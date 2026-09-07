@@ -68,7 +68,8 @@ const REVIEW_URL = "https://www.google.com/maps?cid=9657905201752242057";
 
 const app = express();
 app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
-app.use(cors({ origin: process.env.ALLOWED_ORIGIN || true }));
+const ORIGINS = (process.env.ALLOWED_ORIGIN || "").split(",").map((s) => s.trim()).filter(Boolean);
+app.use(cors({ origin: ORIGINS.length ? ORIGINS : true }));
 
 // Health check — open the server URL in a browser to see this
 app.get("/", (req, res) => {
