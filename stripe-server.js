@@ -51,6 +51,8 @@ const cors = require("cors");
 const nodemailer = require("nodemailer");
 const Stripe = require("stripe");
 const PDFDocument = require("pdfkit");
+const path = require("path");
+const fs = require("fs");
 
 const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
 const mailer = process.env.GMAIL_USER
@@ -60,6 +62,9 @@ const mailer = process.env.GMAIL_USER
     })
   : null;
 const BOOKINGS_EMAIL = process.env.BOOKINGS_EMAIL || "info@skytransfers.com.au";
+const LOGO_PATH = path.join(__dirname, "logo.png");
+const HAS_LOGO = fs.existsSync(LOGO_PATH);
+const REVIEW_URL = "https://www.google.com/maps?cid=9657905201752242057";
 
 const app = express();
 app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
@@ -109,42 +114,252 @@ function computeFare(pickup, dropoff, vehicle) {
   return null;
 }
 
+// ---- Booking reference: ST-YYMMDD-XXXX (no confusable characters) ----
+function makeRef(dateStr) {
+  const CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+  let code = "";
+  for (let i = 0; i < 4; i++) code += CHARS[Math.floor(Math.random() * CHARS.length)];
+  const d = /^\d{4}-\d{2}-\d{2}$/.test(dateStr || "") ? dateStr.slice(2).replace(/-/g, "") : new Date().toISOString().slice(2, 10).replace(/-/g, "");
+  return `ST-${d}-${code}`;
+}
 
-// ---- Printable PDF confirmation ----
+function niceDate(dateStr) {
+  try {
+    const [y, m, d] = dateStr.split("-").map(Number);
+    const dt = new Date(Date.UTC(y, m - 1, d));
+    return dt.toLocaleDateString("en-AU", { weekday: "long", day: "numeric", month: "long", year: "numeric", timeZone: "UTC" });
+  } catch (e) { return dateStr; }
+}
+
+function extrasLabel(b) {
+  return [b.childSeats > 0 ? `${b.childSeats} child seat${b.childSeats > 1 ? "s" : ""}` : "", b.trailer ? "Luggage trailer" : ""].filter(Boolean).join(", ") || "None";
+}
+
+// ---- Printable PDF confirmation (A4, Midnight & Champagne) ----
 function bookingPdf(b, s) {
   return new Promise((resolve, reject) => {
-    const doc = new PDFDocument({ size: "A4", margin: 56 });
+    const doc = new PDFDocument({ size: "A4", margin: 0 });
     const chunks = [];
     doc.on("data", (c) => chunks.push(c));
     doc.on("end", () => resolve(Buffer.concat(chunks)));
     doc.on("error", reject);
-    doc.fillColor("#101828").fontSize(24).font("Times-Roman").text("SKY TRANSFERS", { characterSpacing: 3 });
-    doc.moveDown(0.2).fontSize(10).fillColor("#8E701C").font("Helvetica-Bold")
-      .text("BOOKING CONFIRMATION", { characterSpacing: 2 });
-    doc.moveTo(56, doc.y + 8).lineTo(539, doc.y + 8).lineWidth(1.5).strokeColor("#C9A227").stroke();
-    doc.moveDown(1.2);
-    const row = (label, value) => {
-      if (!value) return;
-      doc.font("Helvetica-Bold").fontSize(10).fillColor("#68707F").text(label, { continued: true, width: 480 });
-      doc.font("Helvetica").fillColor("#141D30").text("  " + value);
-      doc.moveDown(0.35);
-    };
-    row("Route", `${b.pickup}  →  ${b.dropoff}`);
-    row("Date & time", `${b.date} at ${b.time}`);
-    row("Vehicle", b.vehicle);
-    row("Passengers", String(b.pax || ""));
-    row("Flight", b.flight);
-    row("Exact address", b.address);
-    row("Passenger", `${b.name} · ${b.phone}`);
-    row("Extras", [b.childSeats > 0 ? `${b.childSeats} child seat(s)` : "", b.trailer ? "luggage trailer" : ""].filter(Boolean).join(", ") || "None");
-    doc.moveDown(0.5);
-    doc.font("Helvetica-Bold").fontSize(14).fillColor("#141D30").text(`Total: $${s.total} AUD (GST incl.)${b.paid ? " — PAID" : " — payment on confirmation"}`);
-    doc.moveDown(1.2).font("Helvetica").fontSize(9).fillColor("#68707F")
-      .text("Your chauffeur meets you with a name board. Airport pick-ups include 30 min free waiting after landing (60 min international). Free changes and cancellation to 24 hours before pick-up.")
-      .moveDown(0.5)
-      .text("Sky Transfers · 24/7 · +61 481 437 772 · info@skytransfers.com.au · www.skytransfers.com.au");
+
+    const W = 595.28, L = 48, R = W - 48, CW = R - L;
+    const NAVY = "#101828", INK = "#141D30", GOLD = "#C9A227", GOLD_D = "#8E701C",
+          GOLD_LT = "#D9B44A", MUTED = "#68707F", LINE = "#E5E0D2", SOFT = "#F6EED9", CREAM = "#F6F2E8";
+
+    // ---------- Header band ----------
+    doc.rect(0, 0, W, 118).fill(NAVY);
+    if (HAS_LOGO) { try { doc.image(LOGO_PATH, R - 96, 22, { fit: [96, 74] }); } catch (e) {} }
+    doc.font("Times-Roman").fontSize(26).fillColor(CREAM).text("SKY TRANSFERS", L, 34, { characterSpacing: 4 });
+    doc.font("Helvetica-Bold").fontSize(9).fillColor(GOLD_LT)
+      .text(b.paid ? "BOOKING CONFIRMED — PAID" : "BOOKING CONFIRMATION", L, 70, { characterSpacing: 2.5 });
+    doc.font("Helvetica").fontSize(8.5).fillColor("#98A0B0")
+      .text("Gold Coast & Brisbane private airport transfers", L, 86);
+    doc.rect(0, 118, W, 3).fill(GOLD);
+
+    // ---------- Reference / status ----------
+    let y = 146;
+    doc.font("Helvetica-Bold").fontSize(8).fillColor(MUTED).text("BOOKING REFERENCE", L, y, { characterSpacing: 1.5 });
+    doc.font("Helvetica-Bold").fontSize(17).fillColor(INK).text(b.ref || "—", L, y + 12);
+    const pill = b.paid ? "PAID IN FULL" : "AWAITING CONFIRMATION";
+    doc.font("Helvetica-Bold").fontSize(8);
+    const pillW = doc.widthOfString(pill) + 24;
+    doc.roundedRect(R - pillW, y + 8, pillW, 20, 10).fill(b.paid ? "#1E7F4F" : SOFT);
+    doc.font("Helvetica-Bold").fontSize(8).fillColor(b.paid ? "#FFFFFF" : GOLD_D)
+      .text(pill, R - pillW, y + 14, { width: pillW, align: "center", characterSpacing: 1 });
+
+    // ---------- Trip card ----------
+    y += 48;
+    const rows = [
+      ["ROUTE", `${b.pickup}   →   ${b.dropoff}`],
+      ["DATE", `${niceDate(b.date)} at ${b.time}`],
+      ["VEHICLE", b.vehicle],
+      ["PASSENGERS", String(b.pax || "—")],
+      b.flight ? ["FLIGHT", b.flight] : null,
+      b.address ? ["PICK-UP / DROP-OFF ADDRESS", b.address] : null,
+      ["LEAD PASSENGER", `${b.name}   ·   ${b.phone}`],
+      ["EXTRAS", extrasLabel(b)],
+    ].filter(Boolean);
+
+    doc.font("Helvetica").fontSize(10.5);
+    const rowH = [];
+    rows.forEach(([lab, val]) => {
+      const h = doc.heightOfString(val, { width: CW - 190 });
+      rowH.push(Math.max(30, h + 18));
+    });
+    const cardH = rowH.reduce((a, c) => a + c, 0) + 8;
+    doc.roundedRect(L, y, CW, cardH, 8).lineWidth(1).strokeColor(LINE).stroke();
+    let ry = y + 4;
+    rows.forEach(([lab, val], i) => {
+      doc.font("Helvetica-Bold").fontSize(7.5).fillColor(MUTED).text(lab, L + 18, ry + 10, { characterSpacing: 1.2, width: 150 });
+      doc.font("Helvetica").fontSize(10.5).fillColor(INK).text(val, L + 172, ry + 8, { width: CW - 190 });
+      ry += rowH[i];
+      if (i < rows.length - 1) doc.moveTo(L + 18, ry).lineTo(R - 18, ry).lineWidth(0.5).strokeColor(LINE).stroke();
+    });
+
+    // ---------- Total band ----------
+    y += cardH + 16;
+    doc.roundedRect(L, y, CW, 46, 8).fill(SOFT);
+    doc.rect(L, y + 4, 3, 38).fill(GOLD);
+    doc.font("Helvetica-Bold").fontSize(9).fillColor(GOLD_D).text("TOTAL · AUD, GST INCLUSIVE", L + 20, y + 18, { characterSpacing: 1.2 });
+    doc.font("Times-Roman").fontSize(24).fillColor(INK)
+      .text(`$${s.total}`, L, y + 10, { width: CW - 20, align: "right" });
+    doc.font("Helvetica").fontSize(8).fillColor(MUTED)
+      .text(b.paid ? "Paid by card via Stripe" : "Payment taken on confirmation", L, y + 34, { width: CW - 20, align: "right" });
+
+    // ---------- Included ----------
+    y += 66;
+    doc.font("Helvetica-Bold").fontSize(8).fillColor(MUTED).text("INCLUDED WITH EVERY TRANSFER", L, y, { characterSpacing: 1.5 });
+    y += 14;
+    const inc = [
+      "Meet & greet — your chauffeur waits at arrivals with a name board",
+      "Flight tracking with 30 minutes' free airport waiting (60 min international at BNE)",
+      "Free changes and cancellation up to 24 hours before pick-up",
+      "No surge pricing — the fare above is final",
+    ];
+    inc.forEach((t) => {
+      doc.circle(L + 4, y + 5, 1.8).fill(GOLD);
+      doc.font("Helvetica").fontSize(9.5).fillColor(INK).text(t, L + 14, y, { width: CW - 14 });
+      y += 16;
+    });
+
+    // ---------- Note ----------
+    y += 8;
+    if (!b.paid) {
+      doc.font("Helvetica-Oblique").fontSize(9).fillColor(MUTED)
+        .text("This is a booking request. We confirm your chauffeur by email, usually within the hour, and send driver details before pick-up.", L, y, { width: CW });
+      y += 28;
+    }
+
+    // ---------- Footer band ----------
+    const FY = 841.89 - 74;
+    doc.rect(0, FY, W, 74).fill(NAVY);
+    doc.rect(0, FY, W, 2).fill(GOLD);
+    doc.font("Times-Roman").fontSize(13).fillColor(CREAM).text("SKY TRANSFERS", L, FY + 16, { characterSpacing: 3 });
+    doc.font("Helvetica").fontSize(8.5).fillColor("#98A0B0")
+      .text("24/7  ·  +61 481 437 772  ·  info@skytransfers.com.au  ·  www.skytransfers.com.au", L, FY + 36);
+    doc.font("Helvetica").fontSize(8.5).fillColor(GOLD_LT)
+      .text(`Ref ${b.ref || ""}`, L, FY + 16, { width: CW, align: "right" });
+
     doc.end();
   });
+}
+
+// ---- Branded HTML email (guest-facing) ----
+function esc(t) { return String(t == null ? "" : t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+
+function bookingEmailHtml(b, s) {
+  const row = (label, value) => value ? `
+    <tr>
+      <td style="padding:10px 0 2px;font:700 10px/1.4 Arial,sans-serif;letter-spacing:1.5px;color:#68707F;">${label}</td>
+    </tr>
+    <tr>
+      <td style="padding:0 0 10px;font:400 15px/1.5 Georgia,serif;color:#141D30;border-bottom:1px solid #EDE8DA;">${esc(value)}</td>
+    </tr>` : "";
+  const paid = !!b.paid;
+  return `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#F7F4ED;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F7F4ED;padding:0;">
+<tr><td align="center" style="padding:28px 12px;">
+  <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:#FFFFFF;border-radius:10px;overflow:hidden;border:1px solid #E5E0D2;">
+
+    <!-- Header -->
+    <tr><td style="background:#101828;padding:30px 36px 24px;border-bottom:3px solid #C9A227;" align="center">
+      <img src="cid:stlogo" alt="SKY TRANSFERS" height="76" style="height:76px;display:block;margin:0 auto 4px;font:400 22px Georgia,serif;letter-spacing:5px;color:#F6F2E8;">
+      <div style="font:700 10px Arial,sans-serif;letter-spacing:3px;color:#D9B44A;padding-top:10px;">
+        ${paid ? "BOOKING CONFIRMED &amp; PAID" : "BOOKING REQUEST RECEIVED"}</div>
+    </td></tr>
+
+    <!-- Reference -->
+    <tr><td style="padding:26px 36px 0;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+        <td>
+          <div style="font:700 10px Arial,sans-serif;letter-spacing:1.5px;color:#68707F;">BOOKING REFERENCE</div>
+          <div style="font:700 20px Arial,sans-serif;color:#141D30;padding-top:2px;">${esc(b.ref)}</div>
+        </td>
+        <td align="right" style="vertical-align:middle;">
+          <span style="display:inline-block;padding:6px 14px;border-radius:12px;font:700 10px Arial,sans-serif;letter-spacing:1px;${paid ? "background:#1E7F4F;color:#FFFFFF;" : "background:#F6EED9;color:#8E701C;"}">${paid ? "PAID IN FULL" : "AWAITING CONFIRMATION"}</span>
+        </td>
+      </tr></table>
+    </td></tr>
+
+    <!-- Greeting -->
+    <tr><td style="padding:18px 36px 6px;font:400 15px/1.6 Georgia,serif;color:#333B4C;">
+      Hi ${esc(b.name)},<br><br>
+      ${paid
+        ? "Payment received — your transfer is confirmed. Your printable confirmation is attached, and we'll send your chauffeur's name and mobile number before pick-up."
+        : "Thank you for booking with Sky Transfers. Here are your trip details — we'll confirm your chauffeur by email, usually within the hour."}
+    </td></tr>
+
+    <!-- Details -->
+    <tr><td style="padding:10px 36px 4px;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+        ${row("ROUTE", `${b.pickup}  →  ${b.dropoff}`)}
+        ${row("DATE &amp; TIME", `${niceDate(b.date)} at ${b.time}`)}
+        ${row("VEHICLE", b.vehicle)}
+        ${row("PASSENGERS", b.pax)}
+        ${row("FLIGHT", b.flight)}
+        ${row("PICK-UP / DROP-OFF ADDRESS", b.address)}
+        ${row("EXTRAS", extrasLabel(b))}
+      </table>
+    </td></tr>
+
+    <!-- Total -->
+    <tr><td style="padding:18px 36px 6px;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F6EED9;border-radius:8px;border-left:4px solid #C9A227;">
+        <tr>
+          <td style="padding:16px 20px;font:700 11px Arial,sans-serif;letter-spacing:1.5px;color:#8E701C;">TOTAL &middot; AUD, GST INCL.</td>
+          <td align="right" style="padding:16px 20px;font:400 26px Georgia,serif;color:#141D30;">$${s.total}</td>
+        </tr>
+      </table>
+      <div style="font:400 12px Arial,sans-serif;color:#68707F;padding-top:8px;text-align:right;">
+        ${paid ? "Paid securely by card via Stripe." : "No payment taken yet — we take payment when your booking is confirmed."}</div>
+    </td></tr>
+
+    <!-- What's included -->
+    <tr><td style="padding:14px 36px 4px;">
+      <div style="font:700 10px Arial,sans-serif;letter-spacing:1.5px;color:#68707F;padding-bottom:8px;">INCLUDED WITH EVERY TRANSFER</div>
+      <div style="font:400 13.5px/1.9 Arial,sans-serif;color:#333B4C;">
+        <span style="color:#C9A227;">&#9679;</span>&nbsp; Meet &amp; greet with a name board at arrivals<br>
+        <span style="color:#C9A227;">&#9679;</span>&nbsp; Flight tracking &middot; 30 min free waiting (60 min international at BNE)<br>
+        <span style="color:#C9A227;">&#9679;</span>&nbsp; Free changes &amp; cancellation to 24 hours before pick-up<br>
+        <span style="color:#C9A227;">&#9679;</span>&nbsp; Fixed fare — no surge pricing, ever
+      </div>
+    </td></tr>
+
+    <!-- Contact -->
+    <tr><td style="padding:20px 36px 8px;font:400 13.5px/1.7 Arial,sans-serif;color:#333B4C;">
+      Questions or changes? Reply to this email or call/text us any time on
+      <a href="tel:+61481437772" style="color:#8E701C;font-weight:700;text-decoration:none;">+61&nbsp;481&nbsp;437&nbsp;772</a> — we're on 24/7.
+    </td></tr>
+
+    <!-- Review CTA -->
+    <tr><td align="center" style="padding:16px 36px 28px;">
+      <a href="${REVIEW_URL}" style="display:inline-block;background:#C9A227;color:#141D30;font:700 14px Arial,sans-serif;padding:12px 26px;border-radius:8px;text-decoration:none;">&#9733; Enjoyed the ride? Leave us a Google review</a>
+    </td></tr>
+
+    <!-- Footer -->
+    <tr><td style="background:#101828;padding:22px 36px;border-top:2px solid #C9A227;" align="center">
+      <div style="font:400 15px Georgia,serif;letter-spacing:3px;color:#F6F2E8;">SKY TRANSFERS</div>
+      <div style="font:400 11.5px/1.8 Arial,sans-serif;color:#98A0B0;padding-top:6px;">
+        Gold Coast &amp; Brisbane private airport transfers<br>
+        24/7 &middot; +61 481 437 772 &middot; <a href="mailto:info@skytransfers.com.au" style="color:#D9B44A;text-decoration:none;">info@skytransfers.com.au</a> &middot; <a href="https://www.skytransfers.com.au" style="color:#D9B44A;text-decoration:none;">skytransfers.com.au</a>
+      </div>
+    </td></tr>
+
+  </table>
+</td></tr>
+</table>
+</body></html>`;
+}
+
+function guestAttachments(pdf) {
+  const a = [];
+  if (pdf) a.push({ filename: "SkyTransfers-Booking.pdf", content: pdf });
+  if (HAS_LOGO) a.push({ filename: "logo.png", path: LOGO_PATH, cid: "stlogo", contentDisposition: "inline" });
+  return a;
 }
 
 // ---- Zapier -> Limo Anywhere dispatch hand-off ----
@@ -162,6 +377,7 @@ function bookingSummary(b, fare, seats, trailer) {
   return {
     total,
     text: [
+      `Booking reference: ${b.ref || "-"}`,
       `Route: ${b.pickup} -> ${b.dropoff}`,
       `Vehicle: ${b.vehicle}`,
       `Fare: $${fare} one-way`,
@@ -194,37 +410,36 @@ app.post("/request-booking", async (req, res) => {
     if (fare == null) return res.status(400).json({ error: "This route needs a manual quote — please email or call us." });
     const seats = Math.min(Math.max(parseInt(b.childSeats, 10) || 0, 0), 3);
     const trailer = b.trailer === true || b.trailer === "true";
+    b.ref = makeRef(b.date);
     const s = bookingSummary(b, fare, seats, trailer);
-    const subject = `Booking request: ${b.pickup} -> ${b.dropoff} (${b.date} ${b.time})`;
-    const pdf = await bookingPdf({ ...b, childSeats: seats, trailer, paid: false }, s).catch(() => null);
-    const attachments = pdf ? [{ filename: "SkyTransfers-Booking.pdf", content: pdf }] : [];
+    const full = { ...b, childSeats: seats, trailer, paid: false };
+    const pdf = await bookingPdf(full, s).catch((e) => { console.error("PDF failed:", e.message); return null; });
 
-    // 1) to Sky Transfers
+    // 1) to Sky Transfers (plain text — the dispatch automation reads this format)
     await mailer.sendMail({
       from: `"Sky Transfers Website" <${process.env.GMAIL_USER}>`,
       to: BOOKINGS_EMAIL,
       replyTo: b.email,
-      subject: `NEW ${subject}`,
+      subject: `NEW Booking request: ${b.pickup} -> ${b.dropoff} (${b.date} ${b.time}) [${b.ref}]`,
       text: `NEW BOOKING REQUEST — Sky Transfers website\n\n${s.text}`,
-      attachments,
+      attachments: pdf ? [{ filename: "SkyTransfers-Booking.pdf", content: pdf }] : [],
     });
-    // 2) confirmation to the guest
+    // 2) branded confirmation to the guest
     await mailer.sendMail({
       from: `"Sky Transfers" <${process.env.GMAIL_USER}>`,
       to: b.email,
       replyTo: BOOKINGS_EMAIL,
-      subject: `We received your booking request — Sky Transfers (${b.date})`,
+      subject: `Booking request received — Sky Transfers · ${b.ref}`,
       text:
-        `Hi ${b.name},\n\n` +
-        `Thanks for your booking request with Sky Transfers. Here's what we received:\n\n${s.text}\n\n` +
+        `Hi ${b.name},\n\nThanks for your booking request with Sky Transfers.\n\n${s.text}\n\n` +
         `This is a request, not a confirmed booking yet — we'll reply shortly (usually within the hour) to confirm your chauffeur.\n\n` +
         `Need anything in the meantime? Call or text +61 481 437 772.\n\n` +
-        `Enjoyed the ride? A quick Google review helps other travellers find us:\nhttps://www.google.com/maps?cid=9657905201752242057\n\n` +
         `Sky Transfers — Gold Coast & Brisbane airport transfers\nwww.skytransfers.com.au`,
-      attachments,
+      html: bookingEmailHtml(full, s),
+      attachments: guestAttachments(pdf),
     });
-    postToZapier({ ...b, childSeats: seats, trailer, paid: false }, s);
-    res.json({ ok: true, total: s.total });
+    postToZapier(full, s);
+    res.json({ ok: true, total: s.total, ref: b.ref });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Could not send the booking request" });
@@ -240,13 +455,14 @@ app.post("/create-checkout", async (req, res) => {
       return res.status(400).json({ error: "This route needs a manual quote — please email or call us." });
     }
     const seats = Math.min(Math.max(parseInt(b.childSeats, 10) || 0, 0), 3);
+    const ref = makeRef(b.date);
     const lineItems = [{
       price_data: {
         currency: "aud",
         unit_amount: fare * 100,
         product_data: {
           name: `Airport transfer — ${b.vehicle}`,
-          description: `${b.pickup} → ${b.dropoff} · ${b.date} ${b.time}`,
+          description: `${b.pickup} → ${b.dropoff} · ${b.date} ${b.time} · Ref ${ref}`,
         },
       },
       quantity: 1,
@@ -276,6 +492,7 @@ app.post("/create-checkout", async (req, res) => {
       line_items: lineItems,
       customer_email: b.email || undefined,
       metadata: {
+        ref,
         pickup: String(b.pickup || ""), dropoff: String(b.dropoff || ""),
         vehicle: String(b.vehicle || ""), date: String(b.date || ""),
         time: String(b.time || ""), pax: String(b.pax || ""),
@@ -305,28 +522,31 @@ app.post("/stripe-webhook", async (req, res) => {
       const sess = event.data.object;
       const m = sess.metadata || {};
       const b = {
+        ref: m.ref || makeRef(m.date),
         pickup: m.pickup, dropoff: m.dropoff, vehicle: m.vehicle, date: m.date, time: m.time,
         pax: m.pax, flight: m.flight, childSeats: parseInt(m.child_seats, 10) || 0,
         trailer: m.trailer === "yes", name: m.passenger_name, phone: m.phone,
         email: sess.customer_email || sess.customer_details?.email || "", address: m.pickup_address,
         notes: m.notes, paid: true,
       };
-      const s = { total: Math.round((sess.amount_total || 0) / 100), text: bookingSummary(b, 0, b.childSeats, b.trailer).text.replace(/Fare: \$0 one-way\n/, "").replace(/TOTAL: \$\d+/, `TOTAL: $${Math.round((sess.amount_total || 0) / 100)} (PAID)`) };
-      const pdf = await bookingPdf(b, s).catch(() => null);
-      const attachments = pdf ? [{ filename: "SkyTransfers-Booking.pdf", content: pdf }] : [];
+      const total = Math.round((sess.amount_total || 0) / 100);
+      const s = { total, text: bookingSummary(b, 0, b.childSeats, b.trailer).text.replace(/Fare: \$0 one-way\n/, "").replace(/TOTAL: \$\d+/, `TOTAL: $${total} (PAID)`) };
+      const pdf = await bookingPdf(b, s).catch((e) => { console.error("PDF failed:", e.message); return null; });
       if (mailer) {
         await mailer.sendMail({
           from: `"Sky Transfers Website" <${process.env.GMAIL_USER}>`,
           to: BOOKINGS_EMAIL, replyTo: b.email,
-          subject: `PAID booking: ${b.pickup} -> ${b.dropoff} (${b.date} ${b.time})`,
-          text: `PAID BOOKING — Sky Transfers website (Stripe)\n\n${s.text}`, attachments,
+          subject: `PAID booking: ${b.pickup} -> ${b.dropoff} (${b.date} ${b.time}) [${b.ref}]`,
+          text: `PAID BOOKING — Sky Transfers website (Stripe)\n\n${s.text}`,
+          attachments: pdf ? [{ filename: "SkyTransfers-Booking.pdf", content: pdf }] : [],
         });
         if (b.email) await mailer.sendMail({
           from: `"Sky Transfers" <${process.env.GMAIL_USER}>`,
           to: b.email, replyTo: BOOKINGS_EMAIL,
-          subject: `Booking confirmed & paid — Sky Transfers (${b.date})`,
-          text: `Hi ${b.name},\n\nPayment received — your transfer is confirmed. Your printable confirmation is attached.\n\n${s.text}\n\nWe track your flight and your chauffeur meets you with a name board. Free changes to 24 hours before pick-up: reply to this email or call +61 481 437 772.\n\nEnjoyed the ride? A quick Google review helps other travellers find us:\nhttps://www.google.com/maps?cid=9657905201752242057\n\nSky Transfers — Gold Coast & Brisbane airport transfers\nwww.skytransfers.com.au`,
-          attachments,
+          subject: `Booking confirmed & paid — Sky Transfers · ${b.ref}`,
+          text: `Hi ${b.name},\n\nPayment received — your transfer is confirmed. Your printable confirmation is attached.\n\n${s.text}\n\nWe track your flight and your chauffeur meets you with a name board. Free changes to 24 hours before pick-up: reply to this email or call +61 481 437 772.\n\nSky Transfers — Gold Coast & Brisbane airport transfers\nwww.skytransfers.com.au`,
+          html: bookingEmailHtml(b, s),
+          attachments: guestAttachments(pdf),
         });
       }
       postToZapier(b, s);
