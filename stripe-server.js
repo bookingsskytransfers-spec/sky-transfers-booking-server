@@ -100,7 +100,7 @@ function computeFare(pickup, dropoff, vehicle) {
   const isHub = (p) => p === OOL || p === BNE || p === CRUISE;
   const bump = pickup === CRUISE || dropoff === CRUISE ? CRUISE_EXTRA : 0;
   if (isHub(pickup) && isHub(dropoff)) {
-    if ((pickup === BNE && dropoff === CRUISE) || (pickup === CRUISE && dropoff === BNE)) return null; // short hop, manual quote
+    if ((pickup === BNE && dropoff === CRUISE) || (pickup === CRUISE && dropoff === BNE)) return BM_RATES["CBD"][vi]; // same as BNE <-> Brisbane CBD
     return BNE_RATES["S1"][vi] + bump; // OOL <-> BNE / cruise terminal
   }
   const hub = isHub(pickup) ? pickup : isHub(dropoff) ? dropoff : null;
