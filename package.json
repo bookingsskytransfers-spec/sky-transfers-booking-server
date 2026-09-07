@@ -1,0 +1,19 @@
+{
+  "name": "sky-transfers-booking-server",
+  "version": "1.0.0",
+  "description": "Booking + payment server for the Sky Transfers website widget",
+  "main": "stripe-server.js",
+  "scripts": {
+    "start": "node stripe-server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "nodemailer": "^6.9.14",
+    "stripe": "^16.8.0",
+    "pdfkit": "^0.15.0"
+  }
+}
