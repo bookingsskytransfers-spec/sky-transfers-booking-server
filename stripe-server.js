@@ -130,6 +130,29 @@ function computeFare(pickup, dropoff, vehicle) {
   return null;
 }
 
+/* ---- minimum notice ----------------------------------------------------
+   Six hours, matching the booking form and the FAQ. Enforced here as well as
+   in the page because the page can be bypassed and because a fare quoted for
+   a trip we cannot staff is worse than no quote at all.
+   This box runs in Singapore, so local time is useless: Brisbane is UTC+10
+   all year, so the pick-up is turned into an absolute instant arithmetically.
+   A missing or unparseable date is left alone — the form marks both fields
+   required, and rejecting a booking over a date format is worse than taking
+   it and letting dispatch see it. */
+const MIN_LEAD_HOURS = 6;
+const BNE_OFFSET_MS = 10 * 3600 * 1000;
+function leadTimeShortfall(dateStr, timeStr) {
+  const d = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateStr || "");
+  const t = /^(\d{1,2}):(\d{2})/.exec(timeStr || "");
+  if (!d || !t) return null;
+  const when = Date.UTC(+d[1], +d[2] - 1, +d[3], +t[1], +t[2]) - BNE_OFFSET_MS;
+  const hours = (when - Date.now()) / 3600000;
+  return hours >= MIN_LEAD_HOURS ? null : hours;
+}
+const LEAD_TIME_ERROR =
+  `Online bookings need ${MIN_LEAD_HOURS} hours' notice (Brisbane time). ` +
+  "For a pick-up sooner than that please call +61 481 437 772 — we take same-day transfers whenever a vehicle is free.";
+
 // ---- Booking reference: ST-YYMMDD-XXXX (no confusable characters) ----
 function makeRef(dateStr) {
   const CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
@@ -424,6 +447,7 @@ app.post("/request-booking", async (req, res) => {
     }
     const fare = computeFare(b.pickup, b.dropoff, b.vehicle);
     if (fare == null) return res.status(400).json({ error: "This route needs a manual quote — please email or call us." });
+    if (leadTimeShortfall(b.date, b.time) !== null) return res.status(400).json({ error: LEAD_TIME_ERROR });
     const seats = Math.min(Math.max(parseInt(b.childSeats, 10) || 0, 0), 3);
     const trailer = b.trailer === true || b.trailer === "true";
     b.ref = makeRef(b.date);
@@ -469,6 +493,9 @@ app.post("/create-checkout", async (req, res) => {
     const fare = computeFare(b.pickup, b.dropoff, b.vehicle);
     if (fare == null) {
       return res.status(400).json({ error: "This route needs a manual quote — please email or call us." });
+    }
+    if (leadTimeShortfall(b.date, b.time) !== null) {
+      return res.status(400).json({ error: LEAD_TIME_ERROR });
     }
     const seats = Math.min(Math.max(parseInt(b.childSeats, 10) || 0, 0), 3);
     const ref = makeRef(b.date);
