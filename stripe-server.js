@@ -490,6 +490,14 @@ app.post("/create-checkout", async (req, res) => {
     }
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
+      // Card only, on purpose. Left unset, Stripe falls back to automatic
+      // payment methods and offers everything enabled on the account — which
+      // put Link first, asking the guest for a phone number and an SMS code
+      // before they could simply type a card. Naming "card" also keeps Apple
+      // Pay and Google Pay (both ride on the card method), which is exactly
+      // what the site's FAQ promises. To offer Afterpay/Zip later, add them
+      // here deliberately rather than reverting to automatic.
+      payment_method_types: ["card"],
       line_items: lineItems,
       customer_email: b.email || undefined,
       metadata: {
