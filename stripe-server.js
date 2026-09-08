@@ -87,6 +87,16 @@ const BNE_RATES = {"S1":[280,295,325,410,480],"S2":[265,280,310,395,460],"S3":[2
 const BM_ZONE = {"CBD":["Brisbane CBD","Spring Hill","Fortitude Valley","New Farm","Newstead","Teneriffe","Bowen Hills","Herston","Kelvin Grove","Paddington","Milton","Auchenflower","South Brisbane","West End","Highgate Hill","Kangaroo Point","East Brisbane","Woolloongabba","Dutton Park"],"BN1":["Hamilton","Ascot","Clayfield","Hendra","Albion","Nundah","Northgate","Banyo","Virginia","Wavell Heights","Kedron","Chermside","Stafford","Aspley","Geebung","Zillmere","Boondall","Taigum"],"BN2":["Sandgate","Brighton","Bracken Ridge","Bald Hills","Albany Creek","Eatons Hill","Strathpine","Brendale","Petrie","Kallangur","Murrumba Downs","Mango Hill","North Lakes","Deception Bay","Redcliffe","Scarborough","Margate","Clontarf"],"BE1":["Eagle Farm","Pinkenba","Murarrie","Cannon Hill","Morningside","Bulimba","Hawthorne","Balmoral","Tingalpa","Hemmant","Wynnum","Wynnum West","Manly","Lota","Carina"],"BE2":["Belmont","Gumdale","Wakerley","Capalaba","Birkdale","Thorneside","Alexandra Hills","Wellington Point","Ormiston","Cleveland","Thornlands","Victoria Point","Redland Bay"],"BS1":["Coorparoo","Camp Hill","Carina Heights","Carindale","Greenslopes","Holland Park","Mount Gravatt","Wishart","Mansfield","Annerley","Yeronga","Fairfield","Tarragindi","Moorooka","Salisbury"],"BS2":["Sunnybank","Sunnybank Hills","Robertson","Macgregor","Eight Mile Plains","Rochedale","Acacia Ridge","Calamvale","Parkinson","Browns Plains","Springwood","Underwood","Slacks Creek","Daisy Hill","Shailer Park","Logan Central","Woodridge"],"BW1":["Toowong","St Lucia","Taringa","Indooroopilly","Chapel Hill","Kenmore","Fig Tree Pocket","Graceville","Sherwood","Corinda","Oxley","Ashgrove","Bardon","Red Hill","The Gap","Enoggera","Mitchelton","Keperra","Ferny Grove"],"BW2":["Jindalee","Mount Ommaney","Sinnamon Park","Seventeen Mile Rocks","Darra","Richlands","Inala","Forest Lake","Wacol"],"BW3":["Springfield","Springfield Lakes","Brookwater","Augustine Heights","Goodna","Redbank","Redbank Plains","Moggill","Bellbowrie"],"BW4":["Ipswich","Booval","Bundamba","Ripley","Brassall","Karana Downs","Karalee"]};
 const BM_RATES = {"CBD":[95,105,115,165,230],"BN1":[85,95,105,155,220],"BN2":[125,135,150,195,255],"BE1":[85,95,105,155,220],"BE2":[130,140,155,200,260],"BS1":[105,115,125,175,235],"BS2":[140,150,165,215,270],"BW1":[115,125,140,185,245],"BW2":[135,145,160,205,265],"BW3":[155,170,185,230,285],"BW4":[185,200,220,265,315]};
 const BM_SUBURB = {}; Object.keys(BM_ZONE).forEach((z) => { BM_ZONE[z].forEach((s) => { BM_SUBURB[s] = z; }); });
+/* Long-distance regional routes — Sunshine Coast, Toowoomba and Byron Bay.
+   These MUST stay identical to LD_ZONE / LD_BNE_RATES / LD_OOL_RATES in the
+   page, or the widget will quote a fare the Pay button then refuses. Priced
+   per hub because OOL→Byron and BNE→Byron are not the same drive.
+   Held with the page's LD_LIVE flag off: until that flips, the booking form
+   never offers these destinations, so these tables are simply unreachable. */
+const LD_ZONE = {"SC1":["Caloundra","Golden Beach","Pelican Waters","Currimundi","Wurtulla","Warana","Buddina","Minyama"],"SC2":["Mooloolaba","Alexandra Headland","Maroochydore","Cotton Tree","Sunshine Coast Airport (MCY)","Buderim","Sippy Downs","Mountain Creek","Kuluin"],"SC3":["Coolum Beach","Peregian Beach","Peregian Springs","Marcoola","Mudjimba","Twin Waters","Yaroomba"],"SC4":["Noosa Heads","Noosaville","Noosa Junction","Sunshine Beach","Sunrise Beach","Tewantin","Doonan","Eumundi"],"TWB":["Toowoomba","Highfields","Middle Ridge","Rangeville","Wilsonton","Kearneys Spring","Westbrook"],"BYR":["Byron Bay","Suffolk Park","Ewingsdale","Bangalow","Broken Head"]};
+const LD_BNE_RATES = {"SC1":[280,295,320,390,450],"SC2":[305,320,350,425,495],"SC3":[330,345,380,460,535],"SC4":[375,395,430,525,615],"TWB":[395,415,455,550,640],"BYR":[450,475,520,630,735]};
+const LD_OOL_RATES = {"BYR":[220,235,260,330,385]};
+const LD_SUBURB = {}; Object.keys(LD_ZONE).forEach((z) => { LD_ZONE[z].forEach((s) => { LD_SUBURB[s] = z; }); });
 const OOL = "Gold Coast Airport (OOL)", BNE = "Brisbane Airport (BNE)";
 const CRUISE = "Brisbane Cruise Terminal (Pinkenba)", CRUISE_EXTRA = 25;
 const VEHICLES = ["Sedan", "SUV", "Luxury Minivan", "Mercedes Sprinter 10-Seater", "Mercedes Sprinter 15-Seater"];
@@ -112,6 +122,11 @@ function computeFare(pickup, dropoff, vehicle) {
     return bneLike ? BNE_RATES[zBne][vi] + bump : OOL_RATES[zOol][vi];
   }
   if (BM_SUBURB[suburb] && bneLike) return BM_RATES[BM_SUBURB[suburb]][vi] + bump;
+  if (LD_SUBURB[suburb]) {
+    const ld = (bneLike ? LD_BNE_RATES : LD_OOL_RATES)[LD_SUBURB[suburb]];
+    if (ld) return ld[vi] + bump;
+    return null; // regional run with no fixed fare from this hub → quoted by hand
+  }
   return null;
 }
 
