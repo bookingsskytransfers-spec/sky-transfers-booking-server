@@ -627,3 +627,6 @@ require("./agent-portal")({
     .concat(Object.keys(BM_SUBURB).sort())
     .concat(Object.keys(LD_SUBURB).sort()),
 });
+/* The real fare for the Google Ads purchase conversion. Without it every
+   booking reports as the conversion action's $1 default. */
+require("./checkout-lookup")({ app });
