@@ -611,3 +611,19 @@ app.post("/stripe-webhook", async (req, res) => {
 
 const port = process.env.PORT || 4242;
 app.listen(port, () => console.log(`Sky Transfers payment server on :${port}`));
+/* ---------------------------------------------------------------------
+   The agent portal. It lives in agent-portal.js and is handed the pieces
+   this file already owns — the fare table, the lead-time rule, the mailer
+   and the booking formatter — so agent bookings are priced by exactly the
+   same code as public ones. Express accepts routes after listen(), so this
+   sits at the end of the file. Needs DATABASE_URL and AGENT_SECRET; without
+   them it switches itself off and everything above carries on unchanged.
+   --------------------------------------------------------------------- */
+require("./agent-portal")({
+  app, computeFare, VEHICLES, leadTimeShortfall, LEAD_TIME_ERROR,
+  makeRef, bookingSummary, mailer, BOOKINGS_EMAIL,
+  PLACES_FOR_AGENTS: [OOL, BNE, CRUISE]
+    .concat(Object.keys(SUBURBS).sort())
+    .concat(Object.keys(BM_SUBURB).sort())
+    .concat(Object.keys(LD_SUBURB).sort()),
+});
