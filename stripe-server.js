@@ -515,6 +515,83 @@ app.post("/request-booking", async (req, res) => {
   }
 });
 
+/* ---------------------------------------------------------------------------
+ * POST /charter-enquiry
+ *
+ * Charters are quoted per job rather than priced by suburb, so this is
+ * deliberately NOT a copy of /request-booking: there is no fare to compute, no
+ * lead-time rule to enforce, nothing to pay, and no PDF worth generating for
+ * something that is still a conversation.
+ *
+ * It exists because charters.html had no server path at all. The form wrote a
+ * message and handed it to the visitor's own mail or WhatsApp app, so an
+ * enquiry only arrived if they finished the job themselves. On a work desktop
+ * with no mail client configured, "Open in email app" does nothing at all, and
+ * a coach enquiry worth $2,300 disappeared with nobody aware it had happened.
+ * ------------------------------------------------------------------------ */
+app.post("/charter-enquiry", async (req, res) => {
+  try {
+    if (!mailer) return res.status(500).json({ error: "Email is not configured on the server" });
+    const b = req.body || {};
+    /* Deliberately loose. A charter enquiry is the start of a conversation, and
+       a phone number is enough to quote from - rejecting one for a missing
+       field would recreate the hole this endpoint was built to close. */
+    if (!b.name || !b.phone) {
+      return res.status(400).json({ error: "Please give us a name and a phone number" });
+    }
+    b.ref = makeRef(b.date);
+
+    const row = (k, v) => `${k}: ${v === 0 || v ? v : "-"}`;
+    const text = [
+      row("Enquiry reference", b.ref),
+      row("Occasion", b.occasion),
+      row("Vehicle wanted", b.vehicle),
+      row("Date", b.date),
+      row("Hours", b.hours),
+      row("Passengers", b.pax),
+      "",
+      row("Name", b.name),
+      row("Phone", b.phone),
+      row("Email", b.email),
+      "",
+      "Itinerary / notes:",
+      b.itinerary || "-",
+    ].join("\n");
+
+    /* To Sky Transfers, plain text, same key: value shape the dispatch
+       automation already reads on booking requests. */
+    await mailer.sendMail({
+      from: `"Sky Transfers Website" <${process.env.GMAIL_USER}>`,
+      to: BOOKINGS_EMAIL,
+      replyTo: b.email || undefined,
+      subject: `NEW Charter enquiry: ${b.occasion || "charter"} ${b.date || ""} [${b.ref}]`,
+      text: `NEW CHARTER ENQUIRY — Sky Transfers website\n\n${text}`,
+    });
+
+    /* Acknowledgement only if they gave an address; the charter form does not
+       require one. No promise here that is not already on the page. */
+    if (b.email) {
+      await mailer.sendMail({
+        from: `"Sky Transfers" <${process.env.GMAIL_USER}>`,
+        to: b.email,
+        replyTo: BOOKINGS_EMAIL,
+        subject: `Charter enquiry received — Sky Transfers · ${b.ref}`,
+        text:
+          `Hi ${b.name},\n\nThanks for your charter enquiry — we have it.\n\n${text}\n\n` +
+          `We will come back with a written all-inclusive price — driver, fuel, tolls and GST — ` +
+          `usually within the hour.\n\nNeed it sooner? Call or text +61 481 437 772.\n\n` +
+          `Sky Transfers — Gold Coast & Brisbane charters\nwww.skytransfers.com.au`,
+      });
+    }
+
+    postToZapier({ ...b, kind: "charter-enquiry" }, { total: null, text });
+    res.json({ ok: true, ref: b.ref });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Could not send the charter enquiry" });
+  }
+});
+
 app.post("/create-checkout", async (req, res) => {
   try {
     if (!stripe) return res.status(500).json({ error: "Payments are not configured on the server" });
