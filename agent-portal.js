@@ -1050,6 +1050,30 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
     }
   });
 
+  app.post("/admin/web-booking/remove", requireAdmin, async (req, res) => {
+    try {
+      const ref = String((req.body && req.body.ref) || "").trim();
+      if (!ref) return res.status(400).json({ error: "Which booking?" });
+      const r = await getWebBooking(ref);
+      if (!r) return res.status(404).json({ error: "No booking with that reference." });
+      /* Paid bookings stay put. The privacy policy promises booking and
+         payment records are kept for seven years, and a button on a dashboard
+         is not the place to start breaking that promise. */
+      if (r.status === "paid") {
+        return res.status(409).json({ error: "A paid booking cannot be removed." });
+      }
+      /* Kill the payment link first, so removing the row cannot leave a live
+         payable link behind with nothing to reconcile it against. */
+      await deactivatePaymentLink(ref).catch((e) => console.error("deactivate on remove:", e.message));
+      await pool.query(`DELETE FROM web_bookings WHERE ref = $1 AND status <> 'paid'`, [ref]);
+      console.log("web booking removed:", ref);
+      res.json({ ok: true, ref });
+    } catch (err) {
+      console.error("remove web booking:", err);
+      res.status(500).json({ error: "Could not remove that booking." });
+    }
+  });
+
   app.get("/admin/web-bookings", requireAdmin, async (req, res) => {
     try {
       const status = String(req.query.status || "").trim().toLowerCase();
