@@ -62,6 +62,17 @@ const mailer = process.env.GMAIL_USER
     })
   : null;
 const BOOKINGS_EMAIL = process.env.BOOKINGS_EMAIL || "info@skytransfers.com.au";
+/* Filled in at the bottom of this file, where the agent portal is installed.
+   The routes below run long after that, so reading it at request time is safe;
+   it stays null when the portal is switched off and the saves become no-ops. */
+let portal = null;
+const recordBooking = (b, s, status) => {
+  if (!portal || !portal.saveWebBooking) return;
+  /* Deliberately not awaited. A database problem must not stop the emails
+     that the business actually runs on. */
+  portal.saveWebBooking(b, s, status)
+    .catch((e) => console.error("web_bookings save failed:", e.message));
+};
 const LOGO_PATH = path.join(__dirname, "logo.png");
 const HAS_LOGO = fs.existsSync(LOGO_PATH);
 const REVIEW_URL = "https://www.google.com/maps?cid=9657905201752242057";
@@ -507,6 +518,7 @@ app.post("/request-booking", async (req, res) => {
       html: bookingEmailHtml(full, s),
       attachments: guestAttachments(pdf),
     });
+    recordBooking(full, s, "requested");
     postToZapier(full, s);
     res.json({ ok: true, total: s.total, ref: b.ref });
   } catch (err) {
@@ -706,6 +718,7 @@ app.post("/stripe-webhook", async (req, res) => {
           attachments: guestAttachments(pdf),
         });
       }
+      recordBooking(b, s, "paid");
       postToZapier(b, s);
     }
     res.json({ received: true });
@@ -725,7 +738,7 @@ app.listen(port, () => console.log(`Sky Transfers payment server on :${port}`));
    sits at the end of the file. Needs DATABASE_URL and AGENT_SECRET; without
    them it switches itself off and everything above carries on unchanged.
    --------------------------------------------------------------------- */
-require("./agent-portal")({
+portal = require("./agent-portal")({
   app, computeFare, VEHICLES, leadTimeShortfall, LEAD_TIME_ERROR,
   makeRef, bookingSummary, mailer, BOOKINGS_EMAIL,
   PLACES_FOR_AGENTS: [OOL, BNE, CRUISE]
