@@ -128,6 +128,8 @@ module.exports = function installAgentPortal(ctx) {
         declined_at     TIMESTAMPTZ,
         paid_at         TIMESTAMPTZ
       );
+      ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS payment_link_id  TEXT;
+      ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS payment_link_url TEXT;
       CREATE INDEX IF NOT EXISTS web_bookings_recent ON web_bookings (created_at DESC);
       CREATE INDEX IF NOT EXISTS web_bookings_status ON web_bookings (status, created_at DESC);
     `);
@@ -742,6 +744,11 @@ module.exports = function installAgentPortal(ctx) {
        b.trailer === true || b.trailer === "true",
        cents, status, String(b.userAgent || "").slice(0, 300) || null]
     );
+    /* Paid means the link has done its job. Switching it off stops a second
+       payment and stops a forwarded link being payable by anyone else. */
+    if (status === "paid") {
+      deactivatePaymentLink(ref).catch((e) => console.error("deactivate link:", e.message));
+    }
   }
 
   /* ---- one-click confirm from the dispatch email ------------------------
@@ -871,6 +878,72 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
 </dl>`;
   }
 
+  /* ---- the payment link ---------------------------------------------------
+     A Stripe Checkout Session dies 24 hours after it is created - measured on
+     this account, all 38 of them had exactly a 24.0 hour life, and 24 hours is
+     also Stripe's maximum. A guest who slept on it came back to a dead link
+     and had to ask for another one.
+
+     A Payment Link has no expiry field at all, only an `active` flag, so it is
+     still there on Thursday. Stripe copies the link's metadata onto the
+     Checkout Session it creates, so the existing webhook reads exactly what it
+     read before and needs no change.
+
+     The link is stored on the booking: pressing Confirm twice re-sends the
+     same URL rather than minting a second way to pay, and once the webhook
+     reports payment the link is switched off so it cannot be paid again or
+     forwarded to somebody else.
+     --------------------------------------------------------------------- */
+  async function createPaymentLinkFor(r) {
+    const price = await stripe.prices.create({
+      currency: "aud",
+      unit_amount: r.total_cents,
+      product_data: { name: `Transfer — ${r.pickup} to ${r.dropoff}` },
+    }, { idempotencyKey: "price-" + r.ref });
+
+    const link = await stripe.paymentLinks.create({
+      line_items: [{ price: price.id, quantity: 1 }],
+      /* Copied onto the Checkout Session by Stripe, which is what the
+         /stripe-webhook handler reads. Same keys it has always read. */
+      metadata: {
+        ref: r.ref, pickup: String(r.pickup || ""), dropoff: String(r.dropoff || ""),
+        vehicle: String(r.vehicle || ""), date: String(r.pickup_date_text || ""),
+        time: String(r.pickup_time || ""), pax: String(r.pax || ""),
+        flight: String(r.flight || ""), child_seats: String(r.child_seats || 0),
+        trailer: r.trailer ? "yes" : "no",
+        passenger_name: String(r.passenger_name || ""), phone: String(r.passenger_phone || ""),
+        pickup_address: String(r.address || ""), notes: String(r.notes || "").slice(0, 450),
+      },
+      after_completion: {
+        type: "redirect",
+        redirect: { url: process.env.SUCCESS_URL || "https://www.skytransfers.com.au/?booking=confirmed" },
+      },
+      inactive_message: "This booking has already been paid. If you need anything, call or text +61 481 437 772.",
+    }, { idempotencyKey: "plink-" + r.ref });
+
+    await pool.query(
+      `UPDATE web_bookings SET payment_link_id = $2, payment_link_url = $3 WHERE ref = $1`,
+      [r.ref, link.id, link.url]);
+    return link.url;
+  }
+
+  async function paymentUrlFor(r) {
+    /* client_reference_id rides in the query string and Stripe puts it on the
+       Checkout Session, so the booking is identifiable even if metadata ever
+       stops being copied. */
+    const base = r.payment_link_url || await createPaymentLinkFor(r);
+    return base + (base.indexOf("?") === -1 ? "?" : "&") +
+           "client_reference_id=" + encodeURIComponent(r.ref);
+  }
+
+  async function deactivatePaymentLink(ref) {
+    if (!stripe || !pool) return;
+    const { rows } = await pool.query(`SELECT payment_link_id FROM web_bookings WHERE ref = $1`, [ref]);
+    const id = rows[0] && rows[0].payment_link_id;
+    if (!id) return;
+    await stripe.paymentLinks.update(id, { active: false });
+  }
+
   app.get("/booking/action", async (req, res) => {
     res.set("Cache-Control", "no-store");
     try {
@@ -936,40 +1009,7 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
       if (!stripe) return res.status(503).send(actionPage("Payments off",
         `<h1>Payments are not configured</h1><p>The booking is unchanged.</p>${DASH}`));
 
-      const session = await stripe.checkout.sessions.create({
-        mode: "payment",
-        payment_method_types: ["card"],
-        line_items: [{
-          price_data: {
-            currency: "aud",
-            unit_amount: r.total_cents,
-            product_data: {
-              name: `Airport transfer — ${r.vehicle}`,
-              description: `${r.pickup} → ${r.dropoff} · ${r.pickup_date_text || ""} ${r.pickup_time || ""} · Ref ${r.ref}`,
-            },
-          },
-          quantity: 1,
-        }],
-        customer_email: r.passenger_email || undefined,
-        /* The same shape the webhook already reads, and critically the ORIGINAL
-           ref - /create-checkout mints a fresh one, which is why a guest's
-           payment used to carry a different reference from their confirmation. */
-        metadata: {
-          ref: r.ref, pickup: String(r.pickup || ""), dropoff: String(r.dropoff || ""),
-          vehicle: String(r.vehicle || ""), date: String(r.pickup_date_text || ""),
-          time: String(r.pickup_time || ""), pax: String(r.pax || ""),
-          flight: String(r.flight || ""), child_seats: String(r.child_seats || 0),
-          trailer: r.trailer ? "yes" : "no",
-          passenger_name: String(r.passenger_name || ""), phone: String(r.passenger_phone || ""),
-          pickup_address: String(r.address || ""), notes: String(r.notes || "").slice(0, 450),
-        },
-        success_url: process.env.SUCCESS_URL || "https://www.skytransfers.com.au/?booking=confirmed",
-        cancel_url: process.env.CANCEL_URL || "https://www.skytransfers.com.au/?booking=cancelled",
-      }, {
-        /* A double click, or the office opening the link twice, returns the
-           very same session rather than a second payment page. */
-        idempotencyKey: "approve-" + r.ref,
-      });
+      const payUrl = await paymentUrlFor(r);
 
       await setWebStatus(r.ref, "confirmed");
 
@@ -979,14 +1019,14 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
           to: r.passenger_email, replyTo: BOOKINGS_EMAIL,
           subject: `Booking confirmed — Sky Transfers · ${r.ref}`,
           text: `Hi ${r.passenger_name},\n\nGood news — your transfer is confirmed. Your chauffeur is booked.\n\n` +
-                `${rowLines(r)}\n\nTo secure it, pay here:\n${session.url}\n\n` +
+                `${rowLines(r)}\n\nTo secure it, pay here:\n${payUrl}\n\n` +
                 `We track your flight and your chauffeur meets you with a name board. Free changes up to 24 hours ` +
                 `before pick-up — reply to this email or call +61 481 437 772.\n\n` +
                 `Sky Transfers — Gold Coast & Brisbane airport transfers\nwww.skytransfers.com.au`,
           html: `<div style="font-family:system-ui,-apple-system,'Segoe UI',sans-serif;color:#333B4C;max-width:540px">
 <h1 style="font:400 26px/1.3 Georgia,serif;color:#141D30;margin:0 0 14px">Your transfer is confirmed</h1>
 <p style="margin:0 0 20px">Hi ${esc(r.passenger_name)}, your chauffeur is booked. Pay below to secure it.</p>
-<p style="margin:0 0 24px"><a href="${esc(session.url)}" style="display:inline-block;background:#C9A227;color:#141D30;font-weight:700;text-decoration:none;padding:15px 28px;border-radius:9px">Pay ${esc(rowMoney(r))} now</a></p>
+<p style="margin:0 0 24px"><a href="${esc(payUrl)}" style="display:inline-block;background:#C9A227;color:#141D30;font-weight:700;text-decoration:none;padding:15px 28px;border-radius:9px">Pay ${esc(rowMoney(r))} now</a></p>
 <pre style="font:14px/1.6 ui-monospace,Menlo,Consolas,monospace;background:#F7F4ED;border:1px solid #E5E0D2;border-radius:10px;padding:16px;white-space:pre-wrap;margin:0">${esc(rowLines(r))}</pre>
 <p style="margin:18px 0 0;font-size:14px;color:#68707F">Free changes up to 24 hours before pick-up &mdash; reply to this email or call +61 481 437 772.</p></div>`,
         });
@@ -996,7 +1036,7 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
           from: `"Sky Transfers Website" <${process.env.GMAIL_USER}>`,
           to: BOOKINGS_EMAIL, replyTo: r.passenger_email || undefined,
           subject: `CONFIRMED, awaiting payment: ${r.pickup} -> ${r.dropoff} [${r.ref}]`,
-          text: `Confirmed from the dispatch email. The guest has the payment link.\n\n${rowLines(r)}\n\n${session.url}\n`,
+          text: `Confirmed from the dispatch email. The guest has the payment link.\n\n${rowLines(r)}\n\n${payUrl}\n`,
         });
       }
       return res.send(actionPage("Confirmed",
