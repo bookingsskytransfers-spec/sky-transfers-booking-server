@@ -103,6 +103,32 @@ module.exports = function installAgentPortal(ctx) {
       ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS updated_at   TIMESTAMPTZ;
       CREATE INDEX IF NOT EXISTS agent_bookings_by_agent
         ON agent_bookings (agent_code, created_at DESC);
+      CREATE TABLE IF NOT EXISTS web_bookings (
+        ref             TEXT PRIMARY KEY,
+        pickup          TEXT,
+        dropoff         TEXT,
+        vehicle         TEXT,
+        pickup_date     DATE,
+        pickup_time     TEXT,
+        passenger_name  TEXT,
+        passenger_phone TEXT,
+        passenger_email TEXT,
+        flight          TEXT,
+        address         TEXT,
+        notes           TEXT,
+        pax             INT     NOT NULL DEFAULT 1,
+        child_seats     INT     NOT NULL DEFAULT 0,
+        trailer         BOOLEAN NOT NULL DEFAULT FALSE,
+        total_cents     INT     NOT NULL DEFAULT 0,
+        status          TEXT    NOT NULL DEFAULT 'requested',
+        user_agent      TEXT,
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+        confirmed_at    TIMESTAMPTZ,
+        declined_at     TIMESTAMPTZ,
+        paid_at         TIMESTAMPTZ
+      );
+      CREATE INDEX IF NOT EXISTS web_bookings_recent ON web_bookings (created_at DESC);
+      CREATE INDEX IF NOT EXISTS web_bookings_status ON web_bookings (status, created_at DESC);
     `);
   }
 
@@ -663,6 +689,81 @@ module.exports = function installAgentPortal(ctx) {
     }
   });
 
+  /* ---- web bookings -----------------------------------------------------
+     Bookings made on the public website, as opposed to agent bookings. Until
+     now these existed only as two emails: nothing was stored anywhere, so
+     "how many requests turned into payments" could not be answered at all.
+
+     Every caller treats this as fire-and-forget. A database hiccup must never
+     stop a booking email going out - the email is still the path the business
+     actually runs on, and this is a record of it, not a replacement for it.
+     --------------------------------------------------------------------- */
+  const WEB_STATUSES = ["requested", "confirmed", "declined", "paid"];
+
+  const webRow = (r) => ({
+    ref: r.ref, created: r.created_at,
+    date: r.pickup_date, time: r.pickup_time,
+    pickup: r.pickup, dropoff: r.dropoff, vehicle: r.vehicle,
+    name: r.passenger_name, phone: r.passenger_phone, email: r.passenger_email,
+    flight: r.flight, address: r.address, notes: r.notes,
+    pax: r.pax, childSeats: r.child_seats, trailer: r.trailer,
+    total: r.total_cents / 100, status: r.status,
+    confirmedAt: r.confirmed_at, declinedAt: r.declined_at, paidAt: r.paid_at,
+  });
+
+  async function saveWebBooking(b, s, status) {
+    if (!AGENTS_ON || !pool) return;
+    if (!WEB_STATUSES.includes(status)) throw new Error("bad web booking status: " + status);
+    const ref = String((b && b.ref) || "").trim();
+    if (!ref) return;
+    const date = /^\d{4}-\d{2}-\d{2}$/.test(String((b && b.date) || "")) ? b.date : null;
+    const cents = Math.round(Number((s && s.total) || 0) * 100);
+    await pool.query(
+      `INSERT INTO web_bookings
+         (ref, pickup, dropoff, vehicle, pickup_date, pickup_time, passenger_name,
+          passenger_phone, passenger_email, flight, address, notes, pax, child_seats,
+          trailer, total_cents, status, user_agent, confirmed_at, paid_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
+               CASE WHEN $17 IN ('confirmed','paid') THEN now() END,
+               CASE WHEN $17 = 'paid' THEN now() END)
+       ON CONFLICT (ref) DO UPDATE SET
+         /* Never walk a booking backwards. The webhook and a later re-save can
+            arrive in either order, and paid is the end of the line. */
+         status       = CASE WHEN web_bookings.status = 'paid' THEN 'paid'
+                             ELSE EXCLUDED.status END,
+         total_cents  = GREATEST(web_bookings.total_cents, EXCLUDED.total_cents),
+         confirmed_at = COALESCE(web_bookings.confirmed_at, EXCLUDED.confirmed_at),
+         paid_at      = COALESCE(web_bookings.paid_at, EXCLUDED.paid_at)`,
+      [ref, b.pickup || null, b.dropoff || null, b.vehicle || null, date, b.time || null,
+       b.name || null, b.phone || null, b.email || null, b.flight || null,
+       b.address || null, b.notes || null,
+       parseInt(b.pax, 10) || 1, parseInt(b.childSeats, 10) || 0,
+       b.trailer === true || b.trailer === "true",
+       cents, status, String(b.userAgent || "").slice(0, 300) || null]
+    );
+  }
+
+  app.get("/admin/web-bookings", requireAdmin, async (req, res) => {
+    try {
+      const status = String(req.query.status || "").trim().toLowerCase();
+      const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 200, 1), 500);
+      const filtered = WEB_STATUSES.includes(status);
+      const { rows } = await pool.query(
+        `SELECT * FROM web_bookings ${filtered ? "WHERE status = $2" : ""}
+         ORDER BY created_at DESC LIMIT $1`,
+        filtered ? [limit, status] : [limit]);
+      const { rows: counts } = await pool.query(
+        `SELECT status, COUNT(*)::int AS n, COALESCE(SUM(total_cents),0)::int AS cents
+           FROM web_bookings GROUP BY status`);
+      const summary = {};
+      for (const c of counts) summary[c.status] = { count: c.n, total: c.cents / 100 };
+      res.json({ bookings: rows.map(webRow), summary });
+    } catch (err) {
+      console.error("admin web bookings:", err);
+      res.status(500).json({ error: "Could not load web bookings." });
+    }
+  });
+
   app.get("/admin/bookings", requireAdmin, async (req, res) => {
     try {
       const code = String(req.query.code || "").trim().toUpperCase();
@@ -741,4 +842,7 @@ module.exports = function installAgentPortal(ctx) {
         ? `Agent portal ready (admin ${ADMIN_PIN ? "on" : "OFF — set ADMIN_PIN"})`
         : "Agent portal off (set DATABASE_URL and AGENT_SECRET)"))
     .catch((e) => console.error("Agent portal setup failed:", e.message));
+
+  /* stripe-server.js records public-site bookings through this. */
+  return { saveWebBooking };
 };
