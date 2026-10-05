@@ -67,10 +67,10 @@ const BOOKINGS_EMAIL = process.env.BOOKINGS_EMAIL || "info@skytransfers.com.au";
    it stays null when the portal is switched off and the saves become no-ops. */
 let portal = null;
 const recordBooking = (b, s, status) => {
-  if (!portal || !portal.saveWebBooking) return;
-  /* Deliberately not awaited. A database problem must not stop the emails
-     that the business actually runs on. */
-  portal.saveWebBooking(b, s, status)
+  if (!portal || !portal.saveWebBooking) return Promise.resolve();
+  /* Always resolves. Callers may await it for ordering, but a database
+     problem must never stop the emails the business actually runs on. */
+  return portal.saveWebBooking(b, s, status)
     .catch((e) => console.error("web_bookings save failed:", e.message));
 };
 const LOGO_PATH = path.join(__dirname, "logo.png");
@@ -478,6 +478,22 @@ function bookingSummary(b, fare, seats, trailer) {
   };
 }
 
+/* The dispatch copy gains two buttons. The plain-text part is left exactly as
+   it was, because the dispatch automation reads that format. */
+function dispatchHtml(s, links) {
+  const e = (v) => String(v == null ? "" : v).replace(/[&<>"']/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  return `<div style="font-family:system-ui,-apple-system,'Segoe UI',sans-serif;color:#333B4C;max-width:560px">
+<p style="margin:0 0 6px;font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:#6F5510">New booking request</p>
+<p style="margin:0 0 18px">Decide it here &mdash; the guest is emailed the moment you do.</p>
+<table role="presentation" cellpadding="0" cellspacing="0" style="margin:0 0 22px"><tr>
+<td style="padding-right:10px"><a href="${e(links.approve)}" style="display:inline-block;background:#C9A227;color:#141D30;font-weight:700;text-decoration:none;padding:14px 22px;border-radius:9px">Confirm &amp; send payment link</a></td>
+<td><a href="${e(links.decline)}" style="display:inline-block;background:#141D30;color:#F6F2E8;font-weight:600;text-decoration:none;padding:14px 22px;border-radius:9px">Can&rsquo;t do this one</a></td>
+</tr></table>
+<pre style="font:14px/1.6 ui-monospace,Menlo,Consolas,monospace;background:#F7F4ED;border:1px solid #E5E0D2;border-radius:10px;padding:16px;white-space:pre-wrap;margin:0">${e(s.text)}</pre>
+<p style="margin:18px 0 0;font-size:13px;color:#68707F">Both buttons open a page that asks you to confirm first, so nothing can fire by accident.</p></div>`;
+}
+
 app.post("/request-booking", async (req, res) => {
   try {
     if (!mailer) return res.status(500).json({ error: "Email is not configured on the server" });
@@ -493,6 +509,11 @@ app.post("/request-booking", async (req, res) => {
     b.ref = makeRef(b.date);
     const s = bookingSummary(b, fare, seats, trailer);
     const full = { ...b, childSeats: seats, trailer, paid: false };
+    /* Before the emails, not after: the dispatch copy carries one-click confirm
+       links, and the row has to exist by the time anyone presses one. This
+       still swallows its own errors. */
+    await recordBooking(full, s, "requested");
+    const actions = portal && portal.actionLinks ? portal.actionLinks(b.ref) : null;
     const pdf = await bookingPdf(full, s).catch((e) => { console.error("PDF failed:", e.message); return null; });
 
     // 1) to Sky Transfers (plain text — the dispatch automation reads this format)
@@ -502,6 +523,7 @@ app.post("/request-booking", async (req, res) => {
       replyTo: b.email,
       subject: `NEW Booking request: ${b.pickup} -> ${b.dropoff} (${b.date} ${b.time}) [${b.ref}]`,
       text: `NEW BOOKING REQUEST — Sky Transfers website\n\n${s.text}`,
+      html: actions ? dispatchHtml(s, actions) : undefined,
       attachments: pdf ? [{ filename: "SkyTransfers-Booking.pdf", content: pdf }] : [],
     });
     // 2) branded confirmation to the guest
@@ -518,7 +540,6 @@ app.post("/request-booking", async (req, res) => {
       html: bookingEmailHtml(full, s),
       attachments: guestAttachments(pdf),
     });
-    recordBooking(full, s, "requested");
     postToZapier(full, s);
     res.json({ ok: true, total: s.total, ref: b.ref });
   } catch (err) {
@@ -739,7 +760,7 @@ app.listen(port, () => console.log(`Sky Transfers payment server on :${port}`));
    them it switches itself off and everything above carries on unchanged.
    --------------------------------------------------------------------- */
 portal = require("./agent-portal")({
-  app, computeFare, VEHICLES, leadTimeShortfall, LEAD_TIME_ERROR,
+  app, stripe, computeFare, VEHICLES, leadTimeShortfall, LEAD_TIME_ERROR,
   makeRef, bookingSummary, mailer, BOOKINGS_EMAIL,
   PLACES_FOR_AGENTS: [OOL, BNE, CRUISE]
     .concat(Object.keys(SUBURBS).sort())
