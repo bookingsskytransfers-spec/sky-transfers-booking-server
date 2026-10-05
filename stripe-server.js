@@ -637,7 +637,18 @@ app.post("/create-checkout", async (req, res) => {
       return res.status(400).json({ error: LEAD_TIME_ERROR });
     }
     const seats = Math.min(Math.max(parseInt(b.childSeats, 10) || 0, 0), 3);
-    const ref = makeRef(b.date);
+    /* Reuse the reference the guest already holds when this is the same trip
+       they asked about earlier. Without it, someone who sends a request and
+       then pays on the site ends up with two references for one journey, and
+       two rows on the dashboard - one of them stuck at "requested" for ever.
+       Falls back to a fresh reference if the lookup is unavailable. */
+    let ref = null;
+    if (portal && portal.findOpenWebBooking) {
+      ref = await portal.findOpenWebBooking({
+        email: b.email, pickup: b.pickup, dropoff: b.dropoff, date: b.date, time: b.time,
+      }).catch((e) => { console.error("ref reuse lookup failed:", e.message); return null; });
+    }
+    if (!ref) ref = makeRef(b.date);
     const lineItems = [{
       price_data: {
         currency: "aud",

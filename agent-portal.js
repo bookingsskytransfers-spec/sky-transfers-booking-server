@@ -810,6 +810,25 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
   }
   const DASH = '<p class="muted" style="margin:18px 0 0"><a href="https://www.skytransfers.com.au/admin.html">Open the office dashboard</a></p>';
 
+  async function findOpenWebBooking(q) {
+    /* Has this guest already got a reference for this exact trip? Looked up
+       server-side on purpose: the reference is never read from a request body,
+       so a caller cannot supply one and overwrite somebody else's row. */
+    if (!AGENTS_ON || !pool || !q || !q.email) return null;
+    const date = /^\d{4}-\d{2}-\d{2}$/.test(String(q.date || "")) ? q.date : null;
+    const { rows } = await pool.query(
+      `SELECT ref FROM web_bookings
+        WHERE status IN ('requested', 'confirmed')
+          AND lower(passenger_email) = lower($1)
+          AND pickup = $2 AND dropoff = $3
+          AND pickup_date IS NOT DISTINCT FROM $4::date
+          AND COALESCE(pickup_time, '') = COALESCE($5, '')
+          AND created_at > now() - interval '60 days'
+        ORDER BY created_at DESC LIMIT 1`,
+      [q.email, q.pickup || null, q.dropoff || null, date, q.time || ""]);
+    return rows[0] ? rows[0].ref : null;
+  }
+
   async function getWebBooking(ref) {
     /* to_char, not the DATE itself: node-postgres hands back a Date at local
        midnight and toISOString() can then slide it a day. */
@@ -1092,5 +1111,5 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
     .catch((e) => console.error("Agent portal setup failed:", e.message));
 
   /* stripe-server.js records public-site bookings through this. */
-  return { saveWebBooking, actionLinks };
+  return { saveWebBooking, actionLinks, findOpenWebBooking };
 };
