@@ -778,6 +778,14 @@ portal = require("./agent-portal")({
     .concat(Object.keys(BM_SUBURB).sort())
     .concat(Object.keys(LD_SUBURB).sort()),
 });
+/* Loud on purpose. When the portal handed back the wrong thing, bookings
+   stopped being recorded and absolutely nothing said so - no row, no error,
+   and emails still going out. A silent recorder is worse than none. */
+if (!portal || typeof portal.saveWebBooking !== "function") {
+  console.error("FATAL-ISH: agent-portal returned no saveWebBooking - website bookings will NOT be recorded");
+} else {
+  console.log("Website booking recorder wired up");
+}
 /* The real fare for the Google Ads purchase conversion. Without it every
    booking reports as the conversion action's $1 default. */
 require("./checkout-lookup")({ app });

@@ -1142,7 +1142,13 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
     }
   });
 
-  return initAgentSchema()
+  /* Kicked off, deliberately not returned. This used to be `return
+     initAgentSchema()...`, which made everything below it unreachable - the
+     module handed stripe-server.js a Promise instead of its functions, so
+     recordBooking silently did nothing and no website booking was ever
+     stored. Nothing waits on this; the handlers that need the tables are
+     HTTP routes that cannot fire before it settles. */
+  initAgentSchema()
     .then(seedAgents)
     .then(() => console.log(
       AGENTS_ON
