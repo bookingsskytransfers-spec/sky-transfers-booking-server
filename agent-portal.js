@@ -20,6 +20,7 @@ module.exports = function installAgentPortal(ctx) {
   const {
     app, computeFare, VEHICLES, leadTimeShortfall, LEAD_TIME_ERROR,
     makeRef, bookingSummary, mailer, BOOKINGS_EMAIL, PLACES_FOR_AGENTS,
+    stripe,
   } = ctx;
   const { Pool } = require("pg");
   const crypto = require("crypto");
@@ -743,6 +744,253 @@ module.exports = function installAgentPortal(ctx) {
     );
   }
 
+  /* ---- one-click confirm from the dispatch email ------------------------
+     The office gets a booking request by email and decides yes or no. Until
+     now that decision was a human writing a separate email with a payment
+     link in it, and only about half of those links were ever paid.
+
+     The token carries nothing but a reference and an expiry. Stage 1 put the
+     booking in the database, so the handler loads the real row rather than
+     trusting anything in the URL - a tampered link cannot change a price or
+     an address, because neither travels in it.
+
+     GET renders a page. POST does the work. That split is the whole point:
+     mail scanners and clients routinely fetch links in messages before a
+     person opens them, and a GET that acted would let a scanner confirm
+     bookings and email payment demands at guests with nobody deciding.
+     --------------------------------------------------------------------- */
+  const ACTION_BASE = String(process.env.PUBLIC_SERVER_URL ||
+    "https://sky-transfers-booking-server.onrender.com").replace(/\/+$/, "");
+  const ACTION_TTL_MS = 30 * 24 * 3600 * 1000;
+
+  function signAction(ref, act) {
+    const body = Buffer.from(JSON.stringify({ ref, act, exp: Date.now() + ACTION_TTL_MS })).toString("base64url");
+    const sig = crypto.createHmac("sha256", AGENT_SECRET).update(body).digest("base64url");
+    return `${body}.${sig}`;
+  }
+  function readAction(token) {
+    const [body, sig] = String(token || "").split(".");
+    if (!body || !sig) return null;
+    const want = crypto.createHmac("sha256", AGENT_SECRET).update(body).digest("base64url");
+    const a = Buffer.from(sig), b = Buffer.from(want);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+    try {
+      const claim = JSON.parse(Buffer.from(body, "base64url").toString());
+      if (!claim || !claim.ref || claim.exp <= Date.now()) return null;
+      if (claim.act !== "approve" && claim.act !== "decline") return null;
+      return claim;
+    } catch (e) { return null; }
+  }
+  function actionLinks(ref) {
+    if (!AGENTS_ON || !ref) return null;
+    return {
+      approve: ACTION_BASE + "/booking/action?t=" + encodeURIComponent(signAction(ref, "approve")),
+      decline: ACTION_BASE + "/booking/action?t=" + encodeURIComponent(signAction(ref, "decline")),
+    };
+  }
+
+  const esc = (v) => String(v == null ? "" : v).replace(/[&<>"']/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+  function actionPage(title, inner, code) {
+    return `<!doctype html><html lang="en-AU"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>${esc(title)} &mdash; Sky Transfers</title><style>
+body{margin:0;background:#F7F4ED;color:#333B4C;font:16px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif}
+.w{max-width:540px;margin:0 auto;padding:40px 20px}
+.c{background:#fff;border:1px solid #E5E0D2;border-radius:14px;padding:28px}
+h1{font:400 26px/1.3 Georgia,"Times New Roman",serif;color:#141D30;margin:0 0 16px}
+dl{margin:0 0 24px;display:grid;grid-template-columns:auto 1fr;gap:7px 18px;font-size:15px}
+dt{color:#68707F}dd{margin:0;font-weight:600;color:#141D30}
+button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;cursor:pointer;width:100%}
+.go{background:#C9A227;color:#141D30}.no{background:#141D30;color:#F6F2E8}
+.muted{color:#68707F;font-size:14px}a{color:#6F5510}
+</style></head><body><div class="w"><div class="c">${inner}</div></div></body></html>`;
+  }
+  const DASH = '<p class="muted" style="margin:18px 0 0"><a href="https://www.skytransfers.com.au/admin.html">Open the office dashboard</a></p>';
+
+  async function getWebBooking(ref) {
+    /* to_char, not the DATE itself: node-postgres hands back a Date at local
+       midnight and toISOString() can then slide it a day. */
+    const { rows } = await pool.query(
+      `SELECT *, to_char(pickup_date, 'YYYY-MM-DD') AS pickup_date_text
+         FROM web_bookings WHERE ref = $1`, [ref]);
+    return rows[0] || null;
+  }
+  async function setWebStatus(ref, status) {
+    await pool.query(
+      `UPDATE web_bookings SET
+         status       = $2,
+         confirmed_at = CASE WHEN $2 = 'confirmed' THEN COALESCE(confirmed_at, now()) ELSE confirmed_at END,
+         declined_at  = CASE WHEN $2 = 'declined'  THEN COALESCE(declined_at,  now()) ELSE declined_at  END
+       WHERE ref = $1 AND status <> 'paid'`, [ref, status]);
+  }
+  const rowMoney = (r) => "$" + (r.total_cents / 100).toFixed(0);
+  function rowLines(r) {
+    return [
+      `Booking reference: ${r.ref}`,
+      `Route: ${r.pickup} -> ${r.dropoff}`,
+      `When: ${r.pickup_date_text || "-"} ${r.pickup_time || ""}`.trim(),
+      `Vehicle: ${r.vehicle}`,
+      `Passengers: ${r.pax}`,
+      r.child_seats ? `Child seats: ${r.child_seats}` : null,
+      r.trailer ? "Luggage trailer: yes" : null,
+      r.flight ? `Flight: ${r.flight}` : null,
+      r.address ? `Pick-up address: ${r.address}` : null,
+      `TOTAL: ${rowMoney(r)}`,
+    ].filter(Boolean).join("\n");
+  }
+  function rowDl(r) {
+    return `<dl>
+<dt>Reference</dt><dd>${esc(r.ref)}</dd>
+<dt>Passenger</dt><dd>${esc(r.passenger_name)}</dd>
+<dt>Route</dt><dd>${esc(r.pickup)} &rarr; ${esc(r.dropoff)}</dd>
+<dt>When</dt><dd>${esc(r.pickup_date_text || "-")} ${esc(r.pickup_time || "")}</dd>
+<dt>Vehicle</dt><dd>${esc(r.vehicle)}</dd>
+<dt>Total</dt><dd>${esc(rowMoney(r))}</dd>
+</dl>`;
+  }
+
+  app.get("/booking/action", async (req, res) => {
+    res.set("Cache-Control", "no-store");
+    try {
+      if (!AGENTS_ON) return res.status(503).send(actionPage("Unavailable", "<h1>Not configured</h1>"));
+      const claim = readAction(req.query.t);
+      if (!claim) return res.status(400).send(actionPage("Link expired",
+        `<h1>That link has expired</h1><p>Confirm or decline this booking from the dashboard instead.</p>${DASH}`));
+      const r = await getWebBooking(claim.ref);
+      if (!r) return res.status(404).send(actionPage("Not found",
+        `<h1>We don&rsquo;t have that booking</h1><p class="muted">Reference ${esc(claim.ref)}.</p>${DASH}`));
+      if (r.status === "paid") return res.send(actionPage("Already paid",
+        `<h1>Already paid</h1>${rowDl(r)}<p>Nothing to do &mdash; this one is settled.</p>${DASH}`));
+
+      const approving = claim.act === "approve";
+      const already = approving && r.status === "confirmed";
+      const head = approving
+        ? (already ? "<h1>Already confirmed</h1><p>Send the payment link again?</p>"
+                   : "<h1>Confirm this booking?</h1><p>The guest is emailed a confirmation and a payment link the moment you press the button.</p>")
+        : "<h1>Turn this booking down?</h1><p>The guest gets a short note. Nothing is charged.</p>";
+      return res.send(actionPage(approving ? "Confirm booking" : "Decline booking",
+        `${head}${rowDl(r)}
+<form method="POST" action="/booking/action">
+  <input type="hidden" name="t" value="${esc(req.query.t)}">
+  <button class="${approving ? "go" : "no"}" type="submit">${
+    approving ? (already ? "Send the payment link again" : "Yes &mdash; confirm and send the link")
+              : "Yes &mdash; turn it down"}</button>
+</form>
+<p class="muted" style="margin:16px 0 0">Current status: ${esc(r.status)}.</p>${DASH}`));
+    } catch (err) {
+      console.error("booking action page:", err);
+      res.status(500).send(actionPage("Something went wrong", "<h1>Something went wrong</h1>" + DASH));
+    }
+  });
+
+  app.post("/booking/action", require("express").urlencoded({ extended: false }), async (req, res) => {
+    res.set("Cache-Control", "no-store");
+    try {
+      if (!AGENTS_ON) return res.status(503).send(actionPage("Unavailable", "<h1>Not configured</h1>"));
+      const claim = readAction((req.body && req.body.t) || req.query.t);
+      if (!claim) return res.status(400).send(actionPage("Link expired",
+        `<h1>That link has expired</h1>${DASH}`));
+      const r = await getWebBooking(claim.ref);
+      if (!r) return res.status(404).send(actionPage("Not found", `<h1>We don&rsquo;t have that booking</h1>${DASH}`));
+      if (r.status === "paid") return res.send(actionPage("Already paid",
+        `<h1>Already paid</h1>${rowDl(r)}${DASH}`));
+
+      if (claim.act === "decline") {
+        await setWebStatus(r.ref, "declined");
+        if (mailer && r.passenger_email) {
+          await mailer.sendMail({
+            from: `"Sky Transfers" <${process.env.GMAIL_USER}>`,
+            to: r.passenger_email, replyTo: BOOKINGS_EMAIL,
+            subject: `About your transfer request — Sky Transfers · ${r.ref}`,
+            text: `Hi ${r.passenger_name},\n\nSorry — we can't cover this one. Nothing has been charged.\n\n` +
+                  `If the timing is flexible, call or text +61 481 437 772 and we'll see what we can do.\n\n` +
+                  `Sky Transfers\nwww.skytransfers.com.au`,
+          });
+        }
+        return res.send(actionPage("Declined",
+          `<h1>Turned down</h1>${rowDl(r)}<p>${r.passenger_email ? "The guest has been told." : "No email address on file, so nobody was told."}</p>${DASH}`));
+      }
+
+      if (!stripe) return res.status(503).send(actionPage("Payments off",
+        `<h1>Payments are not configured</h1><p>The booking is unchanged.</p>${DASH}`));
+
+      const session = await stripe.checkout.sessions.create({
+        mode: "payment",
+        payment_method_types: ["card"],
+        line_items: [{
+          price_data: {
+            currency: "aud",
+            unit_amount: r.total_cents,
+            product_data: {
+              name: `Airport transfer — ${r.vehicle}`,
+              description: `${r.pickup} → ${r.dropoff} · ${r.pickup_date_text || ""} ${r.pickup_time || ""} · Ref ${r.ref}`,
+            },
+          },
+          quantity: 1,
+        }],
+        customer_email: r.passenger_email || undefined,
+        /* The same shape the webhook already reads, and critically the ORIGINAL
+           ref - /create-checkout mints a fresh one, which is why a guest's
+           payment used to carry a different reference from their confirmation. */
+        metadata: {
+          ref: r.ref, pickup: String(r.pickup || ""), dropoff: String(r.dropoff || ""),
+          vehicle: String(r.vehicle || ""), date: String(r.pickup_date_text || ""),
+          time: String(r.pickup_time || ""), pax: String(r.pax || ""),
+          flight: String(r.flight || ""), child_seats: String(r.child_seats || 0),
+          trailer: r.trailer ? "yes" : "no",
+          passenger_name: String(r.passenger_name || ""), phone: String(r.passenger_phone || ""),
+          pickup_address: String(r.address || ""), notes: String(r.notes || "").slice(0, 450),
+        },
+        success_url: process.env.SUCCESS_URL || "https://www.skytransfers.com.au/?booking=confirmed",
+        cancel_url: process.env.CANCEL_URL || "https://www.skytransfers.com.au/?booking=cancelled",
+      }, {
+        /* A double click, or the office opening the link twice, returns the
+           very same session rather than a second payment page. */
+        idempotencyKey: "approve-" + r.ref,
+      });
+
+      await setWebStatus(r.ref, "confirmed");
+
+      if (mailer && r.passenger_email) {
+        await mailer.sendMail({
+          from: `"Sky Transfers" <${process.env.GMAIL_USER}>`,
+          to: r.passenger_email, replyTo: BOOKINGS_EMAIL,
+          subject: `Booking confirmed — Sky Transfers · ${r.ref}`,
+          text: `Hi ${r.passenger_name},\n\nGood news — your transfer is confirmed. Your chauffeur is booked.\n\n` +
+                `${rowLines(r)}\n\nTo secure it, pay here:\n${session.url}\n\n` +
+                `We track your flight and your chauffeur meets you with a name board. Free changes up to 24 hours ` +
+                `before pick-up — reply to this email or call +61 481 437 772.\n\n` +
+                `Sky Transfers — Gold Coast & Brisbane airport transfers\nwww.skytransfers.com.au`,
+          html: `<div style="font-family:system-ui,-apple-system,'Segoe UI',sans-serif;color:#333B4C;max-width:540px">
+<h1 style="font:400 26px/1.3 Georgia,serif;color:#141D30;margin:0 0 14px">Your transfer is confirmed</h1>
+<p style="margin:0 0 20px">Hi ${esc(r.passenger_name)}, your chauffeur is booked. Pay below to secure it.</p>
+<p style="margin:0 0 24px"><a href="${esc(session.url)}" style="display:inline-block;background:#C9A227;color:#141D30;font-weight:700;text-decoration:none;padding:15px 28px;border-radius:9px">Pay ${esc(rowMoney(r))} now</a></p>
+<pre style="font:14px/1.6 ui-monospace,Menlo,Consolas,monospace;background:#F7F4ED;border:1px solid #E5E0D2;border-radius:10px;padding:16px;white-space:pre-wrap;margin:0">${esc(rowLines(r))}</pre>
+<p style="margin:18px 0 0;font-size:14px;color:#68707F">Free changes up to 24 hours before pick-up &mdash; reply to this email or call +61 481 437 772.</p></div>`,
+        });
+      }
+      if (mailer) {
+        await mailer.sendMail({
+          from: `"Sky Transfers Website" <${process.env.GMAIL_USER}>`,
+          to: BOOKINGS_EMAIL, replyTo: r.passenger_email || undefined,
+          subject: `CONFIRMED, awaiting payment: ${r.pickup} -> ${r.dropoff} [${r.ref}]`,
+          text: `Confirmed from the dispatch email. The guest has the payment link.\n\n${rowLines(r)}\n\n${session.url}\n`,
+        });
+      }
+      return res.send(actionPage("Confirmed",
+        `<h1>Confirmed</h1>${rowDl(r)}<p>${r.passenger_email
+          ? "The guest has the confirmation and the payment link."
+          : "No email address on file, so no link could be sent."}</p>${DASH}`));
+    } catch (err) {
+      console.error("booking action:", err);
+      res.status(500).send(actionPage("Something went wrong",
+        `<h1>Something went wrong</h1><p class="muted">The booking has not been changed.</p>${DASH}`));
+    }
+  });
+
   app.get("/admin/web-bookings", requireAdmin, async (req, res) => {
     try {
       const status = String(req.query.status || "").trim().toLowerCase();
@@ -844,5 +1092,5 @@ module.exports = function installAgentPortal(ctx) {
     .catch((e) => console.error("Agent portal setup failed:", e.message));
 
   /* stripe-server.js records public-site bookings through this. */
-  return { saveWebBooking };
+  return { saveWebBooking, actionLinks };
 };
