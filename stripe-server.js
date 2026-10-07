@@ -125,15 +125,19 @@ const OOL = "Gold Coast Airport (OOL)", BNE = "Brisbane Airport (BNE)";
 const CRUISE = "Brisbane Cruise Terminal (Pinkenba)", CRUISE_EXTRA = 25;
 const VEHICLES = [
   "Sedan", "SUV", "People Mover", "Luxury Sedan", "Luxury Minivan",
-  "Mercedes Sprinter 10-Seater", "Mercedes Sprinter 14-Seater", "Mini Coach 18-Seater"
+  "Mercedes Sprinter 10-Seater", "Mercedes Sprinter 14-Seater", "Mercedes Sprinter 18-Seater"
 ];
-/* The mini coach is priced by hand for each job, so it has no column in the
+/* The 18-seater is priced by hand for each job, so it has no column in the
    rate tables and must never reach Stripe with a computed fare. */
-const QUOTE_ONLY = new Set(["Mini Coach 18-Seater"]);
+const QUOTE_ONLY = new Set(["Mercedes Sprinter 18-Seater"]);
 /* Names that were live before 20 Sept 2026. A booking made seconds before the
    rename still has to price, so these stay here permanently. The fare comes
    from the current table, never the old one — the server price always wins. */
-const VEHICLE_ALIASES = { "Mercedes Sprinter 15-Seater": "Mercedes Sprinter 14-Seater" };
+const VEHICLE_ALIASES = {
+  "Mercedes Sprinter 15-Seater": "Mercedes Sprinter 14-Seater",
+  /* Renamed 8 Oct 2026. It was never a coach - it is an 18-seat Sprinter. */
+  "Mini Coach 18-Seater": "Mercedes Sprinter 18-Seater",
+};
 const CHILD_SEAT_PRICE = 15; // per seat, AUD
 const TRAILER_PRICE = 30;    // luggage trailer, AUD
 
