@@ -75,6 +75,19 @@ module.exports = function installAgentPortal(ctx) {
         active          BOOLEAN NOT NULL DEFAULT TRUE,
         created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
       );
+      CREATE TABLE IF NOT EXISTS gallery_photos (
+        id          SERIAL PRIMARY KEY,
+        caption     TEXT NOT NULL DEFAULT '',
+        vehicle     TEXT NOT NULL DEFAULT '',
+        mime        TEXT NOT NULL,
+        width       INTEGER NOT NULL,
+        height      INTEGER NOT NULL,
+        bytes       BYTEA NOT NULL,
+        sha1        TEXT NOT NULL,
+        sort        INTEGER NOT NULL DEFAULT 0,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS gallery_photos_sha1_key ON gallery_photos (sha1);
       CREATE TABLE IF NOT EXISTS agent_bookings (
         ref               TEXT PRIMARY KEY,
         agent_code        TEXT NOT NULL REFERENCES agents(code),
@@ -1165,6 +1178,156 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
       res.status(500).json({ error: "Could not record that payment." });
     }
   });
+
+  /* The gallery is wrapped because this module is required from the very
+     bottom of stripe-server.js: anything that throws out here takes the
+     booking server down with it. A gallery that fails to mount should cost
+     the office a photo page, never a night of bookings. */
+  try {
+    const express = require("express");
+    /* ---- vehicle photo gallery -------------------------------------------
+       Photographs live in the Postgres that is already running for the agent
+       portal, so the office can add one without a deploy. The upload route
+       takes the image bytes raw rather than as JSON: stripe-server.js installs
+       express.json() globally with the default 100kb ceiling, and express.json
+       ignores a body whose Content-Type is not JSON, so an image/* body passes
+       straight through to the parser mounted here. The admin page re-encodes
+       each photograph through a canvas before sending, which both shrinks it
+       and drops the EXIF block - phone photographs carry GPS coordinates and
+       those have no business being served from the website.
+       ---------------------------------------------------------------------- */
+    const GALLERY_TYPES = ["image/jpeg", "image/png", "image/webp"];
+    const galleryBody = express.raw({ type: GALLERY_TYPES, limit: "8mb" });
+
+    /* Read the real pixel size out of the file itself. The browser tells us
+       what it thinks it sent, but a size that decides page layout should come
+       from the bytes being stored, not from the client. Returns null when the
+       buffer is not an image we recognise, so this doubles as the format check. */
+    function imageSize(buf) {
+      if (buf.length > 24 && buf.readUInt32BE(0) === 0x89504e47 &&
+          buf.readUInt32BE(4) === 0x0d0a1a0a && buf.toString("latin1", 12, 16) === "IHDR") {
+        return { mime: "image/png", width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+      }
+      if (buf.length > 30 && buf.toString("latin1", 0, 4) === "RIFF" &&
+          buf.toString("latin1", 8, 12) === "WEBP") {
+        const tag = buf.toString("latin1", 12, 16);
+        if (tag === "VP8X") return { mime: "image/webp",
+          width: 1 + buf.readUIntLE(24, 3), height: 1 + buf.readUIntLE(27, 3) };
+        if (tag === "VP8 ") return { mime: "image/webp",
+          width: buf.readUInt16LE(26) & 0x3fff, height: buf.readUInt16LE(28) & 0x3fff };
+        if (tag === "VP8L") {
+          const b = buf.readUInt32LE(21);
+          return { mime: "image/webp", width: (b & 0x3fff) + 1, height: ((b >> 14) & 0x3fff) + 1 };
+        }
+        return null;
+      }
+      if (buf.length > 4 && buf[0] === 0xff && buf[1] === 0xd8) {
+        let i = 2;
+        while (i + 9 < buf.length) {
+          if (buf[i] !== 0xff) { i++; continue; }
+          const marker = buf[i + 1];
+          if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) { i += 2; continue; }
+          const len = buf.readUInt16BE(i + 2);
+          const isSOF = marker >= 0xc0 && marker <= 0xcf &&
+                        marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc;
+          if (isSOF) return { mime: "image/jpeg",
+            height: buf.readUInt16BE(i + 5), width: buf.readUInt16BE(i + 7) };
+          if (len < 2) return null;
+          i += 2 + len;
+        }
+      }
+      return null;
+    }
+
+    const galleryOff = (res) =>
+      res.status(503).json({ error: "The photo gallery is not configured on this server." });
+
+    /* Public: what the gallery page lists. Never selects the bytes column. */
+    app.get("/gallery", async (req, res) => {
+      if (!pool) return galleryOff(res);
+      try {
+        const { rows } = await pool.query(
+          `SELECT id, caption, vehicle, width, height,
+                  to_char(created_at, 'YYYY-MM-DD') AS added
+             FROM gallery_photos ORDER BY sort DESC, id DESC LIMIT 300`);
+        res.set("Cache-Control", "public, max-age=120");
+        res.json({ photos: rows });
+      } catch (err) {
+        console.error("gallery list:", err);
+        res.status(500).json({ error: "Could not load the gallery." });
+      }
+    });
+
+    /* Public: one photograph. Immutable - a new upload is always a new id. */
+    app.get("/gallery/photo/:id", async (req, res) => {
+      if (!pool) return galleryOff(res);
+      const id = parseInt(req.params.id, 10);
+      if (!Number.isInteger(id) || id < 1) return res.status(400).send("Bad photo id.");
+      try {
+        const { rows } = await pool.query(
+          "SELECT bytes, mime, sha1 FROM gallery_photos WHERE id = $1", [id]);
+        if (!rows.length) return res.status(404).send("No such photo.");
+        const tag = '"' + rows[0].sha1 + '"';
+        res.set("ETag", tag);
+        res.set("Cache-Control", "public, max-age=31536000, immutable");
+        res.type(rows[0].mime);
+        if (req.headers["if-none-match"] === tag) return res.status(304).end();
+        res.send(rows[0].bytes);
+      } catch (err) {
+        console.error("gallery photo:", err);
+        res.status(500).send("Could not load that photo.");
+      }
+    });
+
+    /* Office only. Caption and vehicle ride in the query string because the
+       body is the image itself. */
+    app.post("/gallery/upload", galleryBody, requireAdmin, async (req, res) => {
+      if (!pool) return galleryOff(res);
+      try {
+        const buf = req.body;
+        if (!Buffer.isBuffer(buf) || !buf.length)
+          return res.status(400).json({ error: "No image arrived. Please pick a file and try again." });
+        const info = imageSize(buf);
+        if (!info)
+          return res.status(400).json({ error: "That file is not a JPEG, PNG or WebP image." });
+        if (info.width < 400 || info.height < 300)
+          return res.status(400).json({ error: `That image is only ${info.width}x${info.height}. Please use one at least 400x300.` });
+        const sha1 = crypto.createHash("sha1").update(buf).digest("hex");
+        const caption = String(req.query.caption || "").trim().slice(0, 200);
+        const vehicle = String(req.query.vehicle || "").trim().slice(0, 60);
+        const { rows } = await pool.query(
+          `INSERT INTO gallery_photos (caption, vehicle, mime, width, height, bytes, sha1, sort)
+           VALUES ($1,$2,$3,$4,$5,$6,$7, COALESCE((SELECT MAX(sort) FROM gallery_photos), 0) + 1)
+           ON CONFLICT (sha1) DO NOTHING
+           RETURNING id`,
+          [caption, vehicle, info.mime, info.width, info.height, buf, sha1]);
+        if (!rows.length)
+          return res.status(409).json({ error: "That photo is already in the gallery." });
+        res.json({ ok: true, id: rows[0].id, width: info.width, height: info.height, bytes: buf.length });
+      } catch (err) {
+        console.error("gallery upload:", err);
+        res.status(500).json({ error: "Could not save that photo." });
+      }
+    });
+
+    app.post("/gallery/remove", requireAdmin, async (req, res) => {
+      if (!pool) return galleryOff(res);
+      const id = parseInt(req.body && req.body.id, 10);
+      if (!Number.isInteger(id) || id < 1) return res.status(400).json({ error: "Which photo?" });
+      try {
+        const { rowCount } = await pool.query("DELETE FROM gallery_photos WHERE id = $1", [id]);
+        if (!rowCount) return res.status(404).json({ error: "That photo is already gone." });
+        res.json({ ok: true });
+      } catch (err) {
+        console.error("gallery remove:", err);
+        res.status(500).json({ error: "Could not remove that photo." });
+      }
+    });
+
+    console.log("Vehicle photo gallery ready");
+  } catch (err) {
+    console.error("Photo gallery not mounted (bookings unaffected):", err.message);
+  }
 
   /* Kicked off, deliberately not returned. This used to be `return
      initAgentSchema()...`, which made everything below it unreachable - the
