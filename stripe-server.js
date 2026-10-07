@@ -494,6 +494,30 @@ function dispatchHtml(s, links) {
 <p style="margin:18px 0 0;font-size:13px;color:#68707F">Both buttons open a page that asks you to confirm first, so nothing can fire by accident.</p></div>`;
 }
 
+/* ---------------------------------------------------------------------------
+ * The price the guest was actually shown.
+ *
+ * index.html sends quotedTotal with every booking, with a comment saying a
+ * mismatch would be "visible rather than silent". It was not: nothing here
+ * ever read it, so the guard existed on one side only. The fare tables live
+ * in two repositories and are kept in step by hand, so drift is a real
+ * possibility rather than a theoretical one.
+ *
+ * The server's figure always wins - it is the one that computes the charge -
+ * but a disagreement now says so out loud.
+ * ------------------------------------------------------------------------ */
+function quoteCheck(b, total) {
+  const quoted = Number(b && b.quotedTotal);
+  /* Older cached pages do not send it at all. Absent is not a mismatch. */
+  if (!Number.isFinite(quoted) || quoted <= 0) return null;
+  if (Math.round(quoted) === Math.round(total)) return null;
+  const note =
+    `PRICE MISMATCH: the page showed $${Math.round(quoted)}, this server calculates $${Math.round(total)}. ` +
+    `The fare tables in the two repositories have drifted apart. Check index.html against stripe-server.js.`;
+  console.error(note);
+  return { quoted: Math.round(quoted), total: Math.round(total), note };
+}
+
 app.post("/request-booking", async (req, res) => {
   try {
     if (!mailer) return res.status(500).json({ error: "Email is not configured on the server" });
@@ -508,6 +532,7 @@ app.post("/request-booking", async (req, res) => {
     const trailer = b.trailer === true || b.trailer === "true";
     b.ref = makeRef(b.date);
     const s = bookingSummary(b, fare, seats, trailer);
+    const mismatch = quoteCheck(b, s.total);
     const full = { ...b, childSeats: seats, trailer, paid: false };
     /* Before the emails, not after: the dispatch copy carries one-click confirm
        links, and the row has to exist by the time anyone presses one. This
@@ -522,7 +547,8 @@ app.post("/request-booking", async (req, res) => {
       to: BOOKINGS_EMAIL,
       replyTo: b.email,
       subject: `NEW Booking request: ${b.pickup} -> ${b.dropoff} (${b.date} ${b.time}) [${b.ref}]`,
-      text: `NEW BOOKING REQUEST — Sky Transfers website\n\n${s.text}`,
+      text: (mismatch ? `!! ${mismatch.note}\n\n` : "") +
+        `NEW BOOKING REQUEST — Sky Transfers website\n\n${s.text}`,
       html: actions ? dispatchHtml(s, actions) : undefined,
       attachments: pdf ? [{ filename: "SkyTransfers-Booking.pdf", content: pdf }] : [],
     });
@@ -649,6 +675,28 @@ app.post("/create-checkout", async (req, res) => {
       }).catch((e) => { console.error("ref reuse lookup failed:", e.message); return null; });
     }
     if (!ref) ref = makeRef(b.date);
+    /* Charging more than the page displayed is not something to paper over,
+       so this stops rather than quietly taking the larger amount. Charging
+       LESS is harmless to the guest, so that proceeds at the lower figure and
+       is only reported. */
+    const quotedGuard = quoteCheck(b, fare + seats * CHILD_SEAT_PRICE +
+      ((b.trailer === true || b.trailer === "true") ? TRAILER_PRICE : 0));
+    if (quotedGuard && quotedGuard.total > quotedGuard.quoted) {
+      if (mailer) {
+        mailer.sendMail({
+          from: `"Sky Transfers Website" <${process.env.GMAIL_USER}>`,
+          to: BOOKINGS_EMAIL,
+          subject: `PRICE MISMATCH blocked a payment: ${b.pickup} -> ${b.dropoff}`,
+          text: `${quotedGuard.note}\n\nThe guest was NOT charged and has been asked to call.\n` +
+                `Route: ${b.pickup} -> ${b.dropoff}\nVehicle: ${b.vehicle}\n` +
+                `Date: ${b.date} ${b.time}\nName: ${b.name}\nPhone: ${b.phone}\nEmail: ${b.email}\n`,
+        }).catch((e) => console.error("mismatch alert failed:", e.message));
+      }
+      return res.status(409).json({
+        error: "Our price for this trip has just changed and we don't want to charge you more than we showed. " +
+               "Call or text +61 481 437 772 and we'll honour the price you saw.",
+      });
+    }
     const lineItems = [{
       price_data: {
         currency: "aud",
