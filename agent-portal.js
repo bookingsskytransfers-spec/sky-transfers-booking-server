@@ -1329,14 +1329,89 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
     console.error("Photo gallery not mounted (bookings unaffected):", err.message);
   }
 
+  /* ---- retention: the two-year promise in the privacy policy -------------
+     privacy.html says "Quote enquiries that never became bookings are deleted
+     within two years". Nothing performed that until 8 Oct 2026, so it was a
+     promise with no machinery behind it.
+
+     Only enquiries go: a row still 'requested' (nobody ever answered it) or
+     'declined' (we said no). 'confirmed' and 'paid' are bookings and are kept
+     seven years for the tax and corporate record-keeping the same policy
+     relies on, which is also why /admin/web-booking/remove refuses a paid row.
+
+     There is no scheduler on this service and it sleeps between requests, so a
+     timer would not fire reliably. It runs at boot instead - every deploy and
+     every wake - which is ample for a rule measured in years.
+     ---------------------------------------------------------------------- */
+  const RETAIN_ENQUIRY_YEARS = 2;
+  const PURGEABLE = ["requested", "declined"];
+
+  /* Count first, delete second, and never in the same call by accident:
+     dryRun is the default so a mistake costs a SELECT. */
+  async function purgeOldEnquiries({ dryRun = true } = {}) {
+    if (!pool) return null;
+    const where = `status = ANY($1) AND created_at < now() - ($2 || ' years')::interval`;
+    const args = [PURGEABLE, String(RETAIN_ENQUIRY_YEARS)];
+    const { rows } = await pool.query(
+      `SELECT status, count(*)::int AS n, min(created_at) AS oldest
+         FROM web_bookings WHERE ${where} GROUP BY status`, args);
+    const total = rows.reduce((n, r) => n + r.n, 0);
+    if (dryRun || !total) return { dryRun: true, total, byStatus: rows };
+    const del = await pool.query(`DELETE FROM web_bookings WHERE ${where}`, args);
+    console.log(`Retention: removed ${del.rowCount} enquiry row(s) older than ${RETAIN_ENQUIRY_YEARS} years`);
+    return { dryRun: false, total: del.rowCount, byStatus: rows };
+  }
+
+  /* What would go, without touching anything. */
+  app.get("/admin/retention", requireAdmin, async (req, res) => {
+    try {
+      const r = await purgeOldEnquiries({ dryRun: true });
+      if (!r) return res.status(503).json({ error: "No database configured on this server." });
+      const { rows: all } = await pool.query(
+        "SELECT status, count(*)::int AS n FROM web_bookings GROUP BY status ORDER BY status");
+      res.json({ retainEnquiryYears: RETAIN_ENQUIRY_YEARS, purgeableStatuses: PURGEABLE,
+                 wouldDelete: r.total, breakdown: r.byStatus, tableNow: all,
+                 autoPurgeOnBoot: AUTO_PURGE });
+    } catch (err) {
+      console.error("retention report:", err);
+      res.status(500).json({ error: "Could not read the retention figures." });
+    }
+  });
+
+  /* Deleting customer records is irreversible, so this asks for it in words. */
+  app.post("/admin/retention/purge", requireAdmin, async (req, res) => {
+    if (String(req.body && req.body.confirm) !== "DELETE OLD ENQUIRIES")
+      return res.status(400).json({ error: 'Send {"confirm":"DELETE OLD ENQUIRIES"} to run this.' });
+    try {
+      const r = await purgeOldEnquiries({ dryRun: false });
+      if (!r) return res.status(503).json({ error: "No database configured on this server." });
+      res.json({ ok: true, deleted: r.total });
+    } catch (err) {
+      console.error("retention purge:", err);
+      res.status(500).json({ error: "Could not complete the purge." });
+    }
+  });
+
   /* Kicked off, deliberately not returned. This used to be `return
      initAgentSchema()...`, which made everything below it unreachable - the
      module handed stripe-server.js a Promise instead of its functions, so
      recordBooking silently did nothing and no website booking was ever
      stored. Nothing waits on this; the handlers that need the tables are
      HTTP routes that cannot fire before it settles. */
+  /* Flip RETENTION_AUTO_PURGE to "on" once the dry run has been eyeballed.
+     Until then this reports and deletes nothing. */
+  const AUTO_PURGE = String(process.env.RETENTION_AUTO_PURGE || "").toLowerCase() === "on";
+
   initAgentSchema()
     .then(seedAgents)
+    .then(async () => {
+      try {
+        const r = await purgeOldEnquiries({ dryRun: !AUTO_PURGE });
+        if (r && r.total) console.log(
+          `Retention: ${r.total} enquiry row(s) older than ${RETAIN_ENQUIRY_YEARS} years` +
+          (r.dryRun ? " would be removed (RETENTION_AUTO_PURGE is off)" : " removed"));
+      } catch (e) { console.error("Retention check failed:", e.message); }
+    })
     .then(() => console.log(
       AGENTS_ON
         ? `Agent portal ready (admin ${ADMIN_PIN ? "on" : "OFF — set ADMIN_PIN"})`
