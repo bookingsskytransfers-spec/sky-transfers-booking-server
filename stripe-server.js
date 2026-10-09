@@ -455,17 +455,68 @@ function postToZapier(b, s) {
   }).catch((e) => console.error("Zapier post failed:", e.message));
 }
 
-function bookingSummary(b, fare, seats, trailer) {
-  const total = fare + seats * CHILD_SEAT_PRICE + (trailer ? TRAILER_PRICE : 0);
+/* ---- Return trips ---------------------------------------------------------
+   computeFare works out which end is the hub, so it is direction-symmetric:
+   the second leg always costs exactly what the first did. Aman's call,
+   9 Oct 2026 — 10% off the combined transfer fare. Child seats and a trailer
+   are charged per leg, because the seat is genuinely needed on both journeys
+   and discounting a $15 hire is noise.
+
+   This formula is duplicated in index.html on purpose: the page has to show a
+   price long before it ever talks to this server. If you change it here,
+   change it there in the same commit — quoteCheck compares the two and a
+   mismatch makes it refuse the payment outright. */
+const RETURN_DISCOUNT = 0.10;
+function returnTransfer(fare) { return Math.round(fare * 2 * (1 - RETURN_DISCOUNT)); }
+
+/* A booking is only a return when it carries its own return date. */
+function returnLeg(b) {
+  const date = String((b && b.returnDate) || "").trim();
+  if (!date) return null;
+  return { date, time: String((b && b.returnTime) || "").trim() };
+}
+
+/* Dates are ISO, so a string compare is a date compare. */
+function returnProblem(b, ret) {
+  if (!ret) return null;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(ret.date) || !/^\d{1,2}:\d{2}/.test(ret.time)) {
+    return "Please give both a date and a time for the return trip.";
+  }
+  if (ret.date < b.date || (ret.date === b.date && ret.time <= b.time)) {
+    return "The return trip has to be after the outbound one.";
+  }
+  if (leadTimeShortfall(ret.date, ret.time) !== null) return LEAD_TIME_ERROR;
+  return null;
+}
+
+function bookingSummary(b, fare, seats, trailer, ret) {
+  const legs = ret ? 2 : 1;
+  const transfer = ret ? returnTransfer(fare) : fare;
+  const extras = (seats * CHILD_SEAT_PRICE + (trailer ? TRAILER_PRICE : 0)) * legs;
+  const total = transfer + extras;
+  const saved = ret ? fare * 2 - transfer : 0;
+  /* A one-way booking must produce exactly the text it produced before this
+     feature existed — the dispatch automation parses these lines. The return
+     lines are therefore inserted only when there is a return. */
+  const returnLines = ret ? [
+    `Trip: RETURN`,
+    `Return date: ${ret.date}`,
+    `Return pick-up time: ${ret.time}`,
+    `Return fare: $${transfer} for both legs (saved $${saved}, ${Math.round(RETURN_DISCOUNT * 100)}% off)`,
+  ] : [];
   return {
     total,
+    isReturn: !!ret,
+    transfer,
+    saved,
     text: [
       `Booking reference: ${b.ref || "-"}`,
       `Route: ${b.pickup} -> ${b.dropoff}`,
       `Vehicle: ${b.vehicle}`,
       `Fare: $${fare} one-way`,
-      `Baby/child seats: ${seats} ($${CHILD_SEAT_PRICE} each)`,
-      `Luggage trailer: ${trailer ? `YES (+$${TRAILER_PRICE})` : "No"}`,
+      `Baby/child seats: ${seats} ($${CHILD_SEAT_PRICE} each${ret ? ", each leg" : ""})`,
+      `Luggage trailer: ${trailer ? `YES (+$${TRAILER_PRICE}${ret ? " each leg" : ""})` : "No"}`,
+      ...returnLines,
       `TOTAL: $${total} AUD (GST incl.)`,
       ``,
       `Date: ${b.date}`,
@@ -534,8 +585,11 @@ app.post("/request-booking", async (req, res) => {
     if (leadTimeShortfall(b.date, b.time) !== null) return res.status(400).json({ error: LEAD_TIME_ERROR });
     const seats = Math.min(Math.max(parseInt(b.childSeats, 10) || 0, 0), 3);
     const trailer = b.trailer === true || b.trailer === "true";
+    const ret = returnLeg(b);
+    const retErr = returnProblem(b, ret);
+    if (retErr) return res.status(400).json({ error: retErr });
     b.ref = makeRef(b.date);
-    const s = bookingSummary(b, fare, seats, trailer);
+    const s = bookingSummary(b, fare, seats, trailer, ret);
     const mismatch = quoteCheck(b, s.total);
     const full = { ...b, childSeats: seats, trailer, paid: false };
     /* Before the emails, not after: the dispatch copy carries one-click confirm
@@ -667,6 +721,10 @@ app.post("/create-checkout", async (req, res) => {
       return res.status(400).json({ error: LEAD_TIME_ERROR });
     }
     const seats = Math.min(Math.max(parseInt(b.childSeats, 10) || 0, 0), 3);
+    const trailer = b.trailer === true || b.trailer === "true";
+    const ret = returnLeg(b);
+    const retErr = returnProblem(b, ret);
+    if (retErr) return res.status(400).json({ error: retErr });
     /* Reuse the reference the guest already holds when this is the same trip
        they asked about earlier. Without it, someone who sends a request and
        then pays on the site ends up with two references for one journey, and
@@ -683,8 +741,10 @@ app.post("/create-checkout", async (req, res) => {
        so this stops rather than quietly taking the larger amount. Charging
        LESS is harmless to the guest, so that proceeds at the lower figure and
        is only reported. */
-    const quotedGuard = quoteCheck(b, fare + seats * CHILD_SEAT_PRICE +
-      ((b.trailer === true || b.trailer === "true") ? TRAILER_PRICE : 0));
+    /* bookingSummary is the only place the total is worked out, so the figure
+       guarded here is the same one the emails and the database will show. */
+    const summary = bookingSummary({ ...b, ref }, fare, seats, trailer, ret);
+    const quotedGuard = quoteCheck(b, summary.total);
     if (quotedGuard && quotedGuard.total > quotedGuard.quoted) {
       if (mailer) {
         mailer.sendMail({
@@ -701,13 +761,23 @@ app.post("/create-checkout", async (req, res) => {
                "Call or text +61 481 437 772 and we'll honour the price you saw.",
       });
     }
+    /* Stripe line items cannot be negative, so the return discount is baked
+       into the single transfer line rather than shown as a credit. The saving
+       is named in the description so the guest can see it on the Stripe page. */
+    const legs = ret ? 2 : 1;
     const lineItems = [{
       price_data: {
         currency: "aud",
-        unit_amount: fare * 100,
+        unit_amount: summary.transfer * 100,
         product_data: {
-          name: `Airport transfer — ${b.vehicle}`,
-          description: `${b.pickup} → ${b.dropoff} · ${b.date} ${b.time} · Ref ${ref}`,
+          name: ret ? `Return airport transfer — ${b.vehicle}`
+                    : `Airport transfer — ${b.vehicle}`,
+          description: ret
+            ? `Out ${b.pickup} → ${b.dropoff} · ${b.date} ${b.time}. ` +
+              `Back ${b.dropoff} → ${b.pickup} · ${ret.date} ${ret.time}. ` +
+              `Includes ${Math.round(RETURN_DISCOUNT * 100)}% return discount ` +
+              `(saved $${summary.saved}) · Ref ${ref}`
+            : `${b.pickup} → ${b.dropoff} · ${b.date} ${b.time} · Ref ${ref}`,
         },
       },
       quantity: 1,
@@ -717,19 +787,19 @@ app.post("/create-checkout", async (req, res) => {
         price_data: {
           currency: "aud",
           unit_amount: CHILD_SEAT_PRICE * 100,
-          product_data: { name: "Baby / child seat" },
+          product_data: { name: ret ? "Baby / child seat (each leg)" : "Baby / child seat" },
         },
-        quantity: seats,
+        quantity: seats * legs,
       });
     }
-    if (b.trailer === true || b.trailer === "true") {
+    if (trailer) {
       lineItems.push({
         price_data: {
           currency: "aud",
           unit_amount: TRAILER_PRICE * 100,
-          product_data: { name: "Luggage trailer" },
+          product_data: { name: ret ? "Luggage trailer (each leg)" : "Luggage trailer" },
         },
-        quantity: 1,
+        quantity: legs,
       });
     }
     const session = await stripe.checkout.sessions.create({
@@ -742,6 +812,13 @@ app.post("/create-checkout", async (req, res) => {
       // what the site's FAQ promises. To offer Afterpay/Zip later, add them
       // here deliberately rather than reverting to automatic.
       payment_method_types: ["card"],
+      /* Promo codes are Stripe's, not ours. Create and retire them in the
+         Stripe dashboard; Stripe enforces expiry and usage limits and applies
+         the discount after these line items, which leaves computeFare — and
+         so quoteCheck — untouched. A discount worked out in the browser would
+         be both forgeable and self-defeating: quoteCheck would see a quoted
+         total below the computed one and refuse the payment. */
+      allow_promotion_codes: true,
       line_items: lineItems,
       customer_email: b.email || undefined,
       metadata: {
@@ -750,7 +827,10 @@ app.post("/create-checkout", async (req, res) => {
         vehicle: String(b.vehicle || ""), date: String(b.date || ""),
         time: String(b.time || ""), pax: String(b.pax || ""),
         flight: String(b.flight || ""), child_seats: String(seats),
-        trailer: b.trailer === true || b.trailer === "true" ? "yes" : "no",
+        trailer: trailer ? "yes" : "no",
+        trip_type: ret ? "return" : "one-way",
+        return_date: ret ? ret.date : "",
+        return_time: ret ? ret.time : "",
         passenger_name: String(b.name || ""), phone: String(b.phone || ""),
         pickup_address: String(b.address || ""),
         notes: String(b.notes || "").slice(0, 450),
@@ -781,9 +861,18 @@ app.post("/stripe-webhook", async (req, res) => {
         trailer: m.trailer === "yes", name: m.passenger_name, phone: m.phone,
         email: sess.customer_email || sess.customer_details?.email || "", address: m.pickup_address,
         notes: m.notes, paid: true,
+        returnDate: m.return_date || "", returnTime: m.return_time || "",
       };
+      /* Stripe's amount_total is the figure actually charged, so it already has
+         any promotion code taken off. That makes it the only number worth
+         printing here, and the reason the fare lines below are stripped out
+         rather than recomputed. */
       const total = Math.round((sess.amount_total || 0) / 100);
-      const s = { total, text: bookingSummary(b, 0, b.childSeats, b.trailer).text.replace(/Fare: \$0 one-way\n/, "").replace(/TOTAL: \$\d+/, `TOTAL: $${total} (PAID)`) };
+      const ret = returnLeg(b);
+      const s = { total, isReturn: !!ret, text: bookingSummary(b, 0, b.childSeats, b.trailer, ret).text
+        .replace(/Fare: \$0 one-way\n/, "")
+        .replace(/^Return fare: .*\n/m, "")
+        .replace(/TOTAL: \$\d+/, `TOTAL: $${total} (PAID)`) };
       const pdf = await bookingPdf(b, s).catch((e) => { console.error("PDF failed:", e.message); return null; });
       if (mailer) {
         await mailer.sendMail({
