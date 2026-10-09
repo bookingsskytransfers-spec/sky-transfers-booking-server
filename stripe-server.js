@@ -930,3 +930,12 @@ if (!portal || typeof portal.saveWebBooking !== "function") {
 /* The real fare for the Google Ads purchase conversion. Without it every
    booking reports as the conversion action's $1 default. */
 require("./checkout-lookup")({ app });
+
+/* The blog article feed. Wrapped because it is the newest thing here and the
+   least important: an outside content service feeding the blog must never be
+   able to stop this server taking bookings. */
+try {
+  require("./blog-feed")({ app });
+} catch (err) {
+  console.error("Blog feed not mounted (bookings unaffected):", err.message);
+}
