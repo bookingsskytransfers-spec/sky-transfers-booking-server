@@ -141,6 +141,8 @@ module.exports = function installAgentPortal(ctx) {
         declined_at     TIMESTAMPTZ,
         paid_at         TIMESTAMPTZ
       );
+      ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS return_date      DATE;
+      ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS return_time      TEXT;
       ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS payment_link_id  TEXT;
       ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS payment_link_url TEXT;
       CREATE INDEX IF NOT EXISTS web_bookings_recent ON web_bookings (created_at DESC);
@@ -723,6 +725,7 @@ module.exports = function installAgentPortal(ctx) {
     name: r.passenger_name, phone: r.passenger_phone, email: r.passenger_email,
     flight: r.flight, address: r.address, notes: r.notes,
     pax: r.pax, childSeats: r.child_seats, trailer: r.trailer,
+    returnDate: r.return_date, returnTime: r.return_time,
     total: r.total_cents / 100, status: r.status,
     confirmedAt: r.confirmed_at, declinedAt: r.declined_at, paidAt: r.paid_at,
   });
@@ -738,8 +741,9 @@ module.exports = function installAgentPortal(ctx) {
       `INSERT INTO web_bookings
          (ref, pickup, dropoff, vehicle, pickup_date, pickup_time, passenger_name,
           passenger_phone, passenger_email, flight, address, notes, pax, child_seats,
-          trailer, total_cents, status, user_agent, confirmed_at, paid_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
+          trailer, total_cents, status, user_agent, return_date, return_time,
+          confirmed_at, paid_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
                CASE WHEN $17 IN ('confirmed','paid') THEN now() END,
                CASE WHEN $17 = 'paid' THEN now() END)
        ON CONFLICT (ref) DO UPDATE SET
@@ -755,7 +759,10 @@ module.exports = function installAgentPortal(ctx) {
        b.address || null, b.notes || null,
        parseInt(b.pax, 10) || 1, parseInt(b.childSeats, 10) || 0,
        b.trailer === true || b.trailer === "true",
-       cents, status, String(b.userAgent || "").slice(0, 300) || null]
+       cents, status, String(b.userAgent || "").slice(0, 300) || null,
+       /* Null, not an empty string: the column is a DATE and "" will not cast. */
+       /^\d{4}-\d{2}-\d{2}$/.test(String((b && b.returnDate) || "")) ? b.returnDate : null,
+       String((b && b.returnTime) || "").trim() || null]
     );
     /* Paid means the link has done its job. Switching it off stops a second
        payment and stops a forwarded link being payable by anyone else. */
