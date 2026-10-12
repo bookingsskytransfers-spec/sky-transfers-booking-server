@@ -53,11 +53,24 @@ module.exports = function installP2P(ctx) {
      thing from the outside: ask us. They are separated in the log, not here. */
   const NO_DISTANCE = "We could not work out the distance just now. Send us the details and we will quote it, usually within the hour.";
 
+  /* An endpoint as the page sends it: the priced suburb, the street address,
+     and coordinates when the pick came through Google. A suburb chosen from
+     the form's own list has no coordinates, so the address string is what the
+     distance lookup falls back to. */
   const place = (p) => ({
     lat: p && p.lat, lng: p && p.lng,
     suburb: String((p && (p.suburb || p.locality)) || "").trim(),
-    address: String((p && p.address) || "").trim(),
+    address: String((p && p.address) || "").trim().slice(0, 200),
   });
+
+  /* The vehicles the fare engine can price, in VEHICLES order. The quote-only
+     18-seater stays in the list as null so the page's grid lines up. */
+  const priceable = VEHICLES.filter((v) => !QUOTE_ONLY.has(v));
+
+  /* Distance for a pair, as the page or a booking describes it. */
+  const roadFor = (from, to) => roads.distance(
+    from.lat != null && from.lng != null ? { lat: from.lat, lng: from.lng } : { address: from.address || from.suburb + ", QLD, Australia" },
+    to.lat != null && to.lng != null ? { lat: to.lat, lng: to.lng } : { address: to.address || to.suburb + ", QLD, Australia" });
 
   app.post("/p2p-quote", async (req, res) => {
     try {
@@ -73,20 +86,38 @@ module.exports = function installP2P(ctx) {
          can be refused from the names alone - an airport at either end, the
          18-seater, an unknown vehicle, a region we do not band - is refused
          here for nothing. The distance is only worth buying once the trip is
-         one we could actually price. */
-      const dry = fares.quote({ pickupSuburb: from.suburb, dropoffSuburb: to.suburb, km: 1, vehicle });
+         one we could actually price. With no vehicle named, the Sedan stands
+         in: every refusal that is about the route, not the vehicle, shows on it. */
+      const dry = fares.quote({ pickupSuburb: from.suburb, dropoffSuburb: to.suburb, km: 1, vehicle: vehicle || "Sedan" });
       if (dry.fare == null && dry.reason !== "no_distance") {
         return res.status(422).json({ error: SPOKEN[dry.reason] || FALLBACK, reason: dry.reason });
       }
 
-      const road = await roads.distance(from, to);
+      const road = await roadFor(from, to);
       if (road.km == null) {
         console.error("p2p quote: no distance (" + road.reason + ") for " +
           from.suburb + " -> " + to.suburb);
         return res.status(503).json({ error: NO_DISTANCE, reason: road.reason });
       }
 
-      const q = fares.quote({ pickupSuburb: from.suburb, dropoffSuburb: to.suburb, km: road.km, vehicle });
+      const priced = (v) => fares.quote({ pickupSuburb: from.suburb, dropoffSuburb: to.suburb, km: road.km, vehicle: v });
+
+      /* No vehicle: the whole ladder at once, for the page's vehicle grid. */
+      if (!vehicle) {
+        const all = VEHICLES.map((v) => (QUOTE_ONLY.has(v) ? null : priced(v).fare));
+        if (all.every((f) => f == null)) {
+          const why = priced(priceable[0]).reason;
+          return res.status(422).json({ error: SPOKEN[why] || FALLBACK, reason: why });
+        }
+        return res.json({
+          km: road.km, minutes: road.minutes, pickup: from.suburb, dropoff: to.suburb,
+          fares: all,
+          vehicles: VEHICLES.slice(),
+          basis: "Per vehicle, one way, GST and road tolls included. The same fare at any hour.",
+        });
+      }
+
+      const q = priced(vehicle);
       if (q.fare == null) {
         return res.status(422).json({ error: SPOKEN[q.reason] || FALLBACK, reason: q.reason });
       }
@@ -108,6 +139,26 @@ module.exports = function installP2P(ctx) {
       res.status(500).json({ error: FALLBACK });
     }
   });
+
+  /* The fare for a booking as /create-checkout and /request-booking see it,
+     measured again rather than taken from the page: the distance is cached,
+     so this costs nothing, and it means a tampered quotedTotal is caught by the
+     same quoteCheck that guards airport bookings. null means "not priceable
+     here" - exactly what computeFare returns for a trip it cannot price. */
+  async function fareFor(b) {
+    const p = b && b.p2p;
+    if (!p || typeof p !== "object") return null;
+    const from = place(p.pickup), to = place(p.dropoff);
+    if (!from.suburb || !to.suburb) return null;
+    const dry = fares.quote({ pickupSuburb: from.suburb, dropoffSuburb: to.suburb, km: 1, vehicle: b.vehicle });
+    if (dry.fare == null && dry.reason !== "no_distance") return null;
+    const road = await roadFor(from, to);
+    if (road.km == null) {
+      console.error("p2p fare: no distance (" + road.reason + ") for " + from.suburb + " -> " + to.suburb);
+      return null;
+    }
+    return fares.quote({ pickupSuburb: from.suburb, dropoffSuburb: to.suburb, km: road.km, vehicle: b.vehicle }).fare;
+  }
 
   /* ---- self-test ---------------------------------------------------------
      Admin only. Runs one real lookup end to end so the Google key, its IP
@@ -146,5 +197,5 @@ module.exports = function installP2P(ctx) {
 
   console.log("p2p: quote endpoint ready" +
     (roads.enabled ? "" : " (distance OFF — set GOOGLE_ROUTES_KEY)"));
-  return { on: true, distanceEnabled: roads.enabled };
+  return { on: true, distanceEnabled: roads.enabled, fareFor };
 };
