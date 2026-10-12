@@ -254,16 +254,28 @@ function bookingPdf(b, s) {
 
     // ---------- Trip card ----------
     y += 48;
-    const rows = [
-      ["ROUTE", `${b.pickup}   →   ${b.dropoff}`],
+    /* The route is written as "A to B", not with an arrow. The built-in PDF
+       fonts only cover WinAnsi, so "→" came out as "!'" on every confirmation. */
+    const ret = returnLeg(b);
+    const extras = extrasLabel(b);
+    const rows = (ret ? [
+      /* A return is two transfers, and the customer has to see both legs with
+         their own date and time - a single ROUTE and DATE row hid the return
+         leg entirely, which is what prompted this layout. */
+      ["TRIP", "Return — two transfers on one booking"],
+      ["OUTBOUND", `${b.pickup}  to  ${b.dropoff}\n${niceDate(b.date)} at ${b.time}`],
+      ["RETURN", `${b.dropoff}  to  ${b.pickup}\n${niceDate(ret.date)} at ${ret.time}`],
+    ] : [
+      ["ROUTE", `${b.pickup}  to  ${b.dropoff}`],
       ["DATE", `${niceDate(b.date)} at ${b.time}`],
+    ]).concat([
       ["VEHICLE", b.vehicle],
       ["PASSENGERS", String(b.pax || "—")],
       b.flight ? ["FLIGHT", b.flight] : null,
       b.address ? ["PICK-UP / DROP-OFF ADDRESS", b.address] : null,
       ["LEAD PASSENGER", `${b.name}   ·   ${b.phone}`],
-      ["EXTRAS", extrasLabel(b)],
-    ].filter(Boolean);
+      ["EXTRAS", extras + (ret && extras !== "None" ? "  (each leg)" : "")],
+    ]).filter(Boolean);
 
     doc.font("Helvetica").fontSize(10.5);
     const rowH = [];
@@ -285,7 +297,15 @@ function bookingPdf(b, s) {
     y += cardH + 16;
     doc.roundedRect(L, y, CW, 46, 8).fill(SOFT);
     doc.rect(L, y + 4, 3, 38).fill(GOLD);
-    doc.font("Helvetica-Bold").fontSize(9).fillColor(GOLD_D).text("TOTAL · AUD, GST INCLUSIVE", L + 20, y + 18, { characterSpacing: 1.2 });
+    doc.font("Helvetica-Bold").fontSize(9).fillColor(GOLD_D).text("TOTAL · AUD, GST INCLUSIVE", L + 20, y + (ret ? 12 : 18), { characterSpacing: 1.2 });
+    /* On a return the figure is nearly double the fare the customer saw on the
+       page, so say in words what it covers. No numbers here: on the paid path
+       the total is whatever Stripe charged, promotion code and all, and a
+       per-leg figure could contradict it. */
+    if (ret) {
+      doc.font("Helvetica").fontSize(8).fillColor(MUTED)
+        .text(`Both legs${extras !== "None" ? ", extras each leg" : ""} · ${Math.round(RETURN_DISCOUNT * 100)}% return discount included`, L + 20, y + 26);
+    }
     doc.font("Times-Roman").fontSize(24).fillColor(INK)
       .text(`$${s.total}`, L, y + 10, { width: CW - 20, align: "right" });
     doc.font("Helvetica").fontSize(8).fillColor(MUTED)
@@ -341,6 +361,8 @@ function bookingEmailHtml(b, s) {
       <td style="padding:0 0 10px;font:400 15px/1.5 Georgia,serif;color:#141D30;border-bottom:1px solid #EDE8DA;">${esc(value)}</td>
     </tr>` : "";
   const paid = !!b.paid;
+  const ret = returnLeg(b);
+  const extras = extrasLabel(b);
   return `<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="margin:0;padding:0;background:#F7F4ED;">
@@ -379,13 +401,18 @@ function bookingEmailHtml(b, s) {
     <!-- Details -->
     <tr><td style="padding:10px 36px 4px;">
       <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
-        ${row("ROUTE", `${b.pickup}  →  ${b.dropoff}`)}
-        ${row("DATE &amp; TIME", `${niceDate(b.date)} at ${b.time}`)}
+        ${ret ? row("TRIP", "Return — two transfers on one booking") : ""}
+        ${ret
+          ? row("OUTBOUND", `${b.pickup}  →  ${b.dropoff}  ·  ${niceDate(b.date)} at ${b.time}`)
+          : row("ROUTE", `${b.pickup}  →  ${b.dropoff}`)}
+        ${ret
+          ? row("RETURN", `${b.dropoff}  →  ${b.pickup}  ·  ${niceDate(ret.date)} at ${ret.time}`)
+          : row("DATE &amp; TIME", `${niceDate(b.date)} at ${b.time}`)}
         ${row("VEHICLE", b.vehicle)}
         ${row("PASSENGERS", b.pax)}
         ${row("FLIGHT", b.flight)}
         ${row("PICK-UP / DROP-OFF ADDRESS", b.address)}
-        ${row("EXTRAS", extrasLabel(b))}
+        ${row("EXTRAS", extras + (ret && extras !== "None" ? " (each leg)" : ""))}
       </table>
     </td></tr>
 
@@ -397,7 +424,9 @@ function bookingEmailHtml(b, s) {
           <td align="right" style="padding:16px 20px;font:400 26px Georgia,serif;color:#141D30;">$${s.total}</td>
         </tr>
       </table>
-      <div style="font:400 12px Arial,sans-serif;color:#68707F;padding-top:8px;text-align:right;">
+      ${ret ? `<div style="font:400 12px Arial,sans-serif;color:#68707F;padding-top:8px;text-align:right;">
+        Covers both legs${extras !== "None" ? ", with extras charged each leg" : ""} &middot; includes the ${Math.round(RETURN_DISCOUNT * 100)}% return discount.</div>` : ""}
+      <div style="font:400 12px Arial,sans-serif;color:#68707F;padding-top:${ret ? 2 : 8}px;text-align:right;">
         ${paid ? "Paid securely by card via Stripe." : "No payment taken yet — we take payment when your booking is confirmed."}</div>
     </td></tr>
 
