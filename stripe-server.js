@@ -247,7 +247,7 @@ function bookingPdf(b, s) {
     if (HAS_LOGO) { try { doc.image(LOGO_PATH, R - 96, 22, { fit: [96, 74] }); } catch (e) {} }
     doc.font("Times-Roman").fontSize(26).fillColor(CREAM).text("SKY TRANSFERS", L, 34, { characterSpacing: 4 });
     doc.font("Helvetica-Bold").fontSize(9).fillColor(GOLD_LT)
-      .text(b.paid ? "BOOKING CONFIRMED — PAID" : "BOOKING CONFIRMATION", L, 70, { characterSpacing: 2.5 });
+      .text(b.paid ? "BOOKING CONFIRMED — PAID" : b.confirmed ? "BOOKING CONFIRMED" : "BOOKING CONFIRMATION", L, 70, { characterSpacing: 2.5 });
     doc.font("Helvetica").fontSize(8.5).fillColor("#98A0B0")
       .text("Gold Coast & Brisbane private airport transfers", L, 86);
     doc.rect(0, 118, W, 3).fill(GOLD);
@@ -256,7 +256,9 @@ function bookingPdf(b, s) {
     let y = 146;
     doc.font("Helvetica-Bold").fontSize(8).fillColor(MUTED).text("BOOKING REFERENCE", L, y, { characterSpacing: 1.5 });
     doc.font("Helvetica-Bold").fontSize(17).fillColor(INK).text(b.ref || "—", L, y + 12);
-    const pill = b.paid ? "PAID IN FULL" : "AWAITING CONFIRMATION";
+    /* Three states, not two: a booking the office confirmed and sent a payment
+       link for is neither a request nor paid. */
+    const pill = b.paid ? "PAID IN FULL" : b.confirmed ? "CONFIRMED" : "AWAITING CONFIRMATION";
     doc.font("Helvetica-Bold").fontSize(8);
     const pillW = doc.widthOfString(pill) + 24;
     doc.roundedRect(R - pillW, y + 8, pillW, 20, 10).fill(b.paid ? "#1E7F4F" : SOFT);
@@ -321,7 +323,7 @@ function bookingPdf(b, s) {
     doc.font("Times-Roman").fontSize(24).fillColor(INK)
       .text(`$${s.total}`, L, y + 10, { width: CW - 20, align: "right" });
     doc.font("Helvetica").fontSize(8).fillColor(MUTED)
-      .text(b.paid ? "Paid by card via Stripe" : "Payment taken on confirmation", L, y + 34, { width: CW - 20, align: "right" });
+      .text(b.paid ? "Paid by card via Stripe" : b.confirmed ? "Payment details sent by email" : "Payment taken on confirmation", L, y + 34, { width: CW - 20, align: "right" });
 
     // ---------- Included ----------
     y += 66;
@@ -341,9 +343,13 @@ function bookingPdf(b, s) {
 
     // ---------- Note ----------
     y += 8;
-    if (!b.paid) {
+    if (!b.paid && !b.confirmed) {
       doc.font("Helvetica-Oblique").fontSize(9).fillColor(MUTED)
         .text("This is a booking request. We confirm your chauffeur by email, usually within the hour, and send driver details before pick-up.", L, y, { width: CW });
+      y += 28;
+    } else if (!b.paid) {
+      doc.font("Helvetica-Oblique").fontSize(9).fillColor(MUTED)
+        .text("Your chauffeur is booked. Driver details follow before pick-up; payment details are in the email this came with.", L, y, { width: CW });
       y += 28;
     }
 
@@ -373,6 +379,7 @@ function bookingEmailHtml(b, s) {
       <td style="padding:0 0 10px;font:400 15px/1.5 Georgia,serif;color:#141D30;border-bottom:1px solid #EDE8DA;">${esc(value)}</td>
     </tr>` : "";
   const paid = !!b.paid;
+  const confirmed = !paid && !!b.confirmed;
   const ret = returnLeg(b);
   const extras = extrasLabel(b);
   return `<!DOCTYPE html>
@@ -386,7 +393,7 @@ function bookingEmailHtml(b, s) {
     <tr><td style="background:#101828;padding:30px 36px 24px;border-bottom:3px solid #C9A227;" align="center">
       <img src="cid:stlogo" alt="SKY TRANSFERS" height="76" style="height:76px;display:block;margin:0 auto 4px;font:400 22px Georgia,serif;letter-spacing:5px;color:#F6F2E8;">
       <div style="font:700 10px Arial,sans-serif;letter-spacing:3px;color:#D9B44A;padding-top:10px;">
-        ${paid ? "BOOKING CONFIRMED &amp; PAID" : "BOOKING REQUEST RECEIVED"}</div>
+        ${paid ? "BOOKING CONFIRMED &amp; PAID" : confirmed ? "BOOKING CONFIRMED" : "BOOKING REQUEST RECEIVED"}</div>
     </td></tr>
 
     <!-- Reference -->
@@ -397,7 +404,7 @@ function bookingEmailHtml(b, s) {
           <div style="font:700 20px Arial,sans-serif;color:#141D30;padding-top:2px;">${esc(b.ref)}</div>
         </td>
         <td align="right" style="vertical-align:middle;">
-          <span style="display:inline-block;padding:6px 14px;border-radius:12px;font:700 10px Arial,sans-serif;letter-spacing:1px;${paid ? "background:#1E7F4F;color:#FFFFFF;" : "background:#F6EED9;color:#8E701C;"}">${paid ? "PAID IN FULL" : "AWAITING CONFIRMATION"}</span>
+          <span style="display:inline-block;padding:6px 14px;border-radius:12px;font:700 10px Arial,sans-serif;letter-spacing:1px;${paid ? "background:#1E7F4F;color:#FFFFFF;" : "background:#F6EED9;color:#8E701C;"}">${paid ? "PAID IN FULL" : confirmed ? "CONFIRMED" : "AWAITING CONFIRMATION"}</span>
         </td>
       </tr></table>
     </td></tr>
@@ -407,7 +414,9 @@ function bookingEmailHtml(b, s) {
       Hi ${esc(b.name)},<br><br>
       ${paid
         ? "Payment received — your transfer is confirmed. Your printable confirmation is attached, and we'll send your chauffeur's name and mobile number before pick-up."
-        : "Thank you for booking with Sky Transfers. Here are your trip details — we'll confirm your chauffeur by email, usually within the hour."}
+        : confirmed
+          ? "Your transfer is confirmed and your chauffeur is booked. Your printable confirmation is attached" + (s.payUrl ? " — pay below to secure it, and we'll send your chauffeur's details before pick-up." : ", and we'll send your chauffeur's details before pick-up.")
+          : "Thank you for booking with Sky Transfers. Here are your trip details — we'll confirm your chauffeur by email, usually within the hour."}
     </td></tr>
 
     <!-- Details -->
@@ -429,6 +438,11 @@ function bookingEmailHtml(b, s) {
       </table>
     </td></tr>
 
+    ${s.payUrl ? `<!-- Pay button: only a confirmation the office sent with a payment link -->
+    <tr><td align="center" style="padding:6px 36px 4px;">
+      <a href="${esc(s.payUrl)}" style="display:inline-block;background:#C9A227;color:#141D30;font:700 15px Arial,sans-serif;padding:14px 30px;border-radius:9px;text-decoration:none;">Pay $${s.total} now to secure your booking</a>
+      <div style="font:400 12.5px Arial,sans-serif;color:#68707F;padding-top:8px;">Secure card payment by Stripe &mdash; card details never touch our website.</div>
+    </td></tr>` : ""}
     <!-- Total -->
     <tr><td style="padding:18px 36px 6px;">
       <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F6EED9;border-radius:8px;border-left:4px solid #C9A227;">
@@ -440,7 +454,9 @@ function bookingEmailHtml(b, s) {
       ${ret ? `<div style="font:400 12px Arial,sans-serif;color:#68707F;padding-top:8px;text-align:right;">
         Covers both legs${extras !== "None" ? ", with extras charged each leg" : ""} &middot; includes the ${Math.round(RETURN_DISCOUNT * 100)}% return discount.</div>` : ""}
       <div style="font:400 12px Arial,sans-serif;color:#68707F;padding-top:${ret ? 2 : 8}px;text-align:right;">
-        ${paid ? "Paid securely by card via Stripe." : "No payment taken yet — we take payment when your booking is confirmed."}</div>
+        ${paid ? "Paid securely by card via Stripe."
+          : confirmed ? (s.payUrl ? "Pay with the button above to secure your booking." : "Payment as arranged with our office.")
+          : "No payment taken yet — we take payment when your booking is confirmed."}</div>
     </td></tr>
 
     <!-- What's included -->
@@ -967,6 +983,12 @@ app.listen(port, () => console.log(`Sky Transfers payment server on :${port}`));
 portal = require("./agent-portal")({
   app, stripe, computeFare, VEHICLES, leadTimeShortfall, LEAD_TIME_ERROR,
   makeRef, bookingSummary, mailer, BOOKINGS_EMAIL,
+  /* So the office can book for a guest, or send a confirmation again, with
+     the same branded email and PDF the website sends - not a second version
+     that drifts. fareForBooking is read at call time, so it sees the
+     point-to-point module mounted further down. */
+  bookingPdf, bookingEmailHtml, guestAttachments, fareForBooking, returnLeg,
+  HUB_NAMES: [OOL, BNE, CRUISE],
   PLACES_FOR_AGENTS: [OOL, BNE, CRUISE]
     .concat(Object.keys(SUBURBS).sort())
     .concat(Object.keys(BM_SUBURB).sort())

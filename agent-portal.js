@@ -21,6 +21,9 @@ module.exports = function installAgentPortal(ctx) {
     app, computeFare, VEHICLES, leadTimeShortfall, LEAD_TIME_ERROR,
     makeRef, bookingSummary, mailer, BOOKINGS_EMAIL, PLACES_FOR_AGENTS,
     stripe,
+    /* The website's own confirmation pieces, so what the office sends a guest
+       is byte-for-byte what the site would have sent. */
+    bookingPdf, bookingEmailHtml, guestAttachments, fareForBooking, returnLeg, HUB_NAMES,
   } = ctx;
   const { Pool } = require("pg");
   const crypto = require("crypto");
@@ -862,7 +865,8 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
     /* to_char, not the DATE itself: node-postgres hands back a Date at local
        midnight and toISOString() can then slide it a day. */
     const { rows } = await pool.query(
-      `SELECT *, to_char(pickup_date, 'YYYY-MM-DD') AS pickup_date_text
+      `SELECT *, to_char(pickup_date, 'YYYY-MM-DD') AS pickup_date_text,
+                 to_char(return_date, 'YYYY-MM-DD') AS return_date_text
          FROM web_bookings WHERE ref = $1`, [ref]);
     return rows[0] || null;
   }
@@ -1069,6 +1073,175 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
       console.error("booking action:", err);
       res.status(500).send(actionPage("Something went wrong",
         `<h1>Something went wrong</h1><p class="muted">The booking has not been changed.</p>${DASH}`));
+    }
+  });
+
+  /* ---- the office books for a guest, or sends a confirmation again --------
+     Both reuse the website's own summary, email and PDF, handed in from
+     stripe-server.js, so a guest cannot tell which door the booking came in
+     through. Admin bookings skip the six-hour rule on purpose: the office
+     knows what is free right now, which is the whole point of the phone. */
+  const HUBS = new Set(HUB_NAMES || []);
+  const isoDate = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || "")) ? String(v) : "";
+  const hhmm = (v) => /^\d{1,2}:\d{2}/.test(String(v || "")) ? String(v).slice(0, 5) : "";
+
+  app.get("/admin/places", requireAdmin, (req, res) => {
+    res.json({ places: PLACES_FOR_AGENTS, vehicles: VEHICLES });
+  });
+
+  /* A web_bookings row in the shape the website's email and PDF expect. */
+  function rowToBooking(r) {
+    return {
+      ref: r.ref, pickup: r.pickup, dropoff: r.dropoff, vehicle: r.vehicle,
+      date: r.pickup_date_text || "", time: r.pickup_time || "",
+      pax: r.pax, flight: r.flight || "", childSeats: r.child_seats || 0,
+      trailer: !!r.trailer, name: r.passenger_name, phone: r.passenger_phone,
+      email: r.passenger_email || "", address: r.address || "", notes: r.notes || "",
+      returnDate: r.return_date_text || "", returnTime: r.return_time || "",
+      returnFlight: r.return_flight || "",
+      paid: r.status === "paid", confirmed: r.status === "confirmed" || r.status === "paid",
+    };
+  }
+
+  /* The summary for a stored row. The total is the row's figure - the agreed
+     price, or what Stripe charged - never a recomputation, so the fare lines
+     are stripped exactly as the webhook strips them. */
+  function summaryForRow(r, b) {
+    const total = Math.round((r.total_cents || 0) / 100);
+    const ret = returnLeg(b);
+    const text = bookingSummary(b, 0, b.childSeats, b.trailer, ret).text
+      .replace(/Fare: \$0 one-way\n/, "")
+      .replace(/^Return fare: .*\n/m, "")
+      .replace(/TOTAL: \$\d+/, "TOTAL: $" + total + (b.paid ? " (PAID)" : ""));
+    return { total, isReturn: !!ret, text };
+  }
+
+  async function emailGuestConfirmation(b, s, payUrl) {
+    const pdf = await bookingPdf(b, s).catch((e) => { console.error("PDF failed:", e.message); return null; });
+    const subject = b.paid ? `Booking confirmed & paid — Sky Transfers · ${b.ref}`
+                  : b.confirmed ? `Booking confirmed — Sky Transfers · ${b.ref}`
+                  : `Booking request received — Sky Transfers · ${b.ref}`;
+    const opening = b.paid
+      ? "Your transfer is confirmed and paid. Your printable confirmation is attached."
+      : b.confirmed
+        ? "Your transfer is confirmed and your chauffeur is booked. Your printable confirmation is attached" +
+          (payUrl ? `, and you can pay securely here to secure it:\n${payUrl}` : ".")
+        : "Thanks for your booking request. We'll reply shortly, usually within the hour, to confirm your chauffeur.";
+    await mailer.sendMail({
+      from: `"Sky Transfers" <${process.env.GMAIL_USER}>`,
+      to: b.email, replyTo: BOOKINGS_EMAIL, subject,
+      text: `Hi ${b.name},\n\n${opening}\n\n${s.text}\n\n` +
+            `We track your flight and your chauffeur meets you with a name board. Free changes to 24 hours ` +
+            `before pick-up: reply to this email or call +61 481 437 772.\n\n` +
+            `Sky Transfers — Gold Coast & Brisbane airport transfers\nwww.skytransfers.com.au`,
+      html: bookingEmailHtml(b, payUrl ? { ...s, payUrl } : s),
+      attachments: guestAttachments(pdf),
+    });
+  }
+
+  app.post("/admin/web-booking/create", requireAdmin, async (req, res) => {
+    try {
+      if (!mailer) return res.status(500).json({ error: "Email is not configured on the server." });
+      const b0 = req.body || {};
+      const b = {
+        pickup: String(b0.pickup || "").trim(), dropoff: String(b0.dropoff || "").trim(),
+        vehicle: String(b0.vehicle || "").trim(), date: isoDate(b0.date), time: hhmm(b0.time),
+        pax: Math.min(Math.max(parseInt(b0.pax, 10) || 1, 1), 53),
+        flight: String(b0.flight || "").trim().slice(0, 40),
+        childSeats: Math.min(Math.max(parseInt(b0.childSeats, 10) || 0, 0), 3),
+        trailer: b0.trailer === true || b0.trailer === "true",
+        name: String(b0.name || "").trim(), phone: String(b0.phone || "").trim(),
+        email: String(b0.email || "").trim(), address: String(b0.address || "").trim(),
+        notes: String(b0.notes || "").trim().slice(0, 450),
+        returnDate: isoDate(b0.returnDate), returnTime: hhmm(b0.returnTime),
+        returnFlight: String(b0.returnFlight || "").trim().slice(0, 40),
+      };
+      for (const f of ["pickup", "dropoff", "vehicle", "date", "time", "name", "phone"]) {
+        if (!b[f]) return res.status(400).json({ error: "Please fill in pick-up, drop-off, vehicle, date, time, name and phone." });
+      }
+      if (b.pickup === b.dropoff) return res.status(400).json({ error: "Pick-up and drop-off are the same place." });
+      const ret = returnLeg(b);
+      if (ret && (!ret.date || !ret.time)) return res.status(400).json({ error: "Please give both a date and a time for the return trip." });
+      if (ret && (ret.date < b.date || (ret.date === b.date && ret.time <= b.time))) {
+        return res.status(400).json({ error: "The return trip has to be after the outbound one." });
+      }
+      const mode = b0.mode === "paid" ? "paid" : "link";
+      const override = Math.round(Number(b0.overrideTotal));
+      const hasOverride = Number.isFinite(override) && override > 0;
+      if (mode === "link" && !stripe) {
+        return res.status(503).json({ error: "Payments are not configured, so no link can be sent. Choose 'paid elsewhere'." });
+      }
+
+      /* Priced as the website prices it. Two suburbs with no airport between
+         them are handed to the point-to-point engine by name, exactly as the
+         form would send them. Whatever is still unpriced needs the override. */
+      let fare = hasOverride ? null : await fareForBooking(b);
+      if (fare == null && !hasOverride && !HUBS.has(b.pickup) && !HUBS.has(b.dropoff)) {
+        fare = await fareForBooking({ ...b, p2p: {
+          pickup: { suburb: b.pickup, address: b.pickup + ", QLD, Australia" },
+          dropoff: { suburb: b.dropoff, address: b.dropoff + ", QLD, Australia" },
+        } });
+      }
+      if (fare == null && !hasOverride) {
+        return res.status(400).json({ error: "There is no online price for that route or vehicle — type the agreed total in the override box." });
+      }
+      b.ref = makeRef(b.date);
+      b.paid = mode === "paid";
+      b.confirmed = true;
+      const s = bookingSummary(b, hasOverride ? 0 : fare, b.childSeats, b.trailer, ret);
+      if (hasOverride) s.total = override;
+      const tag = b.paid ? " (PAID)" : hasOverride ? " (agreed price)" : "";
+      s.text = s.text
+        .replace(/Fare: \$0 one-way\n/, "")
+        .replace(/^Return fare: \$0 .*\n/m, "")
+        .replace(/TOTAL: \$\d+/, "TOTAL: $" + s.total + tag);
+
+      await saveWebBooking({ ...b, userAgent: "office" }, s, b.paid ? "paid" : "confirmed");
+
+      let payUrl = null;
+      if (mode === "link") {
+        const row = await getWebBooking(b.ref);
+        payUrl = await paymentUrlFor(row);
+      }
+      let emailed = null;
+      if (b.email) { await emailGuestConfirmation(b, s, payUrl); emailed = b.email; }
+      mailer.sendMail({
+        from: `"Sky Transfers Website" <${process.env.GMAIL_USER}>`,
+        to: BOOKINGS_EMAIL, replyTo: b.email || undefined,
+        subject: `OFFICE booking${b.paid ? " (paid elsewhere)" : ", payment link sent"}: ${b.pickup} -> ${b.dropoff} (${b.date} ${b.time}) [${b.ref}]`,
+        text: `OFFICE BOOKING — made from the admin page\n\n${s.text}\n` + (payUrl ? `\nPayment link: ${payUrl}\n` : ""),
+      }).catch((e) => console.error("office booking copy:", e.message));
+      console.log("office booking:", b.ref, mode, emailed ? "emailed" : "no guest email");
+      res.json({ ok: true, ref: b.ref, total: s.total, emailed, payUrl });
+    } catch (err) {
+      console.error("office booking:", err);
+      res.status(500).json({ error: "Could not make that booking." });
+    }
+  });
+
+  app.post("/admin/web-booking/resend", requireAdmin, async (req, res) => {
+    try {
+      if (!mailer) return res.status(500).json({ error: "Email is not configured on the server." });
+      const ref = String((req.body && req.body.ref) || "").trim();
+      const r = ref ? await getWebBooking(ref) : null;
+      if (!r) return res.status(404).json({ error: "No booking with that reference." });
+      if (!r.passenger_email) return res.status(400).json({ error: "That booking has no email address, so there is nowhere to send it." });
+      if (r.status === "declined") return res.status(409).json({ error: "That booking was declined — there is nothing to confirm." });
+      const b = rowToBooking(r);
+      const s = summaryForRow(r, b);
+      /* A link only for a confirmed, unpaid booking. A request that has not
+         been confirmed yet gets its request receipt again, not a link - that
+         decision belongs to the Confirm button in the dispatch email. */
+      let payUrl = null;
+      if (r.status === "confirmed" && stripe) {
+        payUrl = await paymentUrlFor(r).catch((e) => { console.error("resend pay link:", e.message); return null; });
+      }
+      await emailGuestConfirmation(b, s, payUrl);
+      console.log("confirmation resent:", ref, "->", r.passenger_email);
+      res.json({ ok: true, ref, to: r.passenger_email, payUrl });
+    } catch (err) {
+      console.error("resend confirmation:", err);
+      res.status(500).json({ error: "Could not send that confirmation." });
     }
   });
 
