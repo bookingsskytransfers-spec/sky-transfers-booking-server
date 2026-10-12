@@ -939,6 +939,11 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
         trailer: r.trailer ? "yes" : "no",
         passenger_name: String(r.passenger_name || ""), phone: String(r.passenger_phone || ""),
         pickup_address: String(r.address || ""), notes: String(r.notes || "").slice(0, 450),
+        /* The return leg. Without these the webhook printed a return booking
+           as a one-way at the return price the moment the guest paid - found
+           on ST-261024-9GCS, 13 Oct 2026. */
+        return_date: String(r.return_date_text || ""), return_time: String(r.return_time || ""),
+        return_flight: String(r.return_flight || "").slice(0, 40),
       },
       after_completion: {
         type: "redirect",
@@ -1625,5 +1630,5 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
   /* stripe-server.js records public-site bookings through this. requireAdmin
      is handed out so other modules can sit behind the same admin login rather
      than growing a second path that accepts the PIN. */
-  return { saveWebBooking, actionLinks, findOpenWebBooking, requireAdmin };
+  return { saveWebBooking, actionLinks, findOpenWebBooking, requireAdmin, getWebBooking };
 };

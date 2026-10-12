@@ -932,6 +932,18 @@ app.post("/stripe-webhook", async (req, res) => {
         returnDate: m.return_date || "", returnTime: m.return_time || "",
         returnFlight: m.return_flight || "",
       };
+      /* An office payment link made before 13 Oct 2026 carried no return leg
+         in its metadata, so a paid return printed as a one-way at the return
+         price. The stored row is the authority whenever the metadata is
+         silent on the return. */
+      if (!b.returnDate && b.ref && portal && typeof portal.getWebBooking === "function") {
+        const row = await portal.getWebBooking(b.ref).catch(() => null);
+        if (row && row.return_date_text) {
+          b.returnDate = row.return_date_text;
+          b.returnTime = row.return_time || "";
+          b.returnFlight = row.return_flight || "";
+        }
+      }
       /* Stripe's amount_total is the figure actually charged, so it already has
          any promotion code taken off. That makes it the only number worth
          printing here, and the reason the fare lines below are stripped out
