@@ -176,6 +176,32 @@ section("a normal lookup");
   }
   eq(guard.calls.length, 0, "and none of those spent a request");
 
+  section("an address instead of coordinates");
+  {
+    const s = stub(okReply(6300, 540));
+    const rd = makeRouteDistance({ key: "k", fetchImpl: s.fetchImpl });
+    const r = await rd.distance({ address: "Broadbeach QLD, Australia" }, SP);
+    eq(r.km, 6.3, "an address origin is accepted and priced");
+    eq(s.calls[0].body.origin.address, "Broadbeach QLD, Australia", "it is sent to Google as an address waypoint");
+    eq(s.calls[0].body.destination.location.latLng.latitude, SP.lat, "while a coordinate end stays a coordinate");
+    const again = await rd.distance({ address: "  broadbeach   QLD,  Australia " }, SP);
+    eq(again.cached, true, "the same address with different spacing and case hits the cache");
+    eq(s.calls.length, 1, "so no second request");
+    const both = await rd.distance({ address: "Broadbeach QLD" }, { address: "Surfers Paradise QLD" });
+    eq(both.km, 6.3, "both ends may be addresses");
+    const mixed = await rd.distance({ lat: GC.lat, lng: GC.lng, address: "ignored when coordinates exist" }, SP);
+    eq(s.calls[s.calls.length - 1].body.origin.location.latLng.latitude, GC.lat, "coordinates win over an address on the same endpoint");
+    for (const [a, why] of [
+      [{ address: "ab" }, "a two-character address"],
+      [{ address: "x".repeat(201) }, "a 201-character address"],
+      [{ address: "   " }, "a blank address"],
+      [{ address: 42 }, "a numeric address"],
+    ]) {
+      const r2 = await rd.distance(a, SP);
+      eq(r2.reason, "bad_coordinates", why + " is refused");
+    }
+  }
+
   section("rounding");
   for (const [metres, km] of [[1049, 1], [1050, 1.1], [4210, 4.2], [4249, 4.2], [4250, 4.3], [84949, 84.9], [100, 0.1]]) {
     const r = await makeRouteDistance({ key: "k", fetchImpl: stub(okReply(metres, 60)).fetchImpl }).distance(GC, SP);

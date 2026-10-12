@@ -51,16 +51,31 @@ function num(v) {
   return Number.isFinite(n) ? n : null;
 }
 
+/* An endpoint is either coordinates or a street address. Coordinates win when
+   both are present. The address form exists because a suburb picked from the
+   form's own list never went through Google and so has no coordinates; the
+   Routes API geocodes an address string itself, so "Broadbeach QLD" works. */
 function point(p) {
   if (!p || typeof p !== "object") return null;
   const lat = num(p.lat), lng = num(p.lng);
-  if (lat === null || lng === null) return null;
-  if (!isLat(lat) || !isLng(lng)) return null;
-  /* Exactly null island is never a real pick-up; it is what a dropped field
-     looks like once something upstream has already coerced it to a number. */
-  if (lat === 0 && lng === 0) return null;
-  return { lat, lng };
+  if (lat !== null && lng !== null) {
+    if (!isLat(lat) || !isLng(lng)) return null;
+    /* Exactly null island is never a real pick-up; it is what a dropped field
+       looks like once something upstream has already coerced it to a number. */
+    if (lat === 0 && lng === 0) return null;
+    return { lat, lng };
+  }
+  const address = typeof p.address === "string" ? p.address.trim().replace(/\s+/g, " ") : "";
+  if (address.length >= 3 && address.length <= 200) return { address };
+  return null;
 }
+
+const cacheKeyOf = (a) => a.address
+  ? "a:" + a.address.toLowerCase()
+  : round(a.lat, COORD_DP) + "," + round(a.lng, COORD_DP);
+const waypointOf = (a) => a.address
+  ? { address: a.address }
+  : { location: { latLng: { latitude: a.lat, longitude: a.lng } } };
 
 module.exports = function makeRouteDistance(opts) {
   const o = Object.assign({}, DEFAULTS, opts || {});
@@ -90,14 +105,13 @@ module.exports = function makeRouteDistance(opts) {
     if (!a || !b) return { km: null, reason: "bad_coordinates" };
     if (!key) return { km: null, reason: "no_key" };
 
-    const ck = [round(a.lat, COORD_DP), round(a.lng, COORD_DP),
-                round(b.lat, COORD_DP), round(b.lng, COORD_DP)].join(",");
+    const ck = cacheKeyOf(a) + "|" + cacheKeyOf(b);
     const hit = cacheGet(ck);
     if (hit) return Object.assign({}, hit, { cached: true });
 
     const body = {
-      origin: { location: { latLng: { latitude: a.lat, longitude: a.lng } } },
-      destination: { location: { latLng: { latitude: b.lat, longitude: b.lng } } },
+      origin: waypointOf(a),
+      destination: waypointOf(b),
       travelMode: "DRIVE",
       routingPreference: "TRAFFIC_UNAWARE",
       units: "METRIC",

@@ -141,6 +141,17 @@ const VEHICLE_ALIASES = {
 const CHILD_SEAT_PRICE = 15; // per seat, AUD
 const TRAILER_PRICE = 30;    // luggage trailer, AUD
 
+/* The fare for a booking of either kind. A point-to-point booking carries
+   b.p2p with the two endpoints the page had priced; the module that prices
+   them is mounted at the bottom of this file and assigned to `p2p` there,
+   which is fine because this only ever runs inside a request. Without it, or
+   without b.p2p, this is exactly computeFare. */
+let p2p = null;
+async function fareForBooking(b) {
+  if (b && b.p2p && p2p && typeof p2p.fareFor === "function") return p2p.fareFor(b);
+  return computeFare(b.pickup, b.dropoff, b.vehicle);
+}
+
 function computeFare(pickup, dropoff, vehicle) {
   const name = VEHICLE_ALIASES[vehicle] || vehicle;
   if (QUOTE_ONLY.has(name)) return null;
@@ -619,7 +630,7 @@ app.post("/request-booking", async (req, res) => {
     if (!b.pickup || !b.dropoff || !b.vehicle || !b.date || !b.name || !b.phone || !b.email) {
       return res.status(400).json({ error: "Missing booking details" });
     }
-    const fare = computeFare(b.pickup, b.dropoff, b.vehicle);
+    const fare = await fareForBooking(b);
     if (fare == null) return res.status(400).json({ error: "This route or vehicle needs a manual quote — please email or call us." });
     if (leadTimeShortfall(b.date, b.time) !== null) return res.status(400).json({ error: LEAD_TIME_ERROR });
     const seats = Math.min(Math.max(parseInt(b.childSeats, 10) || 0, 0), 3);
@@ -752,7 +763,7 @@ app.post("/create-checkout", async (req, res) => {
   try {
     if (!stripe) return res.status(500).json({ error: "Payments are not configured on the server" });
     const b = req.body || {};
-    const fare = computeFare(b.pickup, b.dropoff, b.vehicle);
+    const fare = await fareForBooking(b);
     if (fare == null) {
       return res.status(400).json({ error: "This route or vehicle needs a manual quote — please email or call us." });
     }
@@ -809,8 +820,9 @@ app.post("/create-checkout", async (req, res) => {
         currency: "aud",
         unit_amount: summary.transfer * 100,
         product_data: {
-          name: ret ? `Return airport transfer — ${b.vehicle}`
-                    : `Airport transfer — ${b.vehicle}`,
+          name: (b.p2p
+                  ? (ret ? "Return private transfer" : "Private transfer")
+                  : (ret ? "Return airport transfer" : "Airport transfer")) + ` — ${b.vehicle}`,
           description: ret
             ? `Out ${b.pickup} → ${b.dropoff} · ${b.date} ${b.time}. ` +
               `Back ${b.dropoff} → ${b.pickup} · ${ret.date} ${ret.time}. ` +
@@ -986,7 +998,7 @@ try {
    It is handed the zone tables so it holds no copy of its own, and the admin
    guard so its self-test sits behind the existing admin login. */
 try {
-  require("./p2p-routes")({
+  p2p = require("./p2p-routes")({
     app,
     requireAdmin: portal && portal.requireAdmin,
     VEHICLES, VEHICLE_ALIASES, QUOTE_ONLY,

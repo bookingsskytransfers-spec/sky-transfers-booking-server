@@ -108,6 +108,59 @@ const SP = { lat: -27.9990, lng: 153.4290, suburb: "Surfers Paradise" };
     eq(r.body.fare, 100, "12.4 km in Brisbane in an SUV is 85 + 15");
   }
 
+  section("no vehicle named: the whole ladder for the vehicle grid");
+  {
+    const roads = stubRoads({ km: 4.2, minutes: 8 });
+    const { app } = mount(roads, true);
+    const r = await call(app, "POST /p2p-quote", { pickup: GC, dropoff: SP });
+    eq(r.code, 200, "it answers 200");
+    ok(Array.isArray(r.body.fares) && r.body.fares.length === VEHICLES.length, "one entry per vehicle, in VEHICLES order");
+    eq(r.body.fares[0], 80, "Sedan is the $80 floor");
+    eq(r.body.fares[1], 95, "SUV is 80 + 15");
+    eq(r.body.fares[6], 275, "Sprinter 14 is 80 + 195");
+    eq(r.body.fares[7], null, "the 18-seater is null - quoted by hand");
+    eq(r.body.km, 4.2, "distance comes back too");
+    eq(roads.calls, 1, "one Routes call prices all seven");
+    ok(!("fare" in r.body), "no single fare when none was asked for");
+  }
+  {
+    const roads = stubRoads({ km: 4.2 });
+    const { app } = mount(roads, true);
+    const r = await call(app, "POST /p2p-quote", { pickup: { ...GC, suburb: OOL }, dropoff: SP });
+    eq(r.code, 422, "an airport end is still refused with no vehicle named");
+    eq(roads.calls, 0, "and spends nothing");
+  }
+  {
+    /* A suburb picked from the form's own list arrives with no coordinates. */
+    const seen = [];
+    const roads = { enabled: true, distance: async (a, b) => { seen.push([a, b]); return { km: 4.2, minutes: 8 }; } };
+    const { app } = mount(roads, true);
+    const r = await call(app, "POST /p2p-quote", { pickup: { suburb: "Broadbeach", address: "Broadbeach, QLD, Australia" }, dropoff: SP });
+    eq(r.code, 200, "an address-only pickup is priced");
+    eq(seen[0][0].address, "Broadbeach, QLD, Australia", "the address is what the distance lookup gets");
+    ok(!("lat" in seen[0][0]), "and no made-up coordinates");
+    eq(seen[0][1].lat, SP.lat, "the coordinate end is passed as coordinates");
+  }
+
+  section("fareFor: the price checkout recomputes before charging");
+  {
+    const roads = stubRoads({ km: 12.4, minutes: 18 });
+    const { api } = mount(roads, true);
+    ok(typeof api.fareFor === "function", "fareFor is exported");
+    const b = { vehicle: "SUV", p2p: { pickup: { lat: -27.47, lng: 153.02, suburb: "Brisbane CBD" }, dropoff: { lat: -27.38, lng: 153.03, suburb: "Chermside" } } };
+    eq(await api.fareFor(b), 100, "12.4 km in Brisbane in an SUV is 85 + 15, same as the quote");
+    eq(await api.fareFor({ vehicle: "Sedan" }), null, "no p2p block means null - the caller falls back to computeFare");
+    eq(await api.fareFor({ vehicle: "Sedan", p2p: { pickup: GC } }), null, "a missing dropoff is null");
+    eq(await api.fareFor({ vehicle: "Mercedes Sprinter 18-Seater", p2p: b.p2p }), null, "the 18-seater is null");
+    eq(await api.fareFor({ vehicle: "Sedan", p2p: { pickup: { ...GC, suburb: OOL }, dropoff: SP } }), null, "an airport end is null");
+    const before = roads.calls;
+    await api.fareFor({ vehicle: "Sedan", p2p: { pickup: { ...GC, suburb: OOL }, dropoff: SP } });
+    eq(roads.calls, before, "and a refusal costs no Routes call");
+    const dead = { enabled: true, distance: async () => ({ km: null, reason: "timeout" }) };
+    const { api: api2 } = mount(dead, true);
+    eq(await api2.fareFor(b), null, "a distance failure is null, never a guessed price");
+  }
+
   section("the money-saving bit: refuse before paying for a distance");
   for (const [body, why] of [
     [{ pickup: { ...GC, suburb: OOL }, dropoff: SP, vehicle: "Sedan" }, "an airport pick-up"],
