@@ -149,6 +149,7 @@ module.exports = function installAgentPortal(ctx) {
       ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS return_flight    TEXT;
       ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS payment_link_id  TEXT;
       ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS payment_link_url TEXT;
+      ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS link_seq         INTEGER NOT NULL DEFAULT 0;
       CREATE INDEX IF NOT EXISTS web_bookings_recent ON web_bookings (created_at DESC);
       CREATE INDEX IF NOT EXISTS web_bookings_status ON web_bookings (status, created_at DESC);
     `);
@@ -730,6 +731,8 @@ module.exports = function installAgentPortal(ctx) {
     flight: r.flight, address: r.address, notes: r.notes,
     pax: r.pax, childSeats: r.child_seats, trailer: r.trailer,
     returnDate: r.return_date, returnTime: r.return_time, returnFlight: r.return_flight,
+    /* Plain text dates for the amend form; the Date objects above can slide a day in JSON. */
+    dateText: r.pickup_date_text || null, returnDateText: r.return_date_text || null,
     total: r.total_cents / 100, status: r.status,
     confirmedAt: r.confirmed_at, declinedAt: r.declined_at, paidAt: r.paid_at,
   });
@@ -925,7 +928,7 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
       currency: "aud",
       unit_amount: r.total_cents,
       product_data: { name: `Transfer — ${r.pickup} to ${r.dropoff}` },
-    }, { idempotencyKey: "price-" + r.ref });
+    }, { idempotencyKey: "price-" + r.ref + "-" + (r.link_seq || 0) });
 
     const link = await stripe.paymentLinks.create({
       line_items: [{ price: price.id, quantity: 1 }],
@@ -950,7 +953,7 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
         redirect: { url: process.env.SUCCESS_URL || "https://www.skytransfers.com.au/?booking=confirmed" },
       },
       inactive_message: "This booking has already been paid. If you need anything, call or text +61 481 437 772.",
-    }, { idempotencyKey: "plink-" + r.ref });
+    }, { idempotencyKey: "plink-" + r.ref + "-" + (r.link_seq || 0) });
 
     await pool.query(
       `UPDATE web_bookings SET payment_link_id = $2, payment_link_url = $3 WHERE ref = $1`,
@@ -1145,66 +1148,78 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
     });
   }
 
+  /* The office form, parsed, validated and priced - shared by create and
+     amend so the two can never disagree about what a valid booking is.
+     Sends the refusal itself and returns null when the form is not usable. */
+  async function parseOfficeBooking(b0, res) {
+    const b = {
+      pickup: String(b0.pickup || "").trim(), dropoff: String(b0.dropoff || "").trim(),
+      vehicle: String(b0.vehicle || "").trim(), date: isoDate(b0.date), time: hhmm(b0.time),
+      pax: Math.min(Math.max(parseInt(b0.pax, 10) || 1, 1), 53),
+      flight: String(b0.flight || "").trim().slice(0, 40),
+      childSeats: Math.min(Math.max(parseInt(b0.childSeats, 10) || 0, 0), 3),
+      trailer: b0.trailer === true || b0.trailer === "true",
+      name: String(b0.name || "").trim(), phone: String(b0.phone || "").trim(),
+      email: String(b0.email || "").trim(), address: String(b0.address || "").trim(),
+      notes: String(b0.notes || "").trim().slice(0, 450),
+      returnDate: isoDate(b0.returnDate), returnTime: hhmm(b0.returnTime),
+      returnFlight: String(b0.returnFlight || "").trim().slice(0, 40),
+    };
+    /* Every refusal is logged with its reason. A booking the office could not
+       make is worth a line in the log even when nothing went wrong. */
+    const refuse = (msg, code) => {
+      console.log("office booking refused:", msg, "|", b.pickup || "-", "->", b.dropoff || "-", "|", b.vehicle || "-");
+      res.status(code || 400).json({ error: msg });
+      return null;
+    };
+    const missing = ["pickup", "dropoff", "vehicle", "date", "time", "name", "phone"].filter((f) => !b[f]);
+    if (missing.length) return refuse("Please fill in: " + missing.join(", ") + ".");
+    if (b.pickup === b.dropoff) return refuse("Pick-up and drop-off are the same place.");
+    const ret = returnLeg(b);
+    if (ret && (!ret.date || !ret.time)) return refuse("Please give both a date and a time for the return trip.");
+    if (ret && (ret.date < b.date || (ret.date === b.date && ret.time <= b.time))) {
+      return refuse("The return trip has to be after the outbound one.");
+    }
+    const override = Math.round(Number(b0.overrideTotal));
+    const hasOverride = Number.isFinite(override) && override > 0;
+    /* The two ends must be places we price - a suburb or airport from the
+       list - unless the office is naming its own total. A street address
+       belongs in the exact-address field, not here. */
+    if (!hasOverride) {
+      const unknown = [b.pickup, b.dropoff].filter((p) => !PRICED_PLACES.has(p));
+      if (unknown.length) {
+        return refuse(`"${unknown[0]}" is not in our priced places list. Pick-up and drop-off need to be a suburb or airport from the suggestions ` +
+          `(start typing and choose one) - put the street address in the exact-address box. Or type the agreed total in the override box.`);
+      }
+    }
+
+    /* Priced as the website prices it. Two suburbs with no airport between
+       them are handed to the point-to-point engine by name, exactly as the
+       form would send them. Whatever is still unpriced needs the override. */
+    let fare = hasOverride ? null : await fareForBooking(b);
+    if (fare == null && !hasOverride && !HUBS.has(b.pickup) && !HUBS.has(b.dropoff)) {
+      fare = await fareForBooking({ ...b, p2p: {
+        pickup: { suburb: b.pickup, address: b.pickup + ", QLD, Australia" },
+        dropoff: { suburb: b.dropoff, address: b.dropoff + ", QLD, Australia" },
+      } });
+    }
+    if (fare == null && !hasOverride) {
+      return refuse("There is no online price for that route or vehicle — type the agreed total in the override box.");
+    }
+    return { b, ret, fare, override, hasOverride };
+  }
+
   app.post("/admin/web-booking/create", requireAdmin, async (req, res) => {
     try {
       if (!mailer) return res.status(500).json({ error: "Email is not configured on the server." });
       const b0 = req.body || {};
-      const b = {
-        pickup: String(b0.pickup || "").trim(), dropoff: String(b0.dropoff || "").trim(),
-        vehicle: String(b0.vehicle || "").trim(), date: isoDate(b0.date), time: hhmm(b0.time),
-        pax: Math.min(Math.max(parseInt(b0.pax, 10) || 1, 1), 53),
-        flight: String(b0.flight || "").trim().slice(0, 40),
-        childSeats: Math.min(Math.max(parseInt(b0.childSeats, 10) || 0, 0), 3),
-        trailer: b0.trailer === true || b0.trailer === "true",
-        name: String(b0.name || "").trim(), phone: String(b0.phone || "").trim(),
-        email: String(b0.email || "").trim(), address: String(b0.address || "").trim(),
-        notes: String(b0.notes || "").trim().slice(0, 450),
-        returnDate: isoDate(b0.returnDate), returnTime: hhmm(b0.returnTime),
-        returnFlight: String(b0.returnFlight || "").trim().slice(0, 40),
-      };
-      /* Every refusal is logged with its reason. A booking the office could not
-         make is worth a line in the log even when nothing went wrong. */
-      const refuse = (msg, code) => {
-        console.log("office booking refused:", msg, "|", b.pickup || "-", "->", b.dropoff || "-", "|", b.vehicle || "-");
-        return res.status(code || 400).json({ error: msg });
-      };
-      const missing = ["pickup", "dropoff", "vehicle", "date", "time", "name", "phone"].filter((f) => !b[f]);
-      if (missing.length) return refuse("Please fill in: " + missing.join(", ") + ".");
-      if (b.pickup === b.dropoff) return refuse("Pick-up and drop-off are the same place.");
-      const ret = returnLeg(b);
-      if (ret && (!ret.date || !ret.time)) return refuse("Please give both a date and a time for the return trip.");
-      if (ret && (ret.date < b.date || (ret.date === b.date && ret.time <= b.time))) {
-        return refuse("The return trip has to be after the outbound one.");
-      }
+      const parsed = await parseOfficeBooking(b0, res);
+      if (!parsed) return;
+      const { b, ret, fare, override, hasOverride } = parsed;
       const mode = b0.mode === "paid" ? "paid" : "link";
-      const override = Math.round(Number(b0.overrideTotal));
-      const hasOverride = Number.isFinite(override) && override > 0;
       if (mode === "link" && !stripe) {
-        return refuse("Payments are not configured, so no link can be sent. Choose 'paid elsewhere'.", 503);
-      }
-      /* The two ends must be places we price - a suburb or airport from the
-         list - unless the office is naming its own total. A street address
-         belongs in the exact-address field, not here. */
-      if (!hasOverride) {
-        const unknown = [b.pickup, b.dropoff].filter((p) => !PRICED_PLACES.has(p));
-        if (unknown.length) {
-          return refuse(`"${unknown[0]}" is not in our priced places list. Pick-up and drop-off need to be a suburb or airport from the suggestions ` +
-            `(start typing and choose one) - put the street address in the exact-address box. Or type the agreed total in the override box.`);
-        }
-      }
-
-      /* Priced as the website prices it. Two suburbs with no airport between
-         them are handed to the point-to-point engine by name, exactly as the
-         form would send them. Whatever is still unpriced needs the override. */
-      let fare = hasOverride ? null : await fareForBooking(b);
-      if (fare == null && !hasOverride && !HUBS.has(b.pickup) && !HUBS.has(b.dropoff)) {
-        fare = await fareForBooking({ ...b, p2p: {
-          pickup: { suburb: b.pickup, address: b.pickup + ", QLD, Australia" },
-          dropoff: { suburb: b.dropoff, address: b.dropoff + ", QLD, Australia" },
-        } });
-      }
-      if (fare == null && !hasOverride) {
-        return refuse("There is no online price for that route or vehicle — type the agreed total in the override box.");
+        console.log("office booking refused: payments not configured |", b.pickup, "->", b.dropoff);
+        return res.status(503).json({ error: "Payments are not configured, so no link can be sent. Choose 'paid elsewhere'." });
       }
       b.ref = makeRef(b.date);
       b.paid = mode === "paid";
@@ -1272,6 +1287,79 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
     }
   });
 
+  /* ---- amend a booking from the admin page --------------------------------
+     Anything but the reference can change. The row gets its own UPDATE because
+     saveWebBooking's ON CONFLICT deliberately never lowers a total or touches
+     the trip fields. A confirmed booking's old payment link is switched off
+     (with a message saying why) and a fresh one made for the new total, and
+     the guest is sent the updated confirmation. Paid bookings are refused:
+     money has moved, and that is a refund or a second charge, not an edit. */
+  app.post("/admin/web-booking/amend", requireAdmin, async (req, res) => {
+    try {
+      if (!mailer) return res.status(500).json({ error: "Email is not configured on the server." });
+      const b0 = req.body || {};
+      const ref = String(b0.ref || "").trim();
+      const r = ref ? await getWebBooking(ref) : null;
+      if (!r) return res.status(404).json({ error: "No booking with that reference." });
+      if (r.status === "paid") {
+        return res.status(409).json({ error: "That booking is already paid, so its total cannot be edited here - refund or charge the difference in Stripe, and tell the guest by email." });
+      }
+      const parsed = await parseOfficeBooking(b0, res);
+      if (!parsed) return;
+      const { b, ret, fare, override, hasOverride } = parsed;
+      b.ref = ref;
+      b.paid = false;
+      b.confirmed = r.status === "confirmed";
+      const s = bookingSummary(b, hasOverride ? 0 : fare, b.childSeats, b.trailer, ret);
+      if (hasOverride) s.total = override;
+      s.text = s.text
+        .replace(/Fare: \$0 one-way\n/, "")
+        .replace(/^Return fare: \$0 .*\n/m, "")
+        .replace(/TOTAL: \$\d+/, "TOTAL: $" + s.total + (hasOverride ? " (agreed price)" : ""));
+      const wasCents = r.total_cents || 0;
+      const oldLink = r.payment_link_id || null;
+
+      await pool.query(
+        `UPDATE web_bookings SET
+           pickup = $2, dropoff = $3, vehicle = $4, pickup_date = $5, pickup_time = $6,
+           passenger_name = $7, passenger_phone = $8, passenger_email = $9, flight = $10,
+           address = $11, notes = $12, pax = $13, child_seats = $14, trailer = $15,
+           total_cents = $16, return_date = $17, return_time = $18, return_flight = $19,
+           payment_link_id = NULL, payment_link_url = NULL, link_seq = link_seq + 1
+         WHERE ref = $1 AND status <> 'paid'`,
+        [ref, b.pickup, b.dropoff, b.vehicle, b.date, b.time, b.name, b.phone, b.email || null,
+         b.flight || null, b.address || null, b.notes || null, b.pax, b.childSeats, b.trailer,
+         Math.round(s.total * 100), b.returnDate || null, b.returnTime || null, b.returnFlight || null]);
+
+      if (oldLink && stripe) {
+        await stripe.paymentLinks.update(oldLink, {
+          active: false,
+          inactive_message: "This booking has been updated. Please use the payment link in your latest email, or call +61 481 437 772.",
+        }).catch((e) => console.error("amend: old link:", e.message));
+      }
+      let payUrl = null;
+      if (b.confirmed && stripe) {
+        payUrl = await paymentUrlFor(await getWebBooking(ref)).catch((e) => { console.error("amend pay link:", e.message); return null; });
+      }
+      /* A request that is not confirmed yet is not re-sent: confirming it is
+         still the dispatch email's job, and that email carries the new figures. */
+      let emailed = null;
+      if (b.confirmed && b.email) { await emailGuestConfirmation(b, s, payUrl); emailed = b.email; }
+      mailer.sendMail({
+        from: `"Sky Transfers Website" <${process.env.GMAIL_USER}>`,
+        to: BOOKINGS_EMAIL, replyTo: b.email || undefined,
+        subject: `OFFICE amended: ${b.pickup} -> ${b.dropoff} (${b.date} ${b.time}) [${ref}] now $${s.total}`,
+        text: `OFFICE AMENDMENT - changed from the admin page\nWas $${Math.round(wasCents / 100)}, now $${s.total}.\n\n${s.text}\n` +
+              (payUrl ? `\nNew payment link: ${payUrl}\n` : "") + (oldLink ? "The previous payment link has been switched off.\n" : ""),
+      }).catch((e) => console.error("office amend copy:", e.message));
+      console.log("office booking amended:", ref, "$" + Math.round(wasCents / 100), "->", "$" + s.total, emailed ? "emailed" : "no guest email");
+      res.json({ ok: true, ref, total: s.total, was: Math.round(wasCents / 100), emailed, payUrl, status: r.status });
+    } catch (err) {
+      console.error("office amend:", err);
+      res.status(500).json({ error: "Could not change that booking." });
+    }
+  });
+
   app.post("/admin/web-booking/remove", requireAdmin, async (req, res) => {
     try {
       const ref = String((req.body && req.body.ref) || "").trim();
@@ -1302,7 +1390,9 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
       const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 200, 1), 500);
       const filtered = WEB_STATUSES.includes(status);
       const { rows } = await pool.query(
-        `SELECT * FROM web_bookings ${filtered ? "WHERE status = $2" : ""}
+        `SELECT *, to_char(pickup_date, 'YYYY-MM-DD') AS pickup_date_text,
+                  to_char(return_date, 'YYYY-MM-DD') AS return_date_text
+           FROM web_bookings ${filtered ? "WHERE status = $2" : ""}
          ORDER BY created_at DESC LIMIT $1`,
         filtered ? [limit, status] : [limit]);
       const { rows: counts } = await pool.query(
