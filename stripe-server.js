@@ -271,7 +271,8 @@ function bookingPdf(b, s) {
     ]).concat([
       ["VEHICLE", b.vehicle],
       ["PASSENGERS", String(b.pax || "—")],
-      b.flight ? ["FLIGHT", b.flight] : null,
+      b.flight ? [ret ? "OUTBOUND FLIGHT" : "FLIGHT", b.flight] : null,
+      ret && ret.flight ? ["RETURN FLIGHT", ret.flight] : null,
       b.address ? ["PICK-UP / DROP-OFF ADDRESS", b.address] : null,
       ["LEAD PASSENGER", `${b.name}   ·   ${b.phone}`],
       ["EXTRAS", extras + (ret && extras !== "None" ? "  (each leg)" : "")],
@@ -410,7 +411,8 @@ function bookingEmailHtml(b, s) {
           : row("DATE &amp; TIME", `${niceDate(b.date)} at ${b.time}`)}
         ${row("VEHICLE", b.vehicle)}
         ${row("PASSENGERS", b.pax)}
-        ${row("FLIGHT", b.flight)}
+        ${row(ret ? "OUTBOUND FLIGHT" : "FLIGHT", b.flight)}
+        ${ret ? row("RETURN FLIGHT", ret.flight) : ""}
         ${row("PICK-UP / DROP-OFF ADDRESS", b.address)}
         ${row("EXTRAS", extras + (ret && extras !== "None" ? " (each leg)" : ""))}
       </table>
@@ -502,7 +504,14 @@ function returnTransfer(fare) { return Math.round(fare * 2 * (1 - RETURN_DISCOUN
 function returnLeg(b) {
   const date = String((b && b.returnDate) || "").trim();
   if (!date) return null;
-  return { date, time: String((b && b.returnTime) || "").trim() };
+  return {
+    date,
+    time: String((b && b.returnTime) || "").trim(),
+    /* The flight for the leg where we collect the guest at the terminal. It is
+       a different flight from the outbound one, and it is the one dispatch
+       needs to track. Optional; bounded because it lands in Stripe metadata. */
+    flight: String((b && b.returnFlight) || "").trim().slice(0, 40),
+  };
 }
 
 /* Dates are ISO, so a string compare is a date compare. */
@@ -531,6 +540,7 @@ function bookingSummary(b, fare, seats, trailer, ret) {
     `Trip: RETURN`,
     `Return date: ${ret.date}`,
     `Return pick-up time: ${ret.time}`,
+    `Return flight: ${ret.flight || "-"}`,
     `Return fare: $${transfer} for both legs (saved $${saved}, ${Math.round(RETURN_DISCOUNT * 100)}% off)`,
   ] : [];
   return {
@@ -860,6 +870,7 @@ app.post("/create-checkout", async (req, res) => {
         trip_type: ret ? "return" : "one-way",
         return_date: ret ? ret.date : "",
         return_time: ret ? ret.time : "",
+        return_flight: ret ? ret.flight : "",
         passenger_name: String(b.name || ""), phone: String(b.phone || ""),
         pickup_address: String(b.address || ""),
         notes: String(b.notes || "").slice(0, 450),
@@ -891,6 +902,7 @@ app.post("/stripe-webhook", async (req, res) => {
         email: sess.customer_email || sess.customer_details?.email || "", address: m.pickup_address,
         notes: m.notes, paid: true,
         returnDate: m.return_date || "", returnTime: m.return_time || "",
+        returnFlight: m.return_flight || "",
       };
       /* Stripe's amount_total is the figure actually charged, so it already has
          any promotion code taken off. That makes it the only number worth
