@@ -1082,6 +1082,7 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
      through. Admin bookings skip the six-hour rule on purpose: the office
      knows what is free right now, which is the whole point of the phone. */
   const HUBS = new Set(HUB_NAMES || []);
+  const PRICED_PLACES = new Set(PLACES_FOR_AGENTS || []);
   const isoDate = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || "")) ? String(v) : "";
   const hhmm = (v) => /^\d{1,2}:\d{2}/.test(String(v || "")) ? String(v).slice(0, 5) : "";
 
@@ -1156,20 +1157,35 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
         returnDate: isoDate(b0.returnDate), returnTime: hhmm(b0.returnTime),
         returnFlight: String(b0.returnFlight || "").trim().slice(0, 40),
       };
-      for (const f of ["pickup", "dropoff", "vehicle", "date", "time", "name", "phone"]) {
-        if (!b[f]) return res.status(400).json({ error: "Please fill in pick-up, drop-off, vehicle, date, time, name and phone." });
-      }
-      if (b.pickup === b.dropoff) return res.status(400).json({ error: "Pick-up and drop-off are the same place." });
+      /* Every refusal is logged with its reason. A booking the office could not
+         make is worth a line in the log even when nothing went wrong. */
+      const refuse = (msg, code) => {
+        console.log("office booking refused:", msg, "|", b.pickup || "-", "->", b.dropoff || "-", "|", b.vehicle || "-");
+        return res.status(code || 400).json({ error: msg });
+      };
+      const missing = ["pickup", "dropoff", "vehicle", "date", "time", "name", "phone"].filter((f) => !b[f]);
+      if (missing.length) return refuse("Please fill in: " + missing.join(", ") + ".");
+      if (b.pickup === b.dropoff) return refuse("Pick-up and drop-off are the same place.");
       const ret = returnLeg(b);
-      if (ret && (!ret.date || !ret.time)) return res.status(400).json({ error: "Please give both a date and a time for the return trip." });
+      if (ret && (!ret.date || !ret.time)) return refuse("Please give both a date and a time for the return trip.");
       if (ret && (ret.date < b.date || (ret.date === b.date && ret.time <= b.time))) {
-        return res.status(400).json({ error: "The return trip has to be after the outbound one." });
+        return refuse("The return trip has to be after the outbound one.");
       }
       const mode = b0.mode === "paid" ? "paid" : "link";
       const override = Math.round(Number(b0.overrideTotal));
       const hasOverride = Number.isFinite(override) && override > 0;
       if (mode === "link" && !stripe) {
-        return res.status(503).json({ error: "Payments are not configured, so no link can be sent. Choose 'paid elsewhere'." });
+        return refuse("Payments are not configured, so no link can be sent. Choose 'paid elsewhere'.", 503);
+      }
+      /* The two ends must be places we price - a suburb or airport from the
+         list - unless the office is naming its own total. A street address
+         belongs in the exact-address field, not here. */
+      if (!hasOverride) {
+        const unknown = [b.pickup, b.dropoff].filter((p) => !PRICED_PLACES.has(p));
+        if (unknown.length) {
+          return refuse(`"${unknown[0]}" is not in our priced places list. Pick-up and drop-off need to be a suburb or airport from the suggestions ` +
+            `(start typing and choose one) - put the street address in the exact-address box. Or type the agreed total in the override box.`);
+        }
       }
 
       /* Priced as the website prices it. Two suburbs with no airport between
@@ -1183,7 +1199,7 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
         } });
       }
       if (fare == null && !hasOverride) {
-        return res.status(400).json({ error: "There is no online price for that route or vehicle — type the agreed total in the override box." });
+        return refuse("There is no online price for that route or vehicle — type the agreed total in the override box.");
       }
       b.ref = makeRef(b.date);
       b.paid = mode === "paid";
@@ -1225,9 +1241,15 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
       const ref = String((req.body && req.body.ref) || "").trim();
       const r = ref ? await getWebBooking(ref) : null;
       if (!r) return res.status(404).json({ error: "No booking with that reference." });
-      if (!r.passenger_email) return res.status(400).json({ error: "That booking has no email address, so there is nowhere to send it." });
       if (r.status === "declined") return res.status(409).json({ error: "That booking was declined — there is nothing to confirm." });
+      /* The office may send it somewhere other than the address on the
+         booking - a corrected address, a travel agent, a second passenger.
+         The booking's own record is not changed. */
+      const to = String((req.body && req.body.to) || "").trim() || r.passenger_email || "";
+      if (!to) return res.status(400).json({ error: "That booking has no email address — type one to send it to." });
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) return res.status(400).json({ error: "That doesn't look like an email address." });
       const b = rowToBooking(r);
+      b.email = to;
       const s = summaryForRow(r, b);
       /* A link only for a confirmed, unpaid booking. A request that has not
          been confirmed yet gets its request receipt again, not a link - that
@@ -1237,8 +1259,8 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
         payUrl = await paymentUrlFor(r).catch((e) => { console.error("resend pay link:", e.message); return null; });
       }
       await emailGuestConfirmation(b, s, payUrl);
-      console.log("confirmation resent:", ref, "->", r.passenger_email);
-      res.json({ ok: true, ref, to: r.passenger_email, payUrl });
+      console.log("confirmation resent:", ref, "->", to, to === r.passenger_email ? "" : "(not the booking's own address)");
+      res.json({ ok: true, ref, to, payUrl });
     } catch (err) {
       console.error("resend confirmation:", err);
       res.status(500).json({ error: "Could not send that confirmation." });
