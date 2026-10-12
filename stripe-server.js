@@ -980,3 +980,19 @@ try {
 } catch (err) {
   console.error("Blog feed not mounted (bookings unaffected):", err.message);
 }
+
+/* Point-to-point quotes: neither end an airport. Same treatment as the blog
+   feed - wrapped, because it is new and nothing on the booking path needs it.
+   It is handed the zone tables so it holds no copy of its own, and the admin
+   guard so its self-test sits behind the existing admin login. */
+try {
+  require("./p2p-routes")({
+    app,
+    requireAdmin: portal && portal.requireAdmin,
+    VEHICLES, VEHICLE_ALIASES, QUOTE_ONLY,
+    SUBURBS, BM_SUBURB, LD_SUBURB,
+    HUB_NAMES: [OOL, BNE, CRUISE],
+  });
+} catch (err) {
+  console.error("p2p quotes not mounted (bookings unaffected):", err.message);
+}
