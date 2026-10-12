@@ -1427,6 +1427,8 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
         : "Agent portal off (set DATABASE_URL and AGENT_SECRET)"))
     .catch((e) => console.error("Agent portal setup failed:", e.message));
 
-  /* stripe-server.js records public-site bookings through this. */
-  return { saveWebBooking, actionLinks, findOpenWebBooking };
+  /* stripe-server.js records public-site bookings through this. requireAdmin
+     is handed out so other modules can sit behind the same admin login rather
+     than growing a second path that accepts the PIN. */
+  return { saveWebBooking, actionLinks, findOpenWebBooking, requireAdmin };
 };
