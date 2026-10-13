@@ -258,11 +258,12 @@ function bookingPdf(b, s) {
     doc.font("Helvetica-Bold").fontSize(17).fillColor(INK).text(b.ref || "—", L, y + 12);
     /* Three states, not two: a booking the office confirmed and sent a payment
        link for is neither a request nor paid. */
-    const pill = b.paid ? "PAID IN FULL" : b.confirmed ? "CONFIRMED" : "AWAITING CONFIRMATION";
+    const pill = (b.paid && s.balance) ? "PAID · BALANCE DUE" : b.paid ? "PAID IN FULL" : b.confirmed ? "CONFIRMED" : "AWAITING CONFIRMATION";
     doc.font("Helvetica-Bold").fontSize(8);
     const pillW = doc.widthOfString(pill) + 24;
-    doc.roundedRect(R - pillW, y + 8, pillW, 20, 10).fill(b.paid ? "#1E7F4F" : SOFT);
-    doc.font("Helvetica-Bold").fontSize(8).fillColor(b.paid ? "#FFFFFF" : GOLD_D)
+    const green = b.paid && !s.balance;
+    doc.roundedRect(R - pillW, y + 8, pillW, 20, 10).fill(green ? "#1E7F4F" : SOFT);
+    doc.font("Helvetica-Bold").fontSize(8).fillColor(green ? "#FFFFFF" : GOLD_D)
       .text(pill, R - pillW, y + 14, { width: pillW, align: "center", characterSpacing: 1 });
 
     // ---------- Trip card ----------
@@ -323,7 +324,9 @@ function bookingPdf(b, s) {
     doc.font("Times-Roman").fontSize(24).fillColor(INK)
       .text(`$${s.total}`, L, y + 10, { width: CW - 20, align: "right" });
     doc.font("Helvetica").fontSize(8).fillColor(MUTED)
-      .text(b.paid ? "Paid by card via Stripe" : b.confirmed ? "Payment details sent by email" : "Payment taken on confirmation", L, y + 34, { width: CW - 20, align: "right" });
+      .text(b.paid && s.balance ? `Paid $${s.total - s.balance} by card · balance $${s.balance} due, see the link in your email`
+          : b.paid && s.refund ? `Paid by card via Stripe · $${s.refund} refunded to your card`
+          : b.paid ? "Paid by card via Stripe" : b.confirmed ? "Payment details sent by email" : "Payment taken on confirmation", L, y + 34, { width: CW - 20, align: "right" });
 
     // ---------- Included ----------
     y += 66;
@@ -404,7 +407,7 @@ function bookingEmailHtml(b, s) {
           <div style="font:700 20px Arial,sans-serif;color:#141D30;padding-top:2px;">${esc(b.ref)}</div>
         </td>
         <td align="right" style="vertical-align:middle;">
-          <span style="display:inline-block;padding:6px 14px;border-radius:12px;font:700 10px Arial,sans-serif;letter-spacing:1px;${paid ? "background:#1E7F4F;color:#FFFFFF;" : "background:#F6EED9;color:#8E701C;"}">${paid ? "PAID IN FULL" : confirmed ? "CONFIRMED" : "AWAITING CONFIRMATION"}</span>
+          <span style="display:inline-block;padding:6px 14px;border-radius:12px;font:700 10px Arial,sans-serif;letter-spacing:1px;${paid && !s.balance ? "background:#1E7F4F;color:#FFFFFF;" : "background:#F6EED9;color:#8E701C;"}">${paid && s.balance ? "PAID &middot; BALANCE DUE" : paid ? "PAID IN FULL" : confirmed ? "CONFIRMED" : "AWAITING CONFIRMATION"}</span>
         </td>
       </tr></table>
     </td></tr>
@@ -412,7 +415,11 @@ function bookingEmailHtml(b, s) {
     <!-- Greeting -->
     <tr><td style="padding:18px 36px 6px;font:400 15px/1.6 Georgia,serif;color:#333B4C;">
       Hi ${esc(b.name)},<br><br>
-      ${paid
+      ${paid && s.balance
+        ? `Your booking has been updated. Your earlier payment of $${s.total - s.balance} is held against it — the $${s.balance} difference can be paid below. Your updated confirmation is attached.`
+        : paid && s.refund
+        ? `Your booking has been updated, and $${s.refund} has been refunded to the card you paid with — it usually shows within 5 to 10 business days. Your updated confirmation is attached.`
+        : paid
         ? "Payment received — your transfer is confirmed. Your printable confirmation is attached, and we'll send your chauffeur's name and mobile number before pick-up."
         : confirmed
           ? "Your transfer is confirmed and your chauffeur is booked. Your printable confirmation is attached" + (s.payUrl ? " — pay below to secure it, and we'll send your chauffeur's details before pick-up." : ", and we'll send your chauffeur's details before pick-up.")
@@ -440,7 +447,7 @@ function bookingEmailHtml(b, s) {
 
     ${s.payUrl ? `<!-- Pay button: only a confirmation the office sent with a payment link -->
     <tr><td align="center" style="padding:6px 36px 4px;">
-      <a href="${esc(s.payUrl)}" style="display:inline-block;background:#C9A227;color:#141D30;font:700 15px Arial,sans-serif;padding:14px 30px;border-radius:9px;text-decoration:none;">Pay $${s.total} now to secure your booking</a>
+      <a href="${esc(s.payUrl)}" style="display:inline-block;background:#C9A227;color:#141D30;font:700 15px Arial,sans-serif;padding:14px 30px;border-radius:9px;text-decoration:none;">${s.balance ? `Pay the $${s.balance} balance now` : `Pay $${s.total} now to secure your booking`}</a>
       <div style="font:400 12.5px Arial,sans-serif;color:#68707F;padding-top:8px;">Secure card payment by Stripe &mdash; card details never touch our website.</div>
     </td></tr>` : ""}
     <!-- Total -->
@@ -454,7 +461,9 @@ function bookingEmailHtml(b, s) {
       ${ret ? `<div style="font:400 12px Arial,sans-serif;color:#68707F;padding-top:8px;text-align:right;">
         Covers both legs${extras !== "None" ? ", with extras charged each leg" : ""} &middot; includes the ${Math.round(RETURN_DISCOUNT * 100)}% return discount.</div>` : ""}
       <div style="font:400 12px Arial,sans-serif;color:#68707F;padding-top:${ret ? 2 : 8}px;text-align:right;">
-        ${paid ? "Paid securely by card via Stripe."
+        ${paid && s.balance ? `Paid $${s.total - s.balance} by card &middot; $${s.balance} balance to pay with the button above.`
+          : paid && s.refund ? `Paid securely by card via Stripe &middot; $${s.refund} refunded to your card.`
+          : paid ? "Paid securely by card via Stripe."
           : confirmed ? (s.payUrl ? "Pay with the button above to secure your booking." : "Payment as arranged with our office.")
           : "No payment taken yet — we take payment when your booking is confirmed."}</div>
     </td></tr>
@@ -931,7 +940,34 @@ app.post("/stripe-webhook", async (req, res) => {
         notes: m.notes, paid: true,
         returnDate: m.return_date || "", returnTime: m.return_time || "",
         returnFlight: m.return_flight || "",
+        paymentIntent: typeof sess.payment_intent === "string" ? sess.payment_intent : (sess.payment_intent && sess.payment_intent.id) || "",
       };
+      /* A balance link - the difference after a paid booking was amended
+         upwards. Not a new booking: settle it and tell both sides. */
+      if (m.balance_for && portal && typeof portal.settleBalance === "function") {
+        const ref = String(m.balance_for);
+        const got = Math.round((sess.amount_total || 0) / 100);
+        const row = await portal.settleBalance(ref).catch((e) => { console.error("settle balance:", e.message); return null; });
+        console.log("balance paid:", ref, "$" + got, row ? "settled" : "row missing");
+        if (row && mailer) {
+          const rb = portal.rowToBooking(row);
+          rb.email = rb.email || sess.customer_email || sess.customer_details?.email || "";
+          const rs = portal.summaryForRow(row, rb);
+          const rpdf = await bookingPdf(rb, rs).catch((e) => { console.error("PDF failed:", e.message); return null; });
+          await mailer.sendMail({
+            from: `"Sky Transfers Website" <${process.env.GMAIL_USER}>`, to: BOOKINGS_EMAIL, replyTo: rb.email || undefined,
+            subject: `BALANCE PAID: $${got} on ${ref} - ${rb.pickup} -> ${rb.dropoff} (${rb.date} ${rb.time})`,
+            text: `BALANCE PAID - Sky Transfers website (Stripe)\n\n$${got} received for the change to ${ref}. The booking is now fully paid.\n\n${rs.text}`,
+          });
+          if (rb.email) await mailer.sendMail({
+            from: `"Sky Transfers" <${process.env.GMAIL_USER}>`, to: rb.email, replyTo: BOOKINGS_EMAIL,
+            subject: `Balance received — fully paid — Sky Transfers · ${ref}`,
+            text: `Hi ${rb.name},\n\nThank you - we've received $${got} and your updated booking is now fully paid. Your confirmation is attached.\n\n${rs.text}\n\nSky Transfers — Gold Coast & Brisbane airport transfers\nwww.skytransfers.com.au`,
+            html: bookingEmailHtml(rb, rs), attachments: guestAttachments(rpdf),
+          });
+        }
+        return res.json({ received: true });
+      }
       /* An office payment link made before 13 Oct 2026 carried no return leg
          in its metadata, so a paid return printed as a one-way at the return
          price. The stored row is the authority whenever the metadata is
