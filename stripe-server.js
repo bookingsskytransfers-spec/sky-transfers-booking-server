@@ -138,6 +138,19 @@ const VEHICLE_ALIASES = {
   /* Renamed 8 Oct 2026. It was never a coach - it is an 18-seat Sprinter. */
   "Mini Coach 18-Seater": "Mercedes Sprinter 18-Seater",
 };
+/* Hourly hire - a chauffeur and vehicle at the guest's disposal, booked from
+   the homepage form like a transfer. Per hour by vehicle class, index-for-index
+   with VEHICLES; the 18-seater stays quote-only. Three hours is the floor -
+   below that two one-ways are the better product - and past six hours it is
+   charter work with its own half-day and full-day rates. No evening loading:
+   the product exists for nights out, so the same rate applies at any hour.
+   MUST match HOURLY_RATES / HOURLY_HOURS in index.html. */
+const HOURLY_RATES = [90, 100, 115, 125, 135, 160, 185, null];
+const HOURLY_MIN_HOURS = 3, HOURLY_MAX_HOURS = 6;
+function hourlyHours(b) {
+  const h = b && b.hourly && parseInt(b.hourly.hours, 10);
+  return Number.isInteger(h) && h >= HOURLY_MIN_HOURS && h <= HOURLY_MAX_HOURS ? h : null;
+}
 const CHILD_SEAT_PRICE = 15; // per seat, AUD
 const TRAILER_PRICE = 30;    // luggage trailer, AUD
 
@@ -148,6 +161,12 @@ const TRAILER_PRICE = 30;    // luggage trailer, AUD
    without b.p2p, this is exactly computeFare. */
 let p2p = null;
 async function fareForBooking(b) {
+  if (b && b.hourly) {
+    const h = hourlyHours(b);
+    const vi = VEHICLES.indexOf(VEHICLE_ALIASES[b.vehicle] || b.vehicle);
+    const rate = vi === -1 ? null : HOURLY_RATES[vi];
+    return h && rate ? rate * h : null;
+  }
   if (b && b.p2p && p2p && typeof p2p.fareFor === "function") return p2p.fareFor(b);
   return computeFare(b.pickup, b.dropoff, b.vehicle);
 }
@@ -279,6 +298,9 @@ function bookingPdf(b, s) {
       ["TRIP", "Return — two transfers on one booking"],
       ["OUTBOUND", `${b.pickup}  to  ${b.dropoff}\n${niceDate(b.date)} at ${b.time}`],
       ["RETURN", `${b.dropoff}  to  ${b.pickup}\n${niceDate(ret.date)} at ${ret.time}`],
+    ] : hourlyHours(b) ? [
+      ["HIRE", `By the hour — ${hourlyHours(b)} hours as directed`],
+      ["STARTS", `${b.pickup}\n${niceDate(b.date)} at ${b.time}`],
     ] : [
       ["ROUTE", `${b.pickup}  to  ${b.dropoff}`],
       ["DATE", `${niceDate(b.date)} at ${b.time}`],
@@ -312,7 +334,7 @@ function bookingPdf(b, s) {
     y += cardH + 16;
     doc.roundedRect(L, y, CW, 46, 8).fill(SOFT);
     doc.rect(L, y + 4, 3, 38).fill(GOLD);
-    doc.font("Helvetica-Bold").fontSize(9).fillColor(GOLD_D).text("TOTAL · AUD, GST INCLUSIVE", L + 20, y + (ret ? 12 : 18), { characterSpacing: 1.2 });
+    doc.font("Helvetica-Bold").fontSize(9).fillColor(GOLD_D).text("TOTAL · AUD, GST INCLUSIVE", L + 20, y + (ret || hourlyHours(b) ? 12 : 18), { characterSpacing: 1.2 });
     /* On a return the figure is nearly double the fare the customer saw on the
        page, so say in words what it covers. No numbers here: on the paid path
        the total is whatever Stripe charged, promotion code and all, and a
@@ -320,6 +342,9 @@ function bookingPdf(b, s) {
     if (ret) {
       doc.font("Helvetica").fontSize(8).fillColor(MUTED)
         .text(`Both legs${extras !== "None" ? ", extras each leg" : ""} · ${Math.round(RETURN_DISCOUNT * 100)}% return discount included`, L + 20, y + 26);
+    } else if (hourlyHours(b)) {
+      doc.font("Helvetica").fontSize(8).fillColor(MUTED)
+        .text(`${hourlyHours(b)} hours, chauffeur and vehicle at your disposal · the same rate at any hour`, L + 20, y + 26);
     }
     doc.font("Times-Roman").fontSize(24).fillColor(INK)
       .text(`$${s.total}`, L, y + 10, { width: CW - 20, align: "right" });
@@ -384,6 +409,7 @@ function bookingEmailHtml(b, s) {
   const paid = !!b.paid;
   const confirmed = !paid && !!b.confirmed;
   const ret = returnLeg(b);
+  const hrs = hourlyHours(b);
   const extras = extrasLabel(b);
   return `<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
@@ -430,11 +456,14 @@ function bookingEmailHtml(b, s) {
     <tr><td style="padding:10px 36px 4px;">
       <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
         ${ret ? row("TRIP", "Return — two transfers on one booking") : ""}
+        ${hrs ? row("HIRE", `By the hour — ${hrs} hours as directed`) : ""}
         ${ret
           ? row("OUTBOUND", `${b.pickup}  →  ${b.dropoff}  ·  ${niceDate(b.date)} at ${b.time}`)
+          : hrs ? row("STARTS", `${b.pickup}  ·  ${niceDate(b.date)} at ${b.time}`)
           : row("ROUTE", `${b.pickup}  →  ${b.dropoff}`)}
         ${ret
           ? row("RETURN", `${b.dropoff}  →  ${b.pickup}  ·  ${niceDate(ret.date)} at ${ret.time}`)
+          : hrs ? ""
           : row("DATE &amp; TIME", `${niceDate(b.date)} at ${b.time}`)}
         ${row("VEHICLE", b.vehicle)}
         ${row("PASSENGERS", b.pax)}
@@ -459,7 +488,9 @@ function bookingEmailHtml(b, s) {
         </tr>
       </table>
       ${ret ? `<div style="font:400 12px Arial,sans-serif;color:#68707F;padding-top:8px;text-align:right;">
-        Covers both legs${extras !== "None" ? ", with extras charged each leg" : ""} &middot; includes the ${Math.round(RETURN_DISCOUNT * 100)}% return discount.</div>` : ""}
+        Covers both legs${extras !== "None" ? ", with extras charged each leg" : ""} &middot; includes the ${Math.round(RETURN_DISCOUNT * 100)}% return discount.</div>`
+        : hrs ? `<div style="font:400 12px Arial,sans-serif;color:#68707F;padding-top:8px;text-align:right;">
+        ${hrs} hours with the chauffeur and vehicle at your disposal &middot; the same rate at any hour.</div>` : ""}
       <div style="font:400 12px Arial,sans-serif;color:#68707F;padding-top:${ret ? 2 : 8}px;text-align:right;">
         ${paid && s.balance ? `Paid $${s.total - s.balance} by card &middot; $${s.balance} balance to pay with the button above.`
           : paid && s.refund ? `Paid securely by card via Stripe &middot; $${s.refund} refunded to your card.`
@@ -572,6 +603,10 @@ function bookingSummary(b, fare, seats, trailer, ret) {
   /* A one-way booking must produce exactly the text it produced before this
      feature existed — the dispatch automation parses these lines. The return
      lines are therefore inserted only when there is a return. */
+  const hrs = hourlyHours(b);
+  const hourlyLines = hrs ? [
+    `Hire: BY THE HOUR — ${hrs} hours as directed from ${b.time}`,
+  ] : [];
   const returnLines = ret ? [
     `Trip: RETURN`,
     `Return date: ${ret.date}`,
@@ -587,8 +622,9 @@ function bookingSummary(b, fare, seats, trailer, ret) {
     text: [
       `Booking reference: ${b.ref || "-"}`,
       `Route: ${b.pickup} -> ${b.dropoff}`,
+      ...hourlyLines,
       `Vehicle: ${b.vehicle}`,
-      `Fare: $${fare} one-way`,
+      hrs ? `Fare: $${fare} for ${hrs} hours ($${Math.round(fare / hrs)}/h)` : `Fare: $${fare} one-way`,
       `Baby/child seats: ${seats} ($${CHILD_SEAT_PRICE} each${ret ? ", each leg" : ""})`,
       `Luggage trailer: ${trailer ? `YES (+$${TRAILER_PRICE}${ret ? " each leg" : ""})` : "No"}`,
       ...returnLines,
@@ -845,10 +881,13 @@ app.post("/create-checkout", async (req, res) => {
         currency: "aud",
         unit_amount: summary.transfer * 100,
         product_data: {
-          name: (b.p2p
+          name: (hourlyHours(b) ? `Hourly hire, ${hourlyHours(b)} hours`
+                  : b.p2p
                   ? (ret ? "Return private transfer" : "Private transfer")
                   : (ret ? "Return airport transfer" : "Airport transfer")) + ` — ${b.vehicle}`,
-          description: ret
+          description: hourlyHours(b)
+            ? `From ${b.pickup}, as directed · ${b.date} ${b.time} · ${hourlyHours(b)} h · Ref ${ref}`
+            : ret
             ? `Out ${b.pickup} → ${b.dropoff} · ${b.date} ${b.time}. ` +
               `Back ${b.dropoff} → ${b.pickup} · ${ret.date} ${ret.time}. ` +
               `Includes ${Math.round(RETURN_DISCOUNT * 100)}% return discount ` +
@@ -904,7 +943,8 @@ app.post("/create-checkout", async (req, res) => {
         time: String(b.time || ""), pax: String(b.pax || ""),
         flight: String(b.flight || ""), child_seats: String(seats),
         trailer: trailer ? "yes" : "no",
-        trip_type: ret ? "return" : "one-way",
+        trip_type: hourlyHours(b) ? "hourly" : ret ? "return" : "one-way",
+        hours: hourlyHours(b) ? String(hourlyHours(b)) : "",
         return_date: ret ? ret.date : "",
         return_time: ret ? ret.time : "",
         return_flight: ret ? ret.flight : "",
@@ -940,6 +980,7 @@ app.post("/stripe-webhook", async (req, res) => {
         notes: m.notes, paid: true,
         returnDate: m.return_date || "", returnTime: m.return_time || "",
         returnFlight: m.return_flight || "",
+        hourly: m.hours ? { hours: parseInt(m.hours, 10) } : undefined,
         paymentIntent: typeof sess.payment_intent === "string" ? sess.payment_intent : (sess.payment_intent && sess.payment_intent.id) || "",
       };
       /* A balance link - the difference after a paid booking was amended
@@ -1035,7 +1076,7 @@ portal = require("./agent-portal")({
      the same branded email and PDF the website sends - not a second version
      that drifts. fareForBooking is read at call time, so it sees the
      point-to-point module mounted further down. */
-  bookingPdf, bookingEmailHtml, guestAttachments, fareForBooking, returnLeg,
+  bookingPdf, bookingEmailHtml, guestAttachments, fareForBooking, returnLeg, hourlyHours,
   HUB_NAMES: [OOL, BNE, CRUISE],
   PLACES_FOR_AGENTS: [OOL, BNE, CRUISE]
     .concat(Object.keys(SUBURBS).sort())

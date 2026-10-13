@@ -24,7 +24,9 @@ module.exports = function installAgentPortal(ctx) {
     /* The website's own confirmation pieces, so what the office sends a guest
        is byte-for-byte what the site would have sent. */
     bookingPdf, bookingEmailHtml, guestAttachments, fareForBooking, returnLeg, HUB_NAMES,
+    hourlyHours,
   } = ctx;
+  const hoursOf = (b) => (typeof hourlyHours === "function" ? hourlyHours(b) : null);
   const { Pool } = require("pg");
   const crypto = require("crypto");
   const PDFDocument = require("pdfkit");
@@ -154,6 +156,7 @@ module.exports = function installAgentPortal(ctx) {
       ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS balance_cents    INTEGER NOT NULL DEFAULT 0;
       ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS balance_link_id  TEXT;
       ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS balance_link_url TEXT;
+      ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS hire_hours       INTEGER;
       CREATE INDEX IF NOT EXISTS web_bookings_recent ON web_bookings (created_at DESC);
       CREATE INDEX IF NOT EXISTS web_bookings_status ON web_bookings (status, created_at DESC);
     `);
@@ -735,6 +738,7 @@ module.exports = function installAgentPortal(ctx) {
     flight: r.flight, address: r.address, notes: r.notes,
     pax: r.pax, childSeats: r.child_seats, trailer: r.trailer,
     returnDate: r.return_date, returnTime: r.return_time, returnFlight: r.return_flight,
+    hours: r.hire_hours || null,
     /* Plain text dates for the amend form; the Date objects above can slide a day in JSON. */
     dateText: r.pickup_date_text || null, returnDateText: r.return_date_text || null,
     total: r.total_cents / 100, status: r.status,
@@ -753,8 +757,8 @@ module.exports = function installAgentPortal(ctx) {
          (ref, pickup, dropoff, vehicle, pickup_date, pickup_time, passenger_name,
           passenger_phone, passenger_email, flight, address, notes, pax, child_seats,
           trailer, total_cents, status, user_agent, return_date, return_time, return_flight,
-          payment_intent, confirmed_at, paid_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,
+          payment_intent, hire_hours, confirmed_at, paid_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,
                CASE WHEN $17 IN ('confirmed','paid') THEN now() END,
                CASE WHEN $17 = 'paid' THEN now() END)
        ON CONFLICT (ref) DO UPDATE SET
@@ -776,7 +780,8 @@ module.exports = function installAgentPortal(ctx) {
        /^\d{4}-\d{2}-\d{2}$/.test(String((b && b.returnDate) || "")) ? b.returnDate : null,
        String((b && b.returnTime) || "").trim() || null,
        String((b && b.returnFlight) || "").trim().slice(0, 40) || null,
-       String((b && b.paymentIntent) || "").trim() || null]
+       String((b && b.paymentIntent) || "").trim() || null,
+       hoursOf(b)]
     );
     /* Paid means the link has done its job. Switching it off stops a second
        payment and stops a forwarded link being payable by anyone else. */
@@ -953,6 +958,7 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
            on ST-261024-9GCS, 13 Oct 2026. */
         return_date: String(r.return_date_text || ""), return_time: String(r.return_time || ""),
         return_flight: String(r.return_flight || "").slice(0, 40),
+        hours: r.hire_hours ? String(r.hire_hours) : "",
       },
       after_completion: {
         type: "redirect",
@@ -1169,6 +1175,7 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
       email: r.passenger_email || "", address: r.address || "", notes: r.notes || "",
       returnDate: r.return_date_text || "", returnTime: r.return_time || "",
       returnFlight: r.return_flight || "",
+      hourly: r.hire_hours ? { hours: r.hire_hours } : undefined,
       paid: r.status === "paid", confirmed: r.status === "confirmed" || r.status === "paid",
     };
   }
