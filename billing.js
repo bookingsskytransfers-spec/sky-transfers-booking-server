@@ -113,6 +113,8 @@ module.exports = function installBilling(ctx) {
       );
       CREATE INDEX IF NOT EXISTS ops_invoice_lines_ref ON ops_invoice_lines (ref);
       CREATE INDEX IF NOT EXISTS ops_invoice_lines_inv ON ops_invoice_lines (invoice_id);
+      -- Autopilot: the addresses or domains this account emails bookings from.
+      ALTER TABLE ops_accounts ADD COLUMN IF NOT EXISTS intake_from TEXT;
     `);
   }
 
@@ -153,7 +155,7 @@ module.exports = function installBilling(ctx) {
         `SELECT ref, account_ref, pickup, dropoff, vehicle, to_char(pickup_date, 'YYYY-MM-DD') AS d, pickup_time AS t,
                 to_char(return_date, 'YYYY-MM-DD') AS rd, return_time AS rt, hire_hours, passenger_name, pax,
                 price_cents AS cents
-           FROM ops_jobs WHERE status <> 'cancelled' AND lower(account) = lower($1) AND pickup_date BETWEEN $2 AND $3`,
+           FROM ops_jobs WHERE status <> 'cancelled' AND lower(account) = lower($1) AND pickup_date >= $2 AND pickup_date <= $3`,
         [acc.name, from, to])).rows;
       var party = { type: "account", key: String(acc.id), name: acc.name, email: acc.billing_email, contact: acc.contact,
                     abn: acc.abn, address: acc.address, terms: acc.terms_days || 14 };
@@ -163,7 +165,7 @@ module.exports = function installBilling(ctx) {
       rows = (await pool.query(
         `SELECT ref, NULL AS account_ref, pickup, dropoff, vehicle, to_char(pickup_date, 'YYYY-MM-DD') AS d, pickup_time AS t,
                 NULL AS rd, NULL AS rt, NULL AS hire_hours, passenger_name, pax, total_cents AS cents
-           FROM agent_bookings WHERE status <> 'cancelled' AND agent_code = $1 AND pickup_date BETWEEN $2 AND $3`,
+           FROM agent_bookings WHERE status <> 'cancelled' AND agent_code = $1 AND pickup_date >= $2 AND pickup_date <= $3`,
         [ag.code, from, to])).rows;
       party = { type: "agent", key: ag.code, name: ag.name, email: ag.email, contact: null, abn: null, address: null, terms: 14 };
     } else return { error: "Unknown kind of account." };
@@ -336,7 +338,7 @@ module.exports = function installBilling(ctx) {
       const out = accounts.map((a) => {
         const u = ub.get(a.name.toLowerCase()) || { count: 0, cents: 0 }, o = open("account", String(a.id));
         return { type: "account", key: String(a.id), id: a.id, name: a.name, email: a.billing_email, contact: a.contact, abn: a.abn,
-                 address: a.address, terms: a.terms_days, notes: a.notes, active: a.active,
+                 address: a.address, terms: a.terms_days, notes: a.notes, active: a.active, intakeFrom: a.intake_from || "",
                  unbilledCount: u.count, unbilled: u.cents / 100, open: o.open / 100, overdue: o.overdue / 100 };
       }).concat(agents.map((g) => {
         const u = ubA.get(g.code) || { count: 0, cents: 0 }, o = open("agent", g.code);
@@ -368,17 +370,19 @@ module.exports = function installBilling(ctx) {
       if (clash) return res.status(409).json({ error: `There is already an account called ${name}.` });
       const vals = [name, txt(b.email, 200) || null, txt(b.contact, 120) || null, txt(b.abn, 20) || null,
         txt(b.address, 300) || null, int(b.terms, 0, 120, 14), txt(b.notes, 1000) || null,
-        b.active === false || b.active === "false" ? false : true];
+        b.active === false || b.active === "false" ? false : true,
+        /* lower-case, comma separated, addresses or @domains only */
+        String(b.intakeFrom || "").toLowerCase().split(/[\s,;]+/).filter((x) => /^[^\s@]*@[^\s@]+\.[^\s@]+$/.test(x)).join(",") || null];
       if (id) {
         const r = await pool.query(
-          `UPDATE ops_accounts SET name=$1, billing_email=$2, contact=$3, abn=$4, address=$5, terms_days=$6, notes=$7, active=$8 WHERE id=$9`,
+          `UPDATE ops_accounts SET name=$1, billing_email=$2, contact=$3, abn=$4, address=$5, terms_days=$6, notes=$7, active=$8, intake_from=$9 WHERE id=$10`,
           vals.concat([id]));
         if (!r.rowCount) return res.status(404).json({ error: "No such account." });
         return res.json({ ok: true, id });
       }
       const { rows } = await pool.query(
-        `INSERT INTO ops_accounts (name, billing_email, contact, abn, address, terms_days, notes, active)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`, vals);
+        `INSERT INTO ops_accounts (name, billing_email, contact, abn, address, terms_days, notes, active, intake_from)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`, vals);
       res.json({ ok: true, id: rows[0].id });
     } catch (err) {
       console.error("billing account:", err);
@@ -403,50 +407,58 @@ module.exports = function installBilling(ctx) {
     }
   });
 
+  /* Issues an invoice for the given refs of one party's draft. Throws
+     {code, message}. Used by the office route and by autopilot.js. */
+  async function issueInvoice({ partyType, partyKey, from, to, refs, issuedOn }) {
+    from = isoDate(from); to = isoDate(to);
+    if (!from || !to || to < from) throw { code: 400, message: "Choose the period to invoice." };
+    const want = new Set((Array.isArray(refs) ? refs : []).map((r) => txt(r, 40)));
+    /* Built again here, never taken from the caller: only jobs that really
+       belong to this party, in this period, not yet billed. */
+    const d = await draftLines(partyType, partyKey, from, to);
+    if (d.error) throw { code: 404, message: d.error };
+    const lines = d.lines.filter((l) => want.has(l.ref));
+    if (!lines.length) throw { code: 400, message: "Nothing left to invoice - those jobs may already be on another invoice." };
+    const total = lines.reduce((a, l) => a + l.amountCents, 0);
+    const issued = isoDate(issuedOn) || today();
+    const due = addDays(issued, d.party.terms != null ? d.party.terms : 14);
+    const { rows } = await pool.query(
+      `INSERT INTO ops_invoices (party_type, party_key, party_name, bill_email, bill_contact, bill_abn, bill_address,
+         period_from, period_to, issued_on, due_on, total_cents, gst_cents)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
+      [d.party.type, d.party.key, d.party.name, d.party.email || null, d.party.contact || null, d.party.abn || null,
+       d.party.address || null, from, to, issued, due, total, gstOf(total)]);
+    const id = rows[0].id;
+    const number = "SKY-" + issued.slice(0, 4) + "-" + String(id).padStart(4, "0");
+    await pool.query(`UPDATE ops_invoices SET number = $2 WHERE id = $1`, [id, number]);
+    for (const l of lines) {
+      await pool.query(`INSERT INTO ops_invoice_lines (invoice_id, ref, service_date, description, amount_cents) VALUES ($1,$2,$3,$4,$5)`,
+        [id, l.ref, l.date, l.description, l.amountCents]);
+    }
+    /* The race the draft check cannot see: two issues at the same moment.
+       If any line is now on two live invoices, this one stands down. */
+    const rs = lines.map((l) => l.ref);
+    const dup = (await pool.query(
+      `SELECT l.ref FROM ops_invoice_lines l JOIN ops_invoices i ON i.id = l.invoice_id
+        WHERE i.status <> 'void' AND i.id <> $1 AND l.ref IN (${inList(rs.length, 2)})`, [id].concat(rs))).rows;
+    if (dup.length) {
+      await pool.query(`UPDATE ops_invoices SET status = 'void', paid_note = 'auto-voided: jobs already invoiced' WHERE id = $1`, [id]);
+      throw { code: 409, message: "Some of those jobs were invoiced a moment ago from somewhere else - nothing new was issued." };
+    }
+    let inv = await invoiceWithLines(id);
+    await payLinkFor(inv).catch((e) => console.error("invoice pay link:", e.message));
+    inv = await invoiceWithLines(id);
+    console.log("invoice issued:", number, d.party.name, dollars(total), lines.length, "lines");
+    return inv;
+  }
+
   app.post("/ops/invoice", requireAdmin, async (req, res) => {
     try {
       const b = req.body || {};
-      const from = isoDate(b.from), to = isoDate(b.to);
-      if (!from || !to || to < from) return res.status(400).json({ error: "Choose the period to invoice." });
-      const want = new Set((Array.isArray(b.refs) ? b.refs : []).map((r) => txt(r, 40)));
-      /* Built again here, never taken from the page: only jobs that really
-         belong to this party, in this period, not yet billed. */
-      const d = await draftLines(b.partyType, b.partyKey, from, to);
-      if (d.error) return res.status(404).json({ error: d.error });
-      const lines = d.lines.filter((l) => want.has(l.ref));
-      if (!lines.length) return res.status(400).json({ error: "Nothing left to invoice - those jobs may already be on another invoice." });
-      const total = lines.reduce((a, l) => a + l.amountCents, 0);
-      const issued = isoDate(b.issuedOn) || today();
-      const due = addDays(issued, d.party.terms != null ? d.party.terms : 14);
-      const { rows } = await pool.query(
-        `INSERT INTO ops_invoices (party_type, party_key, party_name, bill_email, bill_contact, bill_abn, bill_address,
-           period_from, period_to, issued_on, due_on, total_cents, gst_cents)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
-        [d.party.type, d.party.key, d.party.name, d.party.email || null, d.party.contact || null, d.party.abn || null,
-         d.party.address || null, from, to, issued, due, total, gstOf(total)]);
-      const id = rows[0].id;
-      const number = "SKY-" + issued.slice(0, 4) + "-" + String(id).padStart(4, "0");
-      await pool.query(`UPDATE ops_invoices SET number = $2 WHERE id = $1`, [id, number]);
-      for (const l of lines) {
-        await pool.query(`INSERT INTO ops_invoice_lines (invoice_id, ref, service_date, description, amount_cents) VALUES ($1,$2,$3,$4,$5)`,
-          [id, l.ref, l.date, l.description, l.amountCents]);
-      }
-      /* The race the draft check cannot see: two issues at the same moment.
-         If any line is now on two live invoices, this one stands down. */
-      const refs = lines.map((l) => l.ref);
-      const dup = (await pool.query(
-        `SELECT l.ref FROM ops_invoice_lines l JOIN ops_invoices i ON i.id = l.invoice_id
-          WHERE i.status <> 'void' AND i.id <> $1 AND l.ref IN (${inList(refs.length, 2)})`, [id].concat(refs))).rows;
-      if (dup.length) {
-        await pool.query(`UPDATE ops_invoices SET status = 'void', paid_note = 'auto-voided: jobs already invoiced' WHERE id = $1`, [id]);
-        return res.status(409).json({ error: "Some of those jobs were invoiced a moment ago from somewhere else - nothing new was issued." });
-      }
-      let inv = await invoiceWithLines(id);
-      await payLinkFor(inv).catch((e) => console.error("invoice pay link:", e.message));
-      inv = await invoiceWithLines(id);
-      console.log("invoice issued:", number, d.party.name, dollars(total), lines.length, "lines");
+      const inv = await issueInvoice({ partyType: b.partyType, partyKey: b.partyKey, from: b.from, to: b.to, refs: b.refs, issuedOn: b.issuedOn });
       res.json({ ok: true, invoice: publicInvoice(inv) });
     } catch (err) {
+      if (err && err.code) return res.status(err.code).json({ error: err.message });
       console.error("invoice issue:", err);
       res.status(500).json({ error: "Could not issue that invoice." });
     }
@@ -483,36 +495,43 @@ module.exports = function installBilling(ctx) {
     }
   });
 
+  /* Emails an invoice with its PDF. Throws {code, message}. */
+  async function sendInvoice(id, toOverride) {
+    if (!mailer) throw { code: 500, message: "Email is not configured on the server." };
+    const inv = await invoiceWithLines(int(id, 1, 1e9, 0));
+    if (!inv) throw { code: 404, message: "No such invoice." };
+    if (inv.status === "void") throw { code: 409, message: "That invoice is void." };
+    const to = txt(toOverride, 200) || inv.bill_email;
+    if (!to || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) throw { code: 400, message: "Give an email address to send it to." };
+    if (inv.status === "issued" && !inv.pay_link_url) { await payLinkFor(inv).catch(() => null); }
+    const fresh = await invoiceWithLines(inv.id);
+    const pdf = await invoicePdf(fresh);
+    const paid = fresh.status === "paid";
+    await mailer.sendMail({
+      from: `"Sky Transfers Accounts" <${process.env.GMAIL_USER}>`, to, replyTo: BOOKINGS_EMAIL, bcc: BOOKINGS_EMAIL,
+      subject: paid ? `Paid tax invoice ${fresh.number} - Sky Transfers`
+                    : `Tax invoice ${fresh.number} from Sky Transfers - ${dollars(fresh.total_cents)} due ${nice(fresh.due)}`,
+      text: `Hello${fresh.bill_contact ? " " + fresh.bill_contact.split(" ")[0] : ""},\n\n` +
+        (paid ? `Attached is your paid tax invoice ${fresh.number} for ${fresh.party_name}. Thank you.\n`
+              : `Attached is tax invoice ${fresh.number} for ${fresh.party_name}: ${fresh.lines.length} transfer${fresh.lines.length === 1 ? "" : "s"}` +
+                (fresh.pfrom ? ` from ${nice(fresh.pfrom)} to ${nice(fresh.pto)}` : "") + `.\n\n` +
+                `Amount due: ${dollars(fresh.total_cents)} (GST inclusive), by ${nice(fresh.due)}.\n` +
+                (fresh.pay_link_url ? `\nPay by card: ${fresh.pay_link_url}\n` : "") +
+                (BANK ? `\nBank transfer:\n${BANK}\nPlease quote ${fresh.number}.\n` : "")) +
+        `\nAny questions, reply to this email or call ${SELLER.phone}.\n\nSky Transfers\n${SELLER.name}, ABN ${SELLER.abn}`,
+      attachments: [{ filename: fresh.number + ".pdf", content: pdf, contentType: "application/pdf" }],
+    });
+    await pool.query(`UPDATE ops_invoices SET sent_at = now(), sent_to = $2 WHERE id = $1`, [fresh.id, to]);
+    console.log("invoice sent:", fresh.number, "->", to);
+    return { to, invoice: fresh };
+  }
+
   app.post("/ops/invoice/send", requireAdmin, async (req, res) => {
     try {
-      if (!mailer) return res.status(500).json({ error: "Email is not configured on the server." });
-      const inv = await invoiceWithLines(int((req.body || {}).id, 1, 1e9, 0));
-      if (!inv) return res.status(404).json({ error: "No such invoice." });
-      if (inv.status === "void") return res.status(409).json({ error: "That invoice is void." });
-      const to = txt((req.body || {}).to, 200) || inv.bill_email;
-      if (!to || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) return res.status(400).json({ error: "Give an email address to send it to." });
-      if (inv.status === "issued" && !inv.pay_link_url) { await payLinkFor(inv).catch(() => null); }
-      const fresh = await invoiceWithLines(inv.id);
-      const pdf = await invoicePdf(fresh);
-      const paid = fresh.status === "paid";
-      await mailer.sendMail({
-        from: `"Sky Transfers Accounts" <${process.env.GMAIL_USER}>`, to, replyTo: BOOKINGS_EMAIL, bcc: BOOKINGS_EMAIL,
-        subject: paid ? `Paid tax invoice ${fresh.number} - Sky Transfers`
-                      : `Tax invoice ${fresh.number} from Sky Transfers - ${dollars(fresh.total_cents)} due ${nice(fresh.due)}`,
-        text: `Hello${fresh.bill_contact ? " " + fresh.bill_contact.split(" ")[0] : ""},\n\n` +
-          (paid ? `Attached is your paid tax invoice ${fresh.number} for ${fresh.party_name}. Thank you.\n`
-                : `Attached is tax invoice ${fresh.number} for ${fresh.party_name}: ${fresh.lines.length} transfer${fresh.lines.length === 1 ? "" : "s"}` +
-                  (fresh.pfrom ? ` from ${nice(fresh.pfrom)} to ${nice(fresh.pto)}` : "") + `.\n\n` +
-                  `Amount due: ${dollars(fresh.total_cents)} (GST inclusive), by ${nice(fresh.due)}.\n` +
-                  (fresh.pay_link_url ? `\nPay by card: ${fresh.pay_link_url}\n` : "") +
-                  (BANK ? `\nBank transfer:\n${BANK}\nPlease quote ${fresh.number}.\n` : "")) +
-          `\nAny questions, reply to this email or call ${SELLER.phone}.\n\nSky Transfers\n${SELLER.name}, ABN ${SELLER.abn}`,
-        attachments: [{ filename: fresh.number + ".pdf", content: pdf, contentType: "application/pdf" }],
-      });
-      await pool.query(`UPDATE ops_invoices SET sent_at = now(), sent_to = $2 WHERE id = $1`, [fresh.id, to]);
-      console.log("invoice sent:", fresh.number, "->", to);
-      res.json({ ok: true, to });
+      const r = await sendInvoice((req.body || {}).id, (req.body || {}).to);
+      res.json({ ok: true, to: r.to });
     } catch (err) {
+      if (err && err.code) return res.status(err.code).json({ error: err.message });
       console.error("invoice send:", err);
       res.status(500).json({ error: "Could not send that invoice." });
     }
@@ -662,5 +681,6 @@ module.exports = function installBilling(ctx) {
     .then(() => console.log("Billing ready (invoices, accounts, pay sheet)" + (BANK ? "" : " - INVOICE_BANK_DETAILS not set, invoices show card payment only")))
     .catch((e) => console.error("Billing setup failed:", e.message));
 
-  return { on: true, paidByStripe, invoicePdf, invoiceWithLines, draftLines, payWeek, initBillingSchema };
+  return { on: true, paidByStripe, invoicePdf, invoiceWithLines, draftLines, payWeek, initBillingSchema,
+           issueInvoice, sendInvoice, publicInvoice, dollars, nice, getAccount, getAgent };
 };

@@ -1153,3 +1153,16 @@ try {
 } catch (err) {
   console.error("Billing not mounted (bookings unaffected):", err.message);
 }
+
+/* Autopilot - picks drivers the evening before, chases unclosed jobs,
+   prepares scheduled invoices for one-click approval, sends the morning
+   digest and reads account booking emails. Every part is off until switched
+   on in dispatch.html, and nothing on the booking path depends on it. */
+try {
+  require("./autopilot")({
+    app, pool: portal && portal.pool, requireAdmin: portal && portal.requireAdmin,
+    ops, billing, mailer, BOOKINGS_EMAIL, VEHICLES, makeRef,
+  });
+} catch (err) {
+  console.error("Autopilot not mounted (bookings unaffected):", err.message);
+}
