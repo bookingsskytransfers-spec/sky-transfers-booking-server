@@ -66,6 +66,8 @@ const BOOKINGS_EMAIL = process.env.BOOKINGS_EMAIL || "info@skytransfers.com.au";
    The routes below run long after that, so reading it at request time is safe;
    it stays null when the portal is switched off and the saves become no-ops. */
 let portal = null;
+/* ops.js (dispatch) and billing.js (invoices, pay sheet), mounted at the end. */
+let ops = null, billing = null;
 const recordBooking = (b, s, status) => {
   if (!portal || !portal.saveWebBooking) return Promise.resolve();
   /* Always resolves. Callers may await it for ordering, but a database
@@ -983,6 +985,13 @@ app.post("/stripe-webhook", async (req, res) => {
         hourly: m.hours ? { hours: parseInt(m.hours, 10) } : undefined,
         paymentIntent: typeof sess.payment_intent === "string" ? sess.payment_intent : (sess.payment_intent && sess.payment_intent.id) || "",
       };
+      /* An account invoice paid by card. Not a booking: mark the invoice
+         paid and stop - nothing below may record it as a transfer. */
+      if (m.invoice_for && billing && typeof billing.paidByStripe === "function") {
+        await billing.paidByStripe(String(m.invoice_for), sess.amount_total || 0, b.paymentIntent || "")
+          .catch((e) => console.error("invoice payment:", e.message));
+        return res.json({ received: true });
+      }
       /* A balance link - the difference after a paid booking was amended
          upwards. Not a new booking: settle it and tell both sides. */
       if (m.balance_for && portal && typeof portal.settleBalance === "function") {
@@ -1126,10 +1135,21 @@ try {
    admin login. Wrapped like the modules above: nothing on the booking path
    depends on it. */
 try {
-  require("./ops")({
+  ops = require("./ops")({
     app, pool: portal && portal.pool, requireAdmin: portal && portal.requireAdmin,
     VEHICLES, makeRef, mailer, BOOKINGS_EMAIL,
   });
 } catch (err) {
   console.error("Ops not mounted (bookings unaffected):", err.message);
+}
+
+/* Billing - account tax invoices and the weekly driver pay sheet. Phase 2.
+   Same treatment: nothing on the booking path depends on it. */
+try {
+  billing = require("./billing")({
+    app, pool: portal && portal.pool, requireAdmin: portal && portal.requireAdmin,
+    ops, stripe, mailer, BOOKINGS_EMAIL,
+  });
+} catch (err) {
+  console.error("Billing not mounted (bookings unaffected):", err.message);
 }

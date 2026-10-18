@@ -146,6 +146,8 @@ module.exports = function installOps(ctx) {
         PRIMARY KEY (ref, leg)
       );
       CREATE INDEX IF NOT EXISTS ops_dispatch_driver ON ops_dispatch (driver_id);
+      /* Phase 2: when the driver was paid for this leg (billing.js pay sheet). */
+      ALTER TABLE ops_dispatch ADD COLUMN IF NOT EXISTS driver_paid_at TIMESTAMPTZ;
     `);
   }
 
@@ -226,6 +228,7 @@ module.exports = function installOps(ctx) {
       l.driverPay = d && d.driver_pay_cents != null ? d.driver_pay_cents / 100 : null;
       l.officeNote = d && d.office_note || "";
       l.sentAt = d && d.sent_at || null;
+      l.driverPaidAt = d && d.driver_paid_at || null;
       l.driverName = l.driverId && dById.get(l.driverId) ? dById.get(l.driverId).name : null;
       l.vehicleLabel = l.vehicleId && vById.get(l.vehicleId) ? vById.get(l.vehicleId).label : null;
       l.times = d ? { assigned: d.assigned_at, accepted: d.accepted_at, onWay: d.on_way_at,
@@ -375,7 +378,8 @@ module.exports = function installOps(ctx) {
            on_location_at = CASE WHEN $8 THEN NULL ELSE ops_dispatch.on_location_at END,
            pob_at = CASE WHEN $8 THEN NULL ELSE ops_dispatch.pob_at END,
            done_at = CASE WHEN $8 THEN NULL ELSE ops_dispatch.done_at END,
-           declined_at = CASE WHEN $8 THEN NULL ELSE ops_dispatch.declined_at END`,
+           declined_at = CASE WHEN $8 THEN NULL ELSE ops_dispatch.declined_at END,
+           driver_paid_at = CASE WHEN $8 THEN NULL ELSE ops_dispatch.driver_paid_at END`,
         [ref, leg, driverId, vehicleId, pay, status, note, changedDriver]);
       console.log("ops assign:", ref, leg, "driver", driverId || "-", "vehicle", vehicleId || "-", status);
       res.json({ ok: true, status });
@@ -670,5 +674,5 @@ module.exports = function installOps(ctx) {
     .then(() => console.log("Ops ready (dispatch board, drivers, vehicles)"))
     .catch((e) => console.error("Ops setup failed:", e.message));
 
-  return { on: true, boardFor, linkFor, initOpsSchema, legsOf, markConflicts, driverFromToken };
+  return { on: true, boardFor, linkFor, initOpsSchema, legsOf, markConflicts, driverFromToken, allDrivers, bneToday, addDays };
 };
