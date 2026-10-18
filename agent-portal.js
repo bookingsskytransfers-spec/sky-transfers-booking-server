@@ -1845,5 +1845,6 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
   /* stripe-server.js records public-site bookings through this. requireAdmin
      is handed out so other modules can sit behind the same admin login rather
      than growing a second path that accepts the PIN. */
-  return { saveWebBooking, actionLinks, findOpenWebBooking, requireAdmin, getWebBooking, rowToBooking, summaryForRow, settleBalance };
+  /* pool goes to ops.js (the dispatch board), which reads these same tables. */
+  return { saveWebBooking, actionLinks, findOpenWebBooking, requireAdmin, getWebBooking, rowToBooking, summaryForRow, settleBalance, pool };
 };
