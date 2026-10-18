@@ -162,6 +162,9 @@ const TRAILER_PRICE = 30;    // luggage trailer, AUD
    which is fine because this only ever runs inside a request. Without it, or
    without b.p2p, this is exactly computeFare. */
 let p2p = null;
+/* Airport transfers to an address with no zone fare, priced on road distance
+   (km-routes.js). A booking priced that way carries b.km. */
+let kmq = null;
 async function fareForBooking(b) {
   if (b && b.hourly) {
     const h = hourlyHours(b);
@@ -170,6 +173,7 @@ async function fareForBooking(b) {
     return h && rate ? rate * h : null;
   }
   if (b && b.p2p && p2p && typeof p2p.fareFor === "function") return p2p.fareFor(b);
+  if (b && b.km && kmq && typeof kmq.fareFor === "function") return kmq.fareFor(b);
   return computeFare(b.pickup, b.dropoff, b.vehicle);
 }
 
@@ -625,6 +629,9 @@ function bookingSummary(b, fare, seats, trailer, ret) {
       `Booking reference: ${b.ref || "-"}`,
       `Route: ${b.pickup} -> ${b.dropoff}`,
       ...hourlyLines,
+      /* Only on a distance-priced booking, so every other booking's text is
+         unchanged for the dispatch automation that reads it. */
+      ...(b.kmRoad ? [`Priced by distance: ${b.kmRoad} km by road (no zone fare for this address)`] : []),
       `Vehicle: ${b.vehicle}`,
       hrs ? `Fare: $${fare} for ${hrs} hours ($${Math.round(fare / hrs)}/h)` : `Fare: $${fare} one-way`,
       `Baby/child seats: ${seats} ($${CHILD_SEAT_PRICE} each${ret ? ", each leg" : ""})`,
@@ -947,6 +954,7 @@ app.post("/create-checkout", async (req, res) => {
         trailer: trailer ? "yes" : "no",
         trip_type: hourlyHours(b) ? "hourly" : ret ? "return" : "one-way",
         hours: hourlyHours(b) ? String(hourlyHours(b)) : "",
+        km_road: b.kmRoad ? String(b.kmRoad) : "",
         return_date: ret ? ret.date : "",
         return_time: ret ? ret.time : "",
         return_flight: ret ? ret.flight : "",
@@ -983,6 +991,7 @@ app.post("/stripe-webhook", async (req, res) => {
         returnDate: m.return_date || "", returnTime: m.return_time || "",
         returnFlight: m.return_flight || "",
         hourly: m.hours ? { hours: parseInt(m.hours, 10) } : undefined,
+        kmRoad: parseInt(m.km_road, 10) || undefined,
         paymentIntent: typeof sess.payment_intent === "string" ? sess.payment_intent : (sess.payment_intent && sess.payment_intent.id) || "",
       };
       /* An account invoice paid by card. Not a booking: mark the invoice
@@ -1127,6 +1136,17 @@ try {
   });
 } catch (err) {
   console.error("p2p quotes not mounted (bookings unaffected):", err.message);
+}
+
+/* Airport transfers by road distance, for an address the zone tables do not
+   price (to 300 km). Wrapped the same way; zone-priced bookings never touch it. */
+try {
+  kmq = require("./km-routes")({
+    app, VEHICLES, VEHICLE_ALIASES, QUOTE_ONLY, computeFare,
+    SUBURBS, BM_SUBURB, LD_SUBURB, OOL, BNE, CRUISE, CRUISE_EXTRA,
+  });
+} catch (err) {
+  console.error("km fares not mounted (bookings unaffected):", err.message);
 }
 
 /* Operations - the dispatch board, drivers, vehicles, and the driver job
