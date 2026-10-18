@@ -1119,3 +1119,17 @@ try {
 } catch (err) {
   console.error("p2p quotes not mounted (bookings unaffected):", err.message);
 }
+
+/* Operations - the dispatch board, drivers, vehicles, and the driver job
+   links. Phase 1 of replacing Limo Anywhere. It reads the booking tables the
+   portal owns rather than copying them, so it borrows the portal pool and
+   admin login. Wrapped like the modules above: nothing on the booking path
+   depends on it. */
+try {
+  require("./ops")({
+    app, pool: portal && portal.pool, requireAdmin: portal && portal.requireAdmin,
+    VEHICLES, makeRef, mailer, BOOKINGS_EMAIL,
+  });
+} catch (err) {
+  console.error("Ops not mounted (bookings unaffected):", err.message);
+}
