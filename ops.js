@@ -148,6 +148,13 @@ module.exports = function installOps(ctx) {
       CREATE INDEX IF NOT EXISTS ops_dispatch_driver ON ops_dispatch (driver_id);
       /* Phase 2: when the driver was paid for this leg (billing.js pay sheet). */
       ALTER TABLE ops_dispatch ADD COLUMN IF NOT EXISTS driver_paid_at TIMESTAMPTZ;
+      /* Autopilot: chosen by the system rather than the office, and every
+         driver who has turned this leg down, so it is never offered back. */
+      ALTER TABLE ops_dispatch ADD COLUMN IF NOT EXISTS auto_assigned BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE ops_dispatch ADD COLUMN IF NOT EXISTS declined_ids TEXT;
+      /* An account job read from an email needs a human glance. */
+      ALTER TABLE ops_jobs ADD COLUMN IF NOT EXISTS needs_review BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE ops_jobs ADD COLUMN IF NOT EXISTS source_note TEXT;
     `);
   }
 
@@ -168,7 +175,7 @@ module.exports = function installOps(ctx) {
     to_char(pickup_date, 'YYYY-MM-DD') AS d, pickup_time AS t,
     to_char(return_date, 'YYYY-MM-DD') AS rd, return_time AS rt, return_flight AS rf,
     hire_hours, passenger_name, passenger_phone, passenger_email, flight, address, notes,
-    pax, child_seats, trailer, price_cents, status`;
+    pax, child_seats, trailer, price_cents, status, needs_review, source_note`;
 
   function legsOf(r, source) {
     const total = source === "account" ? (r.price_cents || 0) : (r.total_cents || 0);
@@ -187,6 +194,7 @@ module.exports = function installOps(ctx) {
       price: Math.round(total / (hasRet ? 2 : 1)) / 100,
       balance: r.balance_cents ? r.balance_cents / 100 : 0,
       isReturn: hasRet,
+      needsReview: !!r.needs_review, sourceNote: r.source_note || "",
     };
     const out = [{ ...base, leg: "out", date: r.d, time: r.t, from: r.pickup, to: r.dropoff, flight: r.flight || "" }];
     if (hasRet) out.push({ ...base, leg: "ret", date: r.rd, time: r.rt, from: r.dropoff, to: r.pickup, flight: r.rf || "" });
@@ -199,15 +207,15 @@ module.exports = function installOps(ctx) {
     if (byRef && !refs.length) return [];
     const web = await pool.query(
       `SELECT ${WEB_COLS} FROM web_bookings WHERE status <> 'declined' AND ` +
-      (byRef ? `ref IN (${inList(refs.length)})` : `((pickup_date BETWEEN $1 AND $2) OR (return_date BETWEEN $1 AND $2))`),
+      (byRef ? `ref IN (${inList(refs.length)})` : `((pickup_date >= $1 AND pickup_date <= $2) OR (return_date >= $1 AND return_date <= $2))`),
       byRef ? refs : [from, to]);
     const agent = await pool.query(
       `SELECT ${AGENT_COLS} FROM agent_bookings a LEFT JOIN agents g ON g.code = a.agent_code
-        WHERE a.status <> 'cancelled' AND ` + (byRef ? `a.ref IN (${inList(refs.length)})` : `a.pickup_date BETWEEN $1 AND $2`),
+        WHERE a.status <> 'cancelled' AND ` + (byRef ? `a.ref IN (${inList(refs.length)})` : `(a.pickup_date >= $1 AND a.pickup_date <= $2)`),
       byRef ? refs : [from, to]);
     const jobs = await pool.query(
       `SELECT ${JOB_COLS} FROM ops_jobs WHERE status <> 'cancelled' AND ` +
-      (byRef ? `ref IN (${inList(refs.length)})` : `((pickup_date BETWEEN $1 AND $2) OR (return_date BETWEEN $1 AND $2))`),
+      (byRef ? `ref IN (${inList(refs.length)})` : `((pickup_date >= $1 AND pickup_date <= $2) OR (return_date >= $1 AND return_date <= $2))`),
       byRef ? refs : [from, to]);
     return [].concat(
       web.rows.flatMap((r) => legsOf(r, "web")),
@@ -229,6 +237,8 @@ module.exports = function installOps(ctx) {
       l.officeNote = d && d.office_note || "";
       l.sentAt = d && d.sent_at || null;
       l.driverPaidAt = d && d.driver_paid_at || null;
+      l.auto = !!(d && d.auto_assigned);
+      l.declinedIds = d && d.declined_ids ? String(d.declined_ids).split(",").filter(Boolean).map(Number) : [];
       l.driverName = l.driverId && dById.get(l.driverId) ? dById.get(l.driverId).name : null;
       l.vehicleLabel = l.vehicleId && vById.get(l.vehicleId) ? vById.get(l.vehicleId).label : null;
       l.times = d ? { assigned: d.assigned_at, accepted: d.accepted_at, onWay: d.on_way_at,
@@ -340,24 +350,21 @@ module.exports = function installOps(ctx) {
     return legs.some((l) => l.ref === ref && l.leg === leg) ? legs.find((l) => l.ref === ref && l.leg === leg) : null;
   }
 
-  app.post("/ops/assign", requireAdmin, async (req, res) => {
-    try {
-      const b = req.body || {};
-      const ref = txt(b.ref, 40), leg = b.leg === "ret" ? "ret" : "out";
-      const job = ref ? await legExists(ref, leg) : null;
-      if (!job) return res.status(404).json({ error: "No such job." });
-      const driverId = b.driverId ? int(b.driverId, 1, 1e9, null) : null;
-      const vehicleId = b.vehicleId ? int(b.vehicleId, 1, 1e9, null) : null;
-      if (driverId) {
-        const { rows } = await pool.query(`SELECT id FROM ops_drivers WHERE id = $1 AND active`, [driverId]);
-        if (!rows.length) return res.status(400).json({ error: "That driver is not active." });
-      }
-      if (vehicleId) {
-        const { rows } = await pool.query(`SELECT id FROM ops_vehicles WHERE id = $1 AND active`, [vehicleId]);
-        if (!rows.length) return res.status(400).json({ error: "That vehicle is not active." });
-      }
-      const pay = b.driverPay === "" || b.driverPay == null ? null : cents(b.driverPay);
-      const note = txt(b.officeNote, 500) || null;
+  /* Shared by the office route and autopilot.js. Throws {code, message}. */
+  async function assignLeg({ ref, leg, driverId, vehicleId, payCents, note, auto }) {
+    const job = ref ? await legExists(ref, leg) : null;
+    if (!job) throw { code: 404, message: "No such job." };
+    if (driverId) {
+      const { rows } = await pool.query(`SELECT id FROM ops_drivers WHERE id = $1 AND active`, [driverId]);
+      if (!rows.length) throw { code: 400, message: "That driver is not active." };
+    }
+    if (vehicleId) {
+      const { rows } = await pool.query(`SELECT id FROM ops_vehicles WHERE id = $1 AND active`, [vehicleId]);
+      if (!rows.length) throw { code: 400, message: "That vehicle is not active." };
+    }
+    const pay = payCents == null ? null : payCents;
+    note = note || null;
+    {
       const { rows: prevRows } = await pool.query(`SELECT * FROM ops_dispatch WHERE ref = $1 AND leg = $2`, [ref, leg]);
       const prev = prevRows[0];
       const changedDriver = !prev || prev.driver_id !== driverId;
@@ -381,9 +388,21 @@ module.exports = function installOps(ctx) {
            declined_at = CASE WHEN $8 THEN NULL ELSE ops_dispatch.declined_at END,
            driver_paid_at = CASE WHEN $8 THEN NULL ELSE ops_dispatch.driver_paid_at END`,
         [ref, leg, driverId, vehicleId, pay, status, note, changedDriver]);
-      console.log("ops assign:", ref, leg, "driver", driverId || "-", "vehicle", vehicleId || "-", status);
-      res.json({ ok: true, status });
+      await pool.query(`UPDATE ops_dispatch SET auto_assigned = $3 WHERE ref = $1 AND leg = $2`, [ref, leg, !!(auto && driverId)]);
+      console.log("ops assign:", auto ? "(auto)" : "", ref, leg, "driver", driverId || "-", "vehicle", vehicleId || "-", status);
+      return { status, job };
+    }
+  }
+
+  app.post("/ops/assign", requireAdmin, async (req, res) => {
+    try {
+      const b = req.body || {};
+      const r = await assignLeg({ ref: txt(b.ref, 40), leg: b.leg === "ret" ? "ret" : "out",
+        driverId: b.driverId ? int(b.driverId, 1, 1e9, null) : null, vehicleId: b.vehicleId ? int(b.vehicleId, 1, 1e9, null) : null,
+        payCents: b.driverPay === "" || b.driverPay == null ? null : cents(b.driverPay), note: txt(b.officeNote, 500) || null, auto: false });
+      res.json({ ok: true, status: r.status });
     } catch (err) {
+      if (err && err.code) return res.status(err.code).json({ error: err.message });
       console.error("ops assign:", err);
       res.status(500).json({ error: "Could not save that assignment." });
     }
@@ -546,7 +565,7 @@ module.exports = function installOps(ctx) {
           `UPDATE ops_jobs SET account=$1, account_ref=$2, pickup=$3, dropoff=$4, vehicle=$5, pickup_date=$6, pickup_time=$7,
              return_date=$8, return_time=$9, return_flight=$10, hire_hours=$11, passenger_name=$12, passenger_phone=$13,
              passenger_email=$14, flight=$15, address=$16, notes=$17, pax=$18, child_seats=$19, trailer=$20, price_cents=$21,
-             updated_at=now() WHERE ref=$22`, vals.concat([editRef]));
+             needs_review=FALSE, updated_at=now() WHERE ref=$22`, vals.concat([editRef]));
         if (!r.rowCount) return res.status(404).json({ error: "No such account job." });
         /* A return that has been taken away leaves no leg to drive. */
         if (!j.returnDate) await pool.query(`DELETE FROM ops_dispatch WHERE ref = $1 AND leg = 'ret'`, [editRef]);
@@ -651,6 +670,12 @@ module.exports = function installOps(ctx) {
       await pool.query(
         `UPDATE ops_dispatch SET status = $3, ${col} = now(), updated_at = now() WHERE ref = $1 AND leg = $2 AND driver_id = $4`,
         [ref, leg, want, d.id]);
+      if (want === "declined") {
+        const { rows: dr } = await pool.query(`SELECT declined_ids FROM ops_dispatch WHERE ref = $1 AND leg = $2`, [ref, leg]);
+        const ids = new Set(String((dr[0] && dr[0].declined_ids) || "").split(",").filter(Boolean));
+        ids.add(String(d.id));
+        await pool.query(`UPDATE ops_dispatch SET declined_ids = $3 WHERE ref = $1 AND leg = $2`, [ref, leg, [...ids].join(",")]);
+      }
       console.log("driver status:", d.name, ref, leg, cur.status, "->", want);
       /* A driver turning a job down needs a human straight away. */
       if (want === "declined" && mailer) {
@@ -674,5 +699,6 @@ module.exports = function installOps(ctx) {
     .then(() => console.log("Ops ready (dispatch board, drivers, vehicles)"))
     .catch((e) => console.error("Ops setup failed:", e.message));
 
-  return { on: true, boardFor, linkFor, initOpsSchema, legsOf, markConflicts, driverFromToken, allDrivers, bneToday, addDays };
+  return { on: true, boardFor, linkFor, initOpsSchema, legsOf, markConflicts, driverFromToken, allDrivers, allVehicles, bneToday, addDays,
+           assignLeg, legExists, sourceRows };
 };
