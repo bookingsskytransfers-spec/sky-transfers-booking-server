@@ -126,6 +126,9 @@ module.exports = function installAutopilot(ctx) {
     digestOn: false, digestAt: "06:30",
     intakeOn: false, intakeSince: null,
     alertTo: "",
+    /* Phase 3, guest-updates.js: emails (and later WhatsApp) to the guest -
+       driver assigned the evening before, on the way, arrived. */
+    guestOn: false, guestNoticeAt: "19:00", guestAgentAccount: false, guestWhatsApp: false,
   };
   async function getSettings() {
     const { rows } = await pool.query(`SELECT value FROM ops_settings WHERE key = 'autopilot'`);
@@ -136,8 +139,9 @@ module.exports = function installAutopilot(ctx) {
     const cur = await getSettings();
     const b = patch || {}, next = Object.assign({}, cur);
     const bool = (k) => { if (k in b) next[k] = b[k] === true || b[k] === "true"; };
-    ["dispatchOn", "closeOn", "autoCloseStarted", "invoicesOn", "digestOn", "intakeOn"].forEach(bool);
-    for (const k of ["dispatchAt", "invoiceAt", "digestAt"]) if (k in b) { const t = hhmm(b[k]); if (!t) throw { code: 400, message: "Times are 24-hour, like 18:00." }; next[k] = t; }
+    ["dispatchOn", "closeOn", "autoCloseStarted", "invoicesOn", "digestOn", "intakeOn",
+     "guestOn", "guestAgentAccount", "guestWhatsApp"].forEach(bool);
+    for (const k of ["dispatchAt", "invoiceAt", "digestAt", "guestNoticeAt"]) if (k in b) { const t = hhmm(b[k]); if (!t) throw { code: 400, message: "Times are 24-hour, like 18:00." }; next[k] = t; }
     if ("closeAfterHours" in b) {
       const h = parseInt(b.closeAfterHours, 10);
       if (!(h >= 1 && h <= 12)) throw { code: 400, message: "Chase unclosed jobs after 1 to 12 hours." };

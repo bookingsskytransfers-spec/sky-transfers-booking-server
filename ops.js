@@ -40,6 +40,10 @@ module.exports = function installOps(ctx) {
   const KEY = crypto.createHmac("sha256", SECRET).update("sky-driver-link-v1").digest();
   const SITE = String(process.env.PUBLIC_SITE_URL || "https://www.skytransfers.com.au").replace(/\/+$/, "");
 
+  /* Filled in by modules mounted later: hooks.step({ref, leg, status}) runs
+     after a driver (or the office) moves a leg on, and must not throw. */
+  const hooks = {};
+
   const STATUSES = ["unassigned", "assigned", "accepted", "on_way", "on_location", "pob", "done", "declined"];
   /* What a driver may press, and the order they come in. */
   const DRIVER_STEPS = { accepted: "accepted_at", on_way: "on_way_at", on_location: "on_location_at", pob: "pob_at", done: "done_at" };
@@ -155,6 +159,11 @@ module.exports = function installOps(ctx) {
       /* An account job read from an email needs a human glance. */
       ALTER TABLE ops_jobs ADD COLUMN IF NOT EXISTS needs_review BOOLEAN NOT NULL DEFAULT FALSE;
       ALTER TABLE ops_jobs ADD COLUMN IF NOT EXISTS source_note TEXT;
+      -- Phase 3 guest updates (guest-updates.js): the driver the guest was told
+      -- about, and when the on-the-way and arrived messages went.
+      ALTER TABLE ops_dispatch ADD COLUMN IF NOT EXISTS guest_assigned_for INTEGER;
+      ALTER TABLE ops_dispatch ADD COLUMN IF NOT EXISTS guest_onway_at TIMESTAMPTZ;
+      ALTER TABLE ops_dispatch ADD COLUMN IF NOT EXISTS guest_arrived_at TIMESTAMPTZ;
     `);
   }
 
@@ -386,7 +395,9 @@ module.exports = function installOps(ctx) {
            pob_at = CASE WHEN $8 THEN NULL ELSE ops_dispatch.pob_at END,
            done_at = CASE WHEN $8 THEN NULL ELSE ops_dispatch.done_at END,
            declined_at = CASE WHEN $8 THEN NULL ELSE ops_dispatch.declined_at END,
-           driver_paid_at = CASE WHEN $8 THEN NULL ELSE ops_dispatch.driver_paid_at END`,
+           driver_paid_at = CASE WHEN $8 THEN NULL ELSE ops_dispatch.driver_paid_at END,
+           guest_onway_at = CASE WHEN $8 THEN NULL ELSE ops_dispatch.guest_onway_at END,
+           guest_arrived_at = CASE WHEN $8 THEN NULL ELSE ops_dispatch.guest_arrived_at END`,
         [ref, leg, driverId, vehicleId, pay, status, note, changedDriver]);
       await pool.query(`UPDATE ops_dispatch SET auto_assigned = $3 WHERE ref = $1 AND leg = $2`, [ref, leg, !!(auto && driverId)]);
       console.log("ops assign:", auto ? "(auto)" : "", ref, leg, "driver", driverId || "-", "vehicle", vehicleId || "-", status);
@@ -427,6 +438,7 @@ module.exports = function installOps(ctx) {
         (col ? `, ${col} = COALESCE(ops_dispatch.${col}, now())` : ""),
         [ref, leg, status]);
       console.log("ops status (office):", ref, leg, status);
+      if (hooks.step) hooks.step({ ref, leg, status }).catch((e) => console.error("guest update:", e.message));
       res.json({ ok: true });
     } catch (err) {
       console.error("ops status:", err);
@@ -677,6 +689,7 @@ module.exports = function installOps(ctx) {
         await pool.query(`UPDATE ops_dispatch SET declined_ids = $3 WHERE ref = $1 AND leg = $2`, [ref, leg, [...ids].join(",")]);
       }
       console.log("driver status:", d.name, ref, leg, cur.status, "->", want);
+      if (hooks.step) hooks.step({ ref, leg, status: want }).catch((e) => console.error("guest update:", e.message));
       /* A driver turning a job down needs a human straight away. */
       if (want === "declined" && mailer) {
         const job = await legExists(ref, leg);
@@ -700,5 +713,5 @@ module.exports = function installOps(ctx) {
     .catch((e) => console.error("Ops setup failed:", e.message));
 
   return { on: true, boardFor, linkFor, initOpsSchema, legsOf, markConflicts, driverFromToken, allDrivers, allVehicles, bneToday, addDays,
-           assignLeg, legExists, sourceRows };
+           assignLeg, legExists, sourceRows, hooks };
 };

@@ -1178,11 +1178,24 @@ try {
    prepares scheduled invoices for one-click approval, sends the morning
    digest and reads account booking emails. Every part is off until switched
    on in dispatch.html, and nothing on the booking path depends on it. */
+let autopilot = null;
 try {
-  require("./autopilot")({
+  autopilot = require("./autopilot")({
     app, pool: portal && portal.pool, requireAdmin: portal && portal.requireAdmin,
     ops, billing, mailer, BOOKINGS_EMAIL, VEHICLES, makeRef,
   });
 } catch (err) {
   console.error("Autopilot not mounted (bookings unaffected):", err.message);
+}
+
+/* Guest updates (Phase 3) - driver assigned / on the way / arrived, by email
+   and later WhatsApp, plus the track-your-driver page's data. Off until
+   switched on in the Autopilot tab. Wrapped like everything above. */
+try {
+  require("./guest-updates")({
+    app, pool: portal && portal.pool, requireAdmin: portal && portal.requireAdmin,
+    ops, autopilot, mailer, BOOKINGS_EMAIL, HUBS: [OOL, BNE, CRUISE],
+  });
+} catch (err) {
+  console.error("Guest updates not mounted (bookings unaffected):", err.message);
 }
