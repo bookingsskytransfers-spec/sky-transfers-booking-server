@@ -40,16 +40,16 @@ module.exports = function installBilling(ctx) {
 
   /* The legal name was confirmed by Aman on 9 Sept 2026; "Australia Wide Cars
      Pty Ltd", on some earlier hand-made invoices, is not it. The operator
-     accreditation is Queensland TMR's. The booking entity authorisation (BEA)
-     is left off until Aman confirms the number from the certificate (two
-     different ones were on old invoices) - set INVOICE_BEA on Render to print it. */
+     accreditation and booking entity authorisation are Queensland TMR's. BEA
+     279338 confirmed by Aman on 19 Oct 2026 (an old invoice said 279339 -
+     that was the typo). INVOICE_BEA on Render overrides it if it ever changes. */
   const SELLER = {
     name: "Australia Wide Car Services Pty Ltd",
     trading: "trading as Sky Transfers",
     short: "Australia Wide Car Services Pty Ltd T/A Sky Transfers",
     abn: "22 680 932 003",
     oa: "900595993",
-    bea: String(process.env.INVOICE_BEA || "").trim(),
+    bea: String(process.env.INVOICE_BEA || "279338").trim(),
     contact: "Aman",   /* Aman's choice: first name only, never the full name */
     email: "info@skytransfers.com.au",
     phone: "+61 481 437 772",
