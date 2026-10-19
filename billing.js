@@ -50,7 +50,7 @@ module.exports = function installBilling(ctx) {
     abn: "22 680 932 003",
     oa: "900595993",
     bea: String(process.env.INVOICE_BEA || "").trim(),
-    contact: "Amandeep Singh",
+    contact: "Aman",   /* Aman's choice: first name only, never the full name */
     email: "info@skytransfers.com.au",
     phone: "+61 481 437 772",
     web: "www.skytransfers.com.au",
