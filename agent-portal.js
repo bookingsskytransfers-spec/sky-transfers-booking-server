@@ -157,6 +157,10 @@ module.exports = function installAgentPortal(ctx) {
       ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS balance_link_id  TEXT;
       ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS balance_link_url TEXT;
       ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS hire_hours       INTEGER;
+      ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS stops            TEXT;
+      ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS cancelled_at     TIMESTAMPTZ;
+      ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS refunded_cents   INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS cancel_note      TEXT;
       CREATE INDEX IF NOT EXISTS web_bookings_recent ON web_bookings (created_at DESC);
       CREATE INDEX IF NOT EXISTS web_bookings_status ON web_bookings (status, created_at DESC);
     `);
@@ -728,7 +732,19 @@ module.exports = function installAgentPortal(ctx) {
      stop a booking email going out - the email is still the path the business
      actually runs on, and this is a record of it, not a replacement for it.
      --------------------------------------------------------------------- */
-  const WEB_STATUSES = ["requested", "confirmed", "declined", "paid"];
+  const WEB_STATUSES = ["requested", "confirmed", "declined", "paid", "cancelled"];
+
+  /* Stops along the way are kept as JSON: {list:[{address,suburb,lat,lng}],
+     extra, km}. extra is the dollars charged for them when the booking was
+     priced, so a resend or an amendment shows the same figure. */
+  const stopsJson = (b) => (Array.isArray(b && b.stops) && b.stops.length)
+    ? JSON.stringify({ list: b.stops.slice(0, 3).map((s) => ({ address: String(s.address || s.suburb || "").slice(0, 200), suburb: s.suburb || "", lat: s.lat != null ? s.lat : null, lng: s.lng != null ? s.lng : null })),
+                       extra: Math.round(Number(b.stopsExtra) || 0), km: b.stopsKm != null ? b.stopsKm : null })
+    : null;
+  function stopsOf(r) {
+    try { const j = r && r.stops ? JSON.parse(r.stops) : null; return j && Array.isArray(j.list) && j.list.length ? j : null; }
+    catch (e) { return null; }
+  }
 
   const webRow = (r) => ({
     ref: r.ref, created: r.created_at,
@@ -743,6 +759,9 @@ module.exports = function installAgentPortal(ctx) {
     dateText: r.pickup_date_text || null, returnDateText: r.return_date_text || null,
     total: r.total_cents / 100, status: r.status,
     confirmedAt: r.confirmed_at, declinedAt: r.declined_at, paidAt: r.paid_at,
+    stops: (stopsOf(r) || { list: [] }).list.map((s) => s.address),
+    cancelledAt: r.cancelled_at || null, refunded: (r.refunded_cents || 0) / 100, cancelNote: r.cancel_note || "",
+    balance: (r.balance_cents || 0) / 100,
   });
 
   async function saveWebBooking(b, s, status) {
@@ -757,15 +776,17 @@ module.exports = function installAgentPortal(ctx) {
          (ref, pickup, dropoff, vehicle, pickup_date, pickup_time, passenger_name,
           passenger_phone, passenger_email, flight, address, notes, pax, child_seats,
           trailer, total_cents, status, user_agent, return_date, return_time, return_flight,
-          payment_intent, hire_hours, confirmed_at, paid_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,
+          payment_intent, hire_hours, stops, confirmed_at, paid_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,
                CASE WHEN $17 IN ('confirmed','paid') THEN now() END,
                CASE WHEN $17 = 'paid' THEN now() END)
        ON CONFLICT (ref) DO UPDATE SET
          /* Never walk a booking backwards. The webhook and a later re-save can
-            arrive in either order, and paid is the end of the line. */
-         status       = CASE WHEN web_bookings.status = 'paid' THEN 'paid'
+            arrive in either order, and paid is the end of the line - as is
+            cancelled, which only the office's Cancel button sets. */
+         status       = CASE WHEN web_bookings.status IN ('paid', 'cancelled') THEN web_bookings.status
                              ELSE EXCLUDED.status END,
+         stops        = COALESCE(web_bookings.stops, EXCLUDED.stops),
          total_cents  = GREATEST(web_bookings.total_cents, EXCLUDED.total_cents),
          confirmed_at = COALESCE(web_bookings.confirmed_at, EXCLUDED.confirmed_at),
          paid_at      = COALESCE(web_bookings.paid_at, EXCLUDED.paid_at),
@@ -781,7 +802,7 @@ module.exports = function installAgentPortal(ctx) {
        String((b && b.returnTime) || "").trim() || null,
        String((b && b.returnFlight) || "").trim().slice(0, 40) || null,
        String((b && b.paymentIntent) || "").trim() || null,
-       hoursOf(b)]
+       hoursOf(b), stopsJson(b)]
     );
     /* Paid means the link has done its job. Switching it off stops a second
        payment and stops a forwarded link being payable by anyone else. */
@@ -890,7 +911,7 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
          status       = $2,
          confirmed_at = CASE WHEN $2 = 'confirmed' THEN COALESCE(confirmed_at, now()) ELSE confirmed_at END,
          declined_at  = CASE WHEN $2 = 'declined'  THEN COALESCE(declined_at,  now()) ELSE declined_at  END
-       WHERE ref = $1 AND status <> 'paid'`, [ref, status]);
+       WHERE ref = $1 AND status NOT IN ('paid', 'cancelled')`, [ref, status]);
   }
   const rowMoney = (r) => "$" + (r.total_cents / 100).toFixed(0);
   function rowLines(r) {
@@ -1057,6 +1078,8 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
         `<h1>We don&rsquo;t have that booking</h1><p class="muted">Reference ${esc(claim.ref)}.</p>${DASH}`));
       if (r.status === "paid") return res.send(actionPage("Already paid",
         `<h1>Already paid</h1>${rowDl(r)}<p>Nothing to do &mdash; this one is settled.</p>${DASH}`));
+      if (r.status === "cancelled") return res.send(actionPage("Cancelled",
+        `<h1>This booking was cancelled</h1>${rowDl(r)}<p>Nothing to do.</p>${DASH}`));
 
       const approving = claim.act === "approve";
       const already = approving && r.status === "confirmed";
@@ -1090,6 +1113,8 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
       if (!r) return res.status(404).send(actionPage("Not found", `<h1>We don&rsquo;t have that booking</h1>${DASH}`));
       if (r.status === "paid") return res.send(actionPage("Already paid",
         `<h1>Already paid</h1>${rowDl(r)}${DASH}`));
+      if (r.status === "cancelled") return res.send(actionPage("Cancelled",
+        `<h1>This booking was cancelled</h1>${rowDl(r)}${DASH}`));
 
       if (claim.act === "decline") {
         await setWebStatus(r.ref, "declined");
@@ -1177,6 +1202,7 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
       returnFlight: r.return_flight || "",
       hourly: r.hire_hours ? { hours: r.hire_hours } : undefined,
       paid: r.status === "paid", confirmed: r.status === "confirmed" || r.status === "paid",
+      ...(() => { const j = stopsOf(r); return j ? { stops: j.list, stopsExtra: j.extra || 0, stopsKm: j.km } : {}; })(),
     };
   }
   const balanceUrlFor = (r) => (r.balance_cents > 0 && r.balance_link_url)
@@ -1247,6 +1273,12 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
       notes: String(b0.notes || "").trim().slice(0, 450),
       returnDate: isoDate(b0.returnDate), returnTime: hhmm(b0.returnTime),
       returnFlight: String(b0.returnFlight || "").trim().slice(0, 40),
+      /* Up to three stops along the way, each an address the office typed;
+         priced by the extra distance in fareForBooking. */
+      stops: (Array.isArray(b0.stops) ? b0.stops : [])
+        .map((s) => (typeof s === "string" ? { address: s.trim() } : s))
+        .filter((s) => s && String(s.address || "").trim().length >= 3).slice(0, 3)
+        .map((s) => ({ address: String(s.address).trim().slice(0, 200), lat: s.lat != null ? s.lat : null, lng: s.lng != null ? s.lng : null })),
     };
     /* Every refusal is logged with its reason. A booking the office could not
        make is worth a line in the log even when nothing went wrong. */
@@ -1345,6 +1377,7 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
       const r = ref ? await getWebBooking(ref) : null;
       if (!r) return res.status(404).json({ error: "No booking with that reference." });
       if (r.status === "declined") return res.status(409).json({ error: "That booking was declined — there is nothing to confirm." });
+      if (r.status === "cancelled") return res.status(409).json({ error: "That booking was cancelled — there is nothing to confirm." });
       /* The office may send it somewhere other than the address on the
          booking - a corrected address, a travel agent, a second passenger.
          The booking's own record is not changed. */
@@ -1385,6 +1418,7 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
       const ref = String(b0.ref || "").trim();
       const r = ref ? await getWebBooking(ref) : null;
       if (!r) return res.status(404).json({ error: "No booking with that reference." });
+      if (r.status === "cancelled") return res.status(409).json({ error: "That booking was cancelled — make a new booking instead." });
       const wasPaid = r.status === "paid";
       const manual = b0.manualMoney === true || b0.manualMoney === "true";
       const parsed = await parseOfficeBooking(b0, res);
@@ -1426,13 +1460,13 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
            passenger_name = $7, passenger_phone = $8, passenger_email = $9, flight = $10,
            address = $11, notes = $12, pax = $13, child_seats = $14, trailer = $15,
            total_cents = $16, return_date = $17, return_time = $18, return_flight = $19,
-           balance_cents = 0, balance_link_id = NULL, balance_link_url = NULL` +
+           stops = $20, balance_cents = 0, balance_link_id = NULL, balance_link_url = NULL` +
         /* An unpaid booking's link is replaced; a paid one keeps its payment history. */
         (wasPaid ? "" : ", payment_link_id = NULL, payment_link_url = NULL, link_seq = link_seq + 1") +
         ` WHERE ref = $1`,
         [ref, b.pickup, b.dropoff, b.vehicle, b.date, b.time, b.name, b.phone, b.email || null,
          b.flight || null, b.address || null, b.notes || null, b.pax, b.childSeats, b.trailer,
-         newCents, b.returnDate || null, b.returnTime || null, b.returnFlight || null]);
+         newCents, b.returnDate || null, b.returnTime || null, b.returnFlight || null, stopsJson(b)]);
 
       /* An earlier balance link, if any, is now wrong - switch it off. */
       if (r.balance_link_id && stripe) {
@@ -1485,6 +1519,107 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
     }
   });
 
+  /* ---- cancel a booking from the admin page -------------------------------
+     The record is kept (status 'cancelled'), unlike Remove, so the history and
+     any refund stay on file. The terms (section 4): more than 24 hours before
+     pick-up, a full refund; within 24 hours a fee of up to the full fare may
+     apply - so the office chooses the refund then (Aman, 19 Oct 2026), and the
+     page suggests none. A refund goes back to the card through Stripe; an
+     unpaid booking's payment links are switched off. The guest is emailed,
+     the board drops the job (ops.js skips cancelled rows), and if a driver had
+     already been sent it the office is told to let them know. */
+  app.post("/admin/web-booking/cancel", requireAdmin, async (req, res) => {
+    try {
+      const b0 = req.body || {};
+      const ref = String(b0.ref || "").trim();
+      const r = ref ? await getWebBooking(ref) : null;
+      if (!r) return res.status(404).json({ error: "No booking with that reference." });
+      if (r.status === "cancelled") return res.status(409).json({ error: "That booking is already cancelled." });
+      if (r.status === "declined") return res.status(409).json({ error: "That booking was declined - there is nothing to cancel." });
+      const paid = r.status === "paid";
+      const paidCents = paid ? Math.max(0, (r.total_cents || 0) - (r.balance_cents || 0)) : 0;
+      const when = Date.parse(`${r.pickup_date_text || ""}T${String(r.pickup_time || "00:00").slice(0, 5)}:00+10:00`);
+      const hoursOut = Number.isFinite(when) ? (when - Date.now()) / 3600e3 : null;
+      const early = hoursOut != null && hoursOut > 24;
+      const manual = b0.manualMoney === true || b0.manualMoney === "true";
+      let refundCents = paid ? (early ? paidCents : 0) : 0;
+      if (paid && b0.refund !== undefined && b0.refund !== null && b0.refund !== "") {
+        const want = Math.round(Number(b0.refund) * 100);
+        if (!Number.isFinite(want) || want < 0) return res.status(400).json({ error: "The refund has to be an amount of dollars, or 0." });
+        if (want > paidCents) return res.status(400).json({ error: `The guest paid $${Math.round(paidCents / 100)} - the refund can't be more than that.` });
+        refundCents = want;
+      }
+      const reason = String(b0.reason || "").trim().slice(0, 300);
+      let refundId = null;
+      if (refundCents > 0 && !manual) {
+        if (!stripe) return res.status(503).json({ error: "Payments are not configured, so the refund cannot be made automatically.", needsManual: true });
+        const pi = await findPaymentIntent(r).catch((e) => { console.error("cancel: find payment:", e.message); return null; });
+        if (!pi) {
+          return res.status(409).json({ needsManual: true,
+            error: `The card payment for ${ref} could not be found in Stripe, so the $${Math.round(refundCents / 100)} refund cannot be made automatically. ` +
+                   "Refund it from the Stripe dashboard, then cancel again with 'settle the money by hand' ticked." });
+        }
+        const refund = await stripe.refunds.create({ payment_intent: pi, amount: refundCents, metadata: { ref, reason: "booking cancelled by office" } },
+          { idempotencyKey: "cancel-" + ref + "-" + refundCents });
+        refundId = refund.id;
+      }
+      await pool.query(
+        `UPDATE web_bookings SET status = 'cancelled', cancelled_at = now(), refunded_cents = refunded_cents + $2, cancel_note = $3 WHERE ref = $1`,
+        [ref, manual ? 0 : refundCents, reason || null]);
+      /* No payment link may stay payable for a cancelled trip. */
+      await deactivatePaymentLink(ref).catch((e) => console.error("cancel: link off:", e.message));
+      if (r.balance_link_id && stripe) {
+        await stripe.paymentLinks.update(r.balance_link_id, { active: false, inactive_message: "This booking has been cancelled. Questions: +61 481 437 772." })
+          .catch((e) => console.error("cancel: balance link off:", e.message));
+      }
+      /* Who had already been sent this job. ops.js's tables exist only when
+         dispatch is on, so this is a best effort. */
+      let drivers = [];
+      try {
+        drivers = (await pool.query(
+          `SELECT d.leg, r.name, r.phone FROM ops_dispatch d JOIN ops_drivers r ON r.id = d.driver_id
+            WHERE d.ref = $1 AND (d.sent_at IS NOT NULL OR d.status IN ('accepted','on_way','on_location','pob'))`, [ref])).rows;
+      } catch (e) { drivers = []; }
+      const refundTxt = refundCents > 0
+        ? (manual ? `$${Math.round(refundCents / 100)} to be refunded by hand` : `$${Math.round(refundCents / 100)} refunded to the card (Stripe ${refundId})`)
+        : paid ? "no refund" : "nothing had been paid";
+      const notify = b0.notifyGuest !== false && b0.notifyGuest !== "false";
+      let emailed = null;
+      if (notify && r.passenger_email && mailer) {
+        const first = String(r.passenger_name || "").trim().split(/\s+/)[0] || "there";
+        const money = refundCents > 0
+          ? (manual
+            ? `A refund of $${Math.round(refundCents / 100)} is being arranged - we'll let you know when it has been sent.`
+            : `$${Math.round(refundCents / 100)} has been refunded to the card you paid with - it usually shows within 5 to 10 business days.`)
+          : paid ? (early ? "The fare is not refunded." : "As the cancellation was within 24 hours of pick-up, the fare is not refunded, in line with our booking terms.")
+          : "Nothing was charged.";
+        /* The booking is already cancelled and any refund made, so a failed
+           email must not turn into an error that invites a second attempt. */
+        try { await mailer.sendMail({
+          from: `"Sky Transfers" <${process.env.GMAIL_USER}>`, to: r.passenger_email, replyTo: BOOKINGS_EMAIL,
+          subject: `Booking cancelled - Sky Transfers · ${ref}`,
+          text: `Hi ${first},\n\nYour booking ${ref} has been cancelled:\n\n  ${r.pickup_date_text} at ${r.pickup_time}\n  ${r.pickup} -> ${r.dropoff}\n  ${r.vehicle}\n\n${money}\n\n` +
+                `If this wasn't what you expected, or you'd like to book again, reply to this email or call +61 481 437 772.\n\nSky Transfers\nwww.skytransfers.com.au`,
+        }); emailed = r.passenger_email; } catch (e) { console.error("cancel guest email:", e.message); }
+      }
+      if (mailer) {
+        Promise.resolve().then(() => mailer.sendMail({
+          from: `"Sky Transfers Website" <${process.env.GMAIL_USER}>`, to: BOOKINGS_EMAIL, replyTo: r.passenger_email || undefined,
+          subject: `CANCELLED: ${r.pickup} -> ${r.dropoff} (${r.pickup_date_text} ${r.pickup_time}) [${ref}] - ${refundTxt}`,
+          text: `CANCELLED from the admin page.\n\n${rowLines(r)}\n\nMoney: ${refundTxt}.` +
+                (reason ? `\nReason: ${reason}` : "") + (emailed ? `\nGuest emailed at ${emailed}.` : "\nGuest NOT emailed.") +
+                (drivers.length ? `\n\nTELL THE DRIVER - this job had been sent to: ${drivers.map((d) => `${d.name} (${d.phone})${d.leg === "ret" ? " for the return" : ""}`).join(", ")}.` : ""),
+        })).catch((e) => console.error("cancel copy:", e.message));
+      }
+      console.log("web booking cancelled:", ref, refundTxt, hoursOut != null ? Math.round(hoursOut) + "h out" : "");
+      res.json({ ok: true, ref, refunded: manual ? 0 : refundCents / 100, refundManual: manual && refundCents > 0 ? refundCents / 100 : 0,
+                 emailed, drivers: drivers.map((d) => ({ name: d.name, phone: d.phone, leg: d.leg })), hoursOut: hoursOut != null ? Math.round(hoursOut) : null });
+    } catch (err) {
+      console.error("cancel web booking:", err);
+      res.status(500).json({ error: "Could not cancel that booking - check Stripe before trying again if it was paid." });
+    }
+  });
+
   app.post("/admin/web-booking/remove", requireAdmin, async (req, res) => {
     try {
       const ref = String((req.body && req.body.ref) || "").trim();
@@ -1494,8 +1629,8 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
       /* Paid bookings stay put. The privacy policy promises booking and
          payment records are kept for seven years, and a button on a dashboard
          is not the place to start breaking that promise. */
-      if (r.status === "paid") {
-        return res.status(409).json({ error: "A paid booking cannot be removed." });
+      if (r.status === "paid" || r.paid_at) {
+        return res.status(409).json({ error: "A paid booking cannot be removed - cancel it instead, which keeps the record." });
       }
       /* Kill the payment link first, so removing the row cannot leave a live
          payable link behind with nothing to reconcile it against. */
