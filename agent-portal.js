@@ -755,11 +755,21 @@ module.exports = function installAgentPortal(ctx) {
     ends: (() => { try { return r.ends ? JSON.parse(r.ends) : null; } catch (e) { return null; } })(),
   });
 
+  /* Trip status per leg, from guest-updates.js (mounted later, so it is
+     handed in). Without it the bookings list simply has no status column. */
+  let tripStatus = null;
+  const setTripStatus = (fn) => { tripStatus = typeof fn === "function" ? fn : null; };
+
   app.get("/agent/summary", requireAgent, async (req, res) => {
     try {
       const { rows } = await pool.query(
         `SELECT * FROM agent_bookings WHERE agent_code = $1 ORDER BY created_at DESC LIMIT 200`,
         [req.agent.code]);
+      let trips = {};
+      if (tripStatus) {
+        const want = rows.filter((r) => r.status === "confirmed").map((r) => { const b = bookingRow(r); return { ref: b.ref, date: b.date, returnDate: b.returnDate }; });
+        trips = await tripStatus(want).catch((e) => { console.error("agent trip status:", e.message); return {}; });
+      }
       /* The wallet is derived, never stored — a stored balance is one failed
          write away from disagreeing with the bookings that justify it. */
       const live = rows.filter((r) => r.status === "confirmed");
@@ -773,6 +783,7 @@ module.exports = function installAgentPortal(ctx) {
           const b = bookingRow(r);
           const h = hoursUntil(b.date, b.time);
           b.changeable = r.status === "confirmed" && h != null && h >= CHANGE_CUTOFF_HOURS;
+          b.trip = trips[b.ref] || null;
           return b;
         }),
       });
@@ -2070,5 +2081,5 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
      is handed out so other modules can sit behind the same admin login rather
      than growing a second path that accepts the PIN. */
   /* pool goes to ops.js (the dispatch board), which reads these same tables. */
-  return { saveWebBooking, actionLinks, findOpenWebBooking, requireAdmin, getWebBooking, rowToBooking, summaryForRow, settleBalance, pool };
+  return { saveWebBooking, actionLinks, findOpenWebBooking, requireAdmin, getWebBooking, rowToBooking, summaryForRow, settleBalance, pool, setTripStatus };
 };
