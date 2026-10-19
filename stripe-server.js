@@ -1199,3 +1199,13 @@ try {
 } catch (err) {
   console.error("Guest updates not mounted (bookings unaffected):", err.message);
 }
+
+/* Phase 4 - import the upcoming Limo Anywhere bookings (dispatch.html Import
+   tab, admin only). Wrapped like everything above. */
+try {
+  require("./la-import")({
+    app, pool: portal && portal.pool, requireAdmin: portal && portal.requireAdmin, ops, VEHICLES, makeRef,
+  });
+} catch (err) {
+  console.error("LA import not mounted (bookings unaffected):", err.message);
+}
