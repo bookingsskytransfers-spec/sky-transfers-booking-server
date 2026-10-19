@@ -1256,6 +1256,8 @@ try {
 try {
   billing = require("./billing")({
     app, pool: portal && portal.pool, requireAdmin: portal && portal.requireAdmin,
+    /* so an agency can read and download its own invoices in the portal */
+    requireAgent: portal && portal.requireAgent,
     ops, stripe, mailer, BOOKINGS_EMAIL,
   });
 } catch (err) {
