@@ -223,9 +223,9 @@ module.exports = function installBilling(ctx) {
       const ag = await getAgent(txt(partyKey, 40));
       if (!ag) return { error: "No such agent." };
       rows = (await pool.query(
-        `SELECT ref, NULL AS account_ref, pickup, dropoff, vehicle, to_char(pickup_date, 'YYYY-MM-DD') AS d, pickup_time AS t,
-                NULL AS rd, NULL AS rt, NULL AS rflight, NULL AS hire_hours, passenger_name, pax, flight, address,
-                NULL AS stops, child_seats, trailer, total_cents AS cents
+        `SELECT ref, client_ref AS account_ref, pickup, dropoff, vehicle, to_char(pickup_date, 'YYYY-MM-DD') AS d, pickup_time AS t,
+                to_char(return_date, 'YYYY-MM-DD') AS rd, return_time AS rt, return_flight AS rflight, hire_hours,
+                passenger_name, pax, flight, address, NULL AS stops, child_seats, trailer, total_cents AS cents
            FROM agent_bookings WHERE status <> 'cancelled' AND agent_code = $1 AND pickup_date >= $2 AND pickup_date <= $3`,
         [ag.code, from, to])).rows;
       party = { type: "agent", key: ag.code, name: ag.name, email: ag.email, contact: null, abn: null, address: null, phone: null, terms: 14 };

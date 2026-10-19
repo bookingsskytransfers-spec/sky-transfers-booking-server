@@ -120,6 +120,15 @@ module.exports = function installAgentPortal(ctx) {
       ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS settled_at   TIMESTAMPTZ;
       ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ;
       ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS updated_at   TIMESTAMPTZ;
+      -- Agent portal v2 (19 Oct 2026): the agency's own reference, a return
+      -- leg, by-the-hour hire, and the two ends as the page priced them (JSON,
+      -- so an amendment can be priced again from the same addresses).
+      ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS client_ref    TEXT;
+      ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS return_date   DATE;
+      ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS return_time   TEXT;
+      ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS return_flight TEXT;
+      ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS hire_hours    INTEGER;
+      ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS ends          TEXT;
       CREATE INDEX IF NOT EXISTS agent_bookings_by_agent
         ON agent_bookings (agent_code, created_at DESC);
       CREATE TABLE IF NOT EXISTS web_bookings (
@@ -346,37 +355,100 @@ module.exports = function installAgentPortal(ctx) {
     res.json({ places: PLACES_FOR_AGENTS, vehicles: VEHICLES });
   });
 
-  app.post("/agent/quote", requireAgent, (req, res) => {
-    const { pickup, dropoff } = req.body || {};
-    const pct = agentPct(req.agent);
-    const out = VEHICLES.map((v) => {
-      const fare = computeFare(pickup, dropoff, v);
-      return fare == null ? null : {
-        vehicle: v,
-        fare,
-        commission: commissionOf(fare * 100, pct) / 100,
-      };
-    }).filter(Boolean);
-    if (!out.length) {
-      return res.json({ quotable: false, message: "We don't publish a fixed fare for that route — call +61 481 437 772 and we'll price it for you." });
+  /* ---- pricing: exactly what the public site charges --------------------
+     Agents get the same engine as the website, through fareForBooking: the
+     zone tables first; then, for an address we have no zone fare for, the
+     road distance to the airport (to 300 km); then point-to-point between
+     any two addresses; and by-the-hour hire. The page sends the two ends as
+     it picked them ({suburb, address, lat, lng}); the server measures again
+     and never takes a fare from the page. */
+  const AGENT_HUBS = new Set(HUB_NAMES || []);
+  function endOf(o, name) {
+    const src = o && typeof o === "object" ? o : {};
+    const e = { suburb: String(src.suburb || name || "").trim().slice(0, 120) };
+    if (src.address) e.address = String(src.address).trim().slice(0, 300);
+    if (src.lat != null && src.lng != null && Number.isFinite(+src.lat) && Number.isFinite(+src.lng)) { e.lat = +src.lat; e.lng = +src.lng; }
+    if (!e.address) e.address = e.suburb + ", QLD, Australia";
+    return e;
+  }
+  function tripOf(b) {
+    const hours = hoursOf(b);
+    const ends = b.ends && typeof b.ends === "object" ? b.ends : {};
+    const pickup = String(b.pickup || "").trim(), dropoff = hours ? "As directed" : String(b.dropoff || "").trim();
+    return { pickup, dropoff, hours, pu: endOf(ends.pickup, pickup), dro: hours ? null : endOf(ends.dropoff, dropoff) };
+  }
+  async function agentFare(t, vehicle) {
+    if (!t.pickup || !t.dropoff) return null;
+    const q = { pickup: t.pickup, dropoff: t.dropoff, vehicle };
+    if (t.hours) { q.hourly = { hours: t.hours }; return fareForBooking(q); }
+    const zone = computeFare(t.pickup, t.dropoff, vehicle);
+    if (zone != null) return zone;
+    const puHub = AGENT_HUBS.has(t.pickup), droHub = AGENT_HUBS.has(t.dropoff);
+    if (puHub && droHub) return null;
+    if (puHub || droHub) q.km = { place: puHub ? t.dro : t.pu };
+    else q.p2p = { pickup: t.pu, dropoff: t.dro };
+    return fareForBooking(q).catch((e) => { console.error("agent fare:", e.message); return null; });
+  }
+  /* The same rules the website enforces on a return leg. */
+  function returnTripOf(b, hours) {
+    if (hours) return { ret: null };
+    const ret = typeof returnLeg === "function" ? returnLeg(b) : null;
+    if (!ret) return { ret: null };
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(ret.date) || !/^\d{1,2}:\d{2}/.test(ret.time)) return { error: "Please give both a date and a time for the return trip." };
+    if (ret.date < b.date || (ret.date === b.date && ret.time <= b.time)) return { error: "The return trip has to be after the outbound one." };
+    if (leadTimeShortfall(ret.date, ret.time) !== null) return { error: LEAD_TIME_ERROR };
+    return { ret };
+  }
+
+  app.post("/agent/quote", requireAgent, async (req, res) => {
+    try {
+      const body = req.body || {};
+      const t = tripOf(body);
+      const pct = agentPct(req.agent);
+      const isReturn = !t.hours && !!body.returnTrip;
+      const fares = await Promise.all(VEHICLES.map((v) => agentFare(t, v).catch(() => null)));
+      const out = VEHICLES.map((v, i) => {
+        const fare = fares[i];
+        if (fare == null) return null;
+        /* the transfer price for what was asked: one way, both legs (10% off,
+           the site's own formula), or the hours - before seats and trailer */
+        const total = bookingSummary({ pickup: t.pickup, dropoff: t.dropoff, vehicle: v, hourly: t.hours ? { hours: t.hours } : undefined },
+          fare, 0, false, isReturn ? { date: "", time: "", flight: "" } : null).total;
+        return { vehicle: v, fare, total, commission: commissionOf(total * 100, pct) / 100 };
+      }).filter(Boolean);
+      if (!out.length) {
+        return res.json({ quotable: false, message: "We can't fix a price for that trip online — call +61 481 437 772 and we'll price it for you." });
+      }
+      res.json({ quotable: true, commissionPct: pct, kind: t.hours ? "hourly" : isReturn ? "return" : "oneway", hours: t.hours, vehicles: out });
+    } catch (err) {
+      console.error("agent quote:", err);
+      res.status(500).json({ error: "Could not price that just now." });
     }
-    res.json({ quotable: true, commissionPct: pct, vehicles: out });
   });
 
   /* Shared by book and amend: validate, price, and normalise one booking. */
-  function priceBooking(b, pct) {
+  async function priceBooking(b, pct) {
+    const t = tripOf(b);
+    b.pickup = t.pickup; b.dropoff = t.dropoff;
     for (const f of ["pickup", "dropoff", "vehicle", "date", "time", "name", "phone"]) {
       if (!b[f]) return { error: "Please fill in every required field." };
     }
-    const fare = computeFare(b.pickup, b.dropoff, b.vehicle);
-    if (fare == null) return { error: "That route needs a manual quote — please call us." };
+    const email = String(b.email || "").trim();
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return { error: "That passenger email doesn't look right." };
+    const fare = await agentFare(t, b.vehicle);
+    if (fare == null) return { error: "That trip needs a manual quote — please call us." };
     if (leadTimeShortfall(b.date, b.time) !== null) return { error: LEAD_TIME_ERROR };
+    const r = returnTripOf(b, t.hours);
+    if (r.error) return { error: r.error };
     const seats = Math.min(Math.max(parseInt(b.childSeats, 10) || 0, 0), 3);
     const trailer = b.trailer === true || b.trailer === "true";
-    const s = bookingSummary({ ...b, email: b.agentEmail || BOOKINGS_EMAIL }, fare, seats, trailer);
+    if (t.hours) b.hourly = { hours: t.hours };
+    const s = bookingSummary({ ...b, email: email || b.agentEmail || BOOKINGS_EMAIL }, fare, seats, trailer, r.ret);
     const totalCents = Math.round(s.total * 100);
     return {
-      seats, trailer, summary: s, totalCents,
+      fare, seats, trailer, summary: s, totalCents, ret: r.ret, hours: t.hours, email: email || null,
+      clientRef: String(b.clientRef || "").trim().slice(0, 60) || null,
+      ends: t.hours ? JSON.stringify({ pickup: t.pu }) : JSON.stringify({ pickup: t.pu, dropoff: t.dro }),
       commissionCents: commissionOf(totalCents, pct),
       pax: parseInt(b.pax, 10) || 1,
     };
@@ -397,24 +469,28 @@ module.exports = function installAgentPortal(ctx) {
     try {
       const pct = agentPct(req.agent);
       const b = { ...(req.body || {}), agentEmail: req.agent.email };
-      const p = priceBooking(b, pct);
+      const p = await priceBooking(b, pct);
       if (p.error) return res.status(400).json({ error: p.error });
       b.ref = makeRef(b.date);
+      /* again now the reference exists, so the emails carry it */
+      p.summary = bookingSummary({ ...b, email: p.email || b.agentEmail || BOOKINGS_EMAIL }, p.fare, p.seats, p.trailer, p.ret);
 
       await pool.query(
         `INSERT INTO agent_bookings
            (ref, agent_code, pickup, dropoff, vehicle, pickup_date, pickup_time,
             passenger_name, passenger_phone, passenger_email, flight, address, notes,
-            pax, child_seats, trailer, total_cents, commission_cents, commission_pct)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
+            pax, child_seats, trailer, total_cents, commission_cents, commission_pct,
+            client_ref, return_date, return_time, return_flight, hire_hours, ends)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)`,
         [b.ref, req.agent.code, b.pickup, b.dropoff, b.vehicle, b.date, b.time,
-         b.name, b.phone, b.email || null, b.flight || null, b.address || null, b.notes || null,
-         p.pax, p.seats, p.trailer, p.totalCents, p.commissionCents, pct]
+         b.name, b.phone, p.email, b.flight || null, b.address || null, b.notes || null,
+         p.pax, p.seats, p.trailer, p.totalCents, p.commissionCents, pct,
+         p.clientRef, p.ret ? p.ret.date : null, p.ret ? p.ret.time : null, p.ret ? (p.ret.flight || null) : null, p.hours, p.ends]
       );
 
       notifyOffice(
         `AGENT booking (${req.agent.code}): ${b.pickup} -> ${b.dropoff} (${b.date} ${b.time}) [${b.ref}]`,
-        `AGENT BOOKING — ${req.agent.name} (${req.agent.code})\n\n${p.summary.text}\n\n` +
+        `AGENT BOOKING — ${req.agent.name} (${req.agent.code})\n` + (p.clientRef ? `Agent reference: ${p.clientRef}\n` : "") + `\n${p.summary.text}\n\n` +
         `Agent commission: ${pct}% = ${money(p.commissionCents)}\n` +
         `Net to invoice the agent: ${money(p.totalCents - p.commissionCents)}\n`,
         req.agent
@@ -426,7 +502,8 @@ module.exports = function installAgentPortal(ctx) {
           replyTo: BOOKINGS_EMAIL,
           subject: `Booking confirmed — ${b.ref} · Sky Transfers`,
           text:
-            `Hi ${req.agent.name},\n\nYour booking is in and we'll confirm the chauffeur shortly.\n\n${p.summary.text}\n\n` +
+            `Hi ${req.agent.name},\n\nYour booking is in and we'll confirm the chauffeur shortly.\n\n` +
+            (p.clientRef ? `Your reference: ${p.clientRef}\n` : "") + `${p.summary.text}\n\n` +
             `Your commission on this booking: ${money(p.commissionCents)} (${pct}%)\n` +
             `This booking will appear on your monthly invoice at ${money(p.totalCents - p.commissionCents)}.\n\n` +
             `You can download a passenger voucher, change or cancel this booking in the portal up to ` +
@@ -488,7 +565,8 @@ module.exports = function installAgentPortal(ctx) {
       const old = found.booking;
       const pct = agentPct(req.agent);
       const b = { ...(req.body || {}), agentEmail: req.agent.email };
-      const p = priceBooking(b, pct);
+      b.ref = old.ref;
+      const p = await priceBooking(b, pct);
       if (p.error) return res.status(400).json({ error: p.error });
 
       await pool.query(
@@ -496,11 +574,13 @@ module.exports = function installAgentPortal(ctx) {
            pickup=$2, dropoff=$3, vehicle=$4, pickup_date=$5, pickup_time=$6,
            passenger_name=$7, passenger_phone=$8, passenger_email=$9, flight=$10,
            address=$11, notes=$12, pax=$13, child_seats=$14, trailer=$15,
-           total_cents=$16, commission_cents=$17, commission_pct=$18, updated_at=now()
+           total_cents=$16, commission_cents=$17, commission_pct=$18, updated_at=now(),
+           client_ref=$19, return_date=$20, return_time=$21, return_flight=$22, hire_hours=$23, ends=$24
          WHERE ref = $1`,
         [old.ref, b.pickup, b.dropoff, b.vehicle, b.date, b.time,
-         b.name, b.phone, b.email || null, b.flight || null, b.address || null, b.notes || null,
-         p.pax, p.seats, p.trailer, p.totalCents, p.commissionCents, pct]
+         b.name, b.phone, p.email, b.flight || null, b.address || null, b.notes || null,
+         p.pax, p.seats, p.trailer, p.totalCents, p.commissionCents, pct,
+         p.clientRef, p.ret ? p.ret.date : null, p.ret ? p.ret.time : null, p.ret ? (p.ret.flight || null) : null, p.hours, p.ends]
       );
 
       const wasDate = old.pickup_date instanceof Date ? old.pickup_date.toISOString().slice(0, 10) : old.pickup_date;
@@ -564,9 +644,12 @@ module.exports = function installAgentPortal(ctx) {
         bk.child_seats > 0 ? `${bk.child_seats} child seat${bk.child_seats > 1 ? "s" : ""}` : "",
         bk.trailer ? "Luggage trailer" : "",
       ].filter(Boolean).join(", ") || "None";
+      const rdate = bk.return_date instanceof Date ? bk.return_date.toISOString().slice(0, 10) : (bk.return_date ? String(bk.return_date) : "");
       const rows = [
-        ["ROUTE", `${bk.pickup}   →   ${bk.dropoff}`],
+        bk.hire_hours ? ["SERVICE", `${bk.hire_hours} hours as directed from ${bk.pickup}`] : ["ROUTE", `${bk.pickup}  to  ${bk.dropoff}`],
         ["DATE & TIME", `${date} at ${bk.pickup_time}`],
+        rdate ? ["RETURN", `${rdate} at ${bk.return_time || ""}  ·  ${bk.dropoff}  to  ${bk.pickup}${bk.return_flight ? "  ·  flight " + bk.return_flight : ""}`] : null,
+        bk.client_ref ? ["YOUR REFERENCE", bk.client_ref] : null,
         ["VEHICLE", bk.vehicle],
         ["PASSENGERS", String(bk.pax || "—")],
         bk.flight ? ["FLIGHT", bk.flight] : null,
@@ -664,6 +747,12 @@ module.exports = function installAgentPortal(ctx) {
     commission: r.commission_cents / 100,
     status: r.status,
     settled: r.settled,
+    clientRef: r.client_ref || "",
+    returnDate: r.return_date instanceof Date ? r.return_date.toISOString().slice(0, 10) : (r.return_date || null),
+    returnTime: r.return_time || null,
+    returnFlight: r.return_flight || "",
+    hours: r.hire_hours || null,
+    ends: (() => { try { return r.ends ? JSON.parse(r.ends) : null; } catch (e) { return null; } })(),
   });
 
   app.get("/agent/summary", requireAgent, async (req, res) => {
