@@ -177,6 +177,15 @@ module.exports = function installOps(ctx) {
        schema above. */
     await pool.query(`ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS stops TEXT`)
       .catch((e) => console.error("ops: web_bookings.stops:", e.message));
+    /* Agent bookings gained a return leg, hours and the agency's own
+       reference (agent-portal.js adds them too); same reasoning. */
+    await pool.query(`
+      ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS client_ref    TEXT;
+      ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS return_date   DATE;
+      ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS return_time   TEXT;
+      ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS return_flight TEXT;
+      ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS hire_hours    INTEGER;
+    `).catch((e) => console.error("ops: agent_bookings v2 columns:", e.message));
   }
 
   /* ---- reading every booking source as legs ------------------------------
@@ -191,7 +200,9 @@ module.exports = function installOps(ctx) {
   const AGENT_COLS = `a.ref, a.pickup, a.dropoff, a.vehicle,
     to_char(a.pickup_date, 'YYYY-MM-DD') AS d, a.pickup_time AS t,
     a.passenger_name, a.passenger_phone, a.passenger_email, a.flight, a.address, a.notes,
-    a.pax, a.child_seats, a.trailer, a.total_cents, a.status, a.agent_code, g.name AS agent_name`;
+    a.pax, a.child_seats, a.trailer, a.total_cents, a.status, a.agent_code, g.name AS agent_name,
+    a.client_ref AS account_ref, to_char(a.return_date, 'YYYY-MM-DD') AS rd, a.return_time AS rt,
+    a.return_flight AS rf, a.hire_hours`;
   const JOB_COLS = `ref, account, account_ref, pickup, dropoff, vehicle,
     to_char(pickup_date, 'YYYY-MM-DD') AS d, pickup_time AS t,
     to_char(return_date, 'YYYY-MM-DD') AS rd, return_time AS rt, return_flight AS rf,
@@ -242,7 +253,8 @@ module.exports = function installOps(ctx) {
       byRef ? refs : [from, to]);
     const agent = await pool.query(
       `SELECT ${AGENT_COLS} FROM agent_bookings a LEFT JOIN agents g ON g.code = a.agent_code
-        WHERE a.status <> 'cancelled' AND ` + (byRef ? `a.ref IN (${inList(refs.length)})` : `(a.pickup_date >= $1 AND a.pickup_date <= $2)`),
+        WHERE a.status <> 'cancelled' AND ` + (byRef ? `a.ref IN (${inList(refs.length)})`
+          : `((a.pickup_date >= $1 AND a.pickup_date <= $2) OR (a.return_date >= $1 AND a.return_date <= $2))`),
       byRef ? refs : [from, to]);
     const jobs = await pool.query(
       `SELECT ${JOB_COLS} FROM ops_jobs WHERE status <> 'cancelled' AND ` +
