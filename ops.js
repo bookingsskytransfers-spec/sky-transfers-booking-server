@@ -164,6 +164,10 @@ module.exports = function installOps(ctx) {
       ALTER TABLE ops_dispatch ADD COLUMN IF NOT EXISTS guest_assigned_for INTEGER;
       ALTER TABLE ops_dispatch ADD COLUMN IF NOT EXISTS guest_onway_at TIMESTAMPTZ;
       ALTER TABLE ops_dispatch ADD COLUMN IF NOT EXISTS guest_arrived_at TIMESTAMPTZ;
+      -- Phase 4 (la-import.js): the key that stops a Limo Anywhere row being
+      -- imported twice.
+      ALTER TABLE ops_jobs ADD COLUMN IF NOT EXISTS import_key TEXT;
+      CREATE INDEX IF NOT EXISTS ops_jobs_import_key ON ops_jobs (import_key);
     `);
   }
 
@@ -192,7 +196,7 @@ module.exports = function installOps(ctx) {
     const base = {
       ref: r.ref, source,
       account: source === "agent" ? (r.agent_name || r.agent_code || "Agent")
-             : source === "account" ? (r.account || "Account") : null,
+             : source === "account" ? (r.account || "Direct") : null,
       accountRef: r.account_ref || null,
       payState: source === "web" ? r.status : source === "agent" ? "account" : "account",
       vehicleClass: r.vehicle || "", pax: r.pax || 1,
