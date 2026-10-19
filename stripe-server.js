@@ -165,7 +165,9 @@ let p2p = null;
 /* Airport transfers to an address with no zone fare, priced on road distance
    (km-routes.js). A booking priced that way carries b.km. */
 let kmq = null;
-async function fareForBooking(b) {
+/* Stops along the way (stops.js), priced by the extra distance they add. */
+let stopsMod = null;
+async function baseFareForBooking(b) {
   if (b && b.hourly) {
     const h = hourlyHours(b);
     const vi = VEHICLES.indexOf(VEHICLE_ALIASES[b.vehicle] || b.vehicle);
@@ -175,6 +177,20 @@ async function fareForBooking(b) {
   if (b && b.p2p && p2p && typeof p2p.fareFor === "function") return p2p.fareFor(b);
   if (b && b.km && kmq && typeof kmq.fareFor === "function") return kmq.fareFor(b);
   return computeFare(b.pickup, b.dropoff, b.vehicle);
+}
+/* The fare, and - when the booking has stops - b.stopsExtra set for
+   bookingSummary to add once on top. Stops that cannot be priced make the
+   whole booking unpriceable, exactly like an unknown route: never guessed.
+   Hourly hire is "as directed" already, so it has no stops. */
+async function fareForBooking(b) {
+  const fare = await baseFareForBooking(b);
+  if (b) b.stopsExtra = 0;
+  if (fare == null || !b || b.hourly || !Array.isArray(b.stops) || !b.stops.length) {
+    if (b && b.hourly) b.stops = undefined;
+    return fare;
+  }
+  if (!stopsMod) return null;
+  return (await stopsMod.applyTo(b)) ? fare : null;
 }
 
 function computeFare(pickup, dropoff, vehicle) {
@@ -311,6 +327,7 @@ function bookingPdf(b, s) {
       ["ROUTE", `${b.pickup}  to  ${b.dropoff}`],
       ["DATE", `${niceDate(b.date)} at ${b.time}`],
     ]).concat([
+      stopsText(b, "\n") ? [ret ? "STOPS (OUTBOUND)" : "STOPS ON THE WAY", stopsText(b, "\n")] : null,
       ["VEHICLE", b.vehicle],
       ["PASSENGERS", String(b.pax || "—")],
       b.flight ? [ret ? "OUTBOUND FLIGHT" : "FLIGHT", b.flight] : null,
@@ -471,6 +488,7 @@ function bookingEmailHtml(b, s) {
           ? row("RETURN", `${b.dropoff}  →  ${b.pickup}  ·  ${niceDate(ret.date)} at ${ret.time}`)
           : hrs ? ""
           : row("DATE &amp; TIME", `${niceDate(b.date)} at ${b.time}`)}
+        ${row(ret ? "STOPS (OUTBOUND)" : "STOPS ON THE WAY", stopsText(b, "  ·  "))}
         ${row("VEHICLE", b.vehicle)}
         ${row("PASSENGERS", b.pax)}
         ${row(ret ? "OUTBOUND FLIGHT" : "FLIGHT", b.flight)}
@@ -600,12 +618,30 @@ function returnProblem(b, ret) {
   return null;
 }
 
+/* "1) Hilton Surfers Paradise  2) ..." for the PDF and the guest email, with
+   the stop charge when there is one; "" when the booking has no stops. */
+function stopsText(b, sep) {
+  const list = Array.isArray(b && b.stops) ? b.stops.filter((s) => s && (s.address || s.suburb)) : [];
+  if (!list.length) return "";
+  return list.map((s, i) => `${i + 1}) ${s.address || s.suburb}`).join(sep) +
+    (b.stopsExtra > 0 ? `${sep}(+$${Math.round(b.stopsExtra)} for the extra distance)` : "");
+}
+
 function bookingSummary(b, fare, seats, trailer, ret) {
   const legs = ret ? 2 : 1;
   const transfer = ret ? returnTransfer(fare) : fare;
   const extras = (seats * CHILD_SEAT_PRICE + (trailer ? TRAILER_PRICE : 0)) * legs;
-  const total = transfer + extras;
+  /* Stops on the way: outbound only, added once, never discounted. */
+  const stops = Array.isArray(b.stops) ? b.stops.filter((s) => s && (s.address || s.suburb)) : [];
+  const stopsExtra = stops.length ? Math.max(0, Math.round(Number(b.stopsExtra) || 0)) : 0;
+  const total = transfer + extras + stopsExtra;
   const saved = ret ? fare * 2 - transfer : 0;
+  const stopLines = stops.length ? [
+    `Stops on the way${ret ? " (outbound)" : ""}: ` + stops.map((s, i) => `${i + 1}) ${s.address || s.suburb}`).join("; "),
+  ] : [];
+  const stopFareLines = stopsExtra ? [
+    `Stops: +$${stopsExtra} (adds ${b.stopsKm != null ? b.stopsKm : "?"} km)`,
+  ] : [];
   /* A one-way booking must produce exactly the text it produced before this
      feature existed — the dispatch automation parses these lines. The return
      lines are therefore inserted only when there is a return. */
@@ -625,15 +661,18 @@ function bookingSummary(b, fare, seats, trailer, ret) {
     isReturn: !!ret,
     transfer,
     saved,
+    stopsExtra,
     text: [
       `Booking reference: ${b.ref || "-"}`,
       `Route: ${b.pickup} -> ${b.dropoff}`,
+      ...stopLines,
       ...hourlyLines,
       /* Only on a distance-priced booking, so every other booking's text is
          unchanged for the dispatch automation that reads it. */
       ...(b.kmRoad ? [`Priced by distance: ${b.kmRoad} km by road (no zone fare for this address)`] : []),
       `Vehicle: ${b.vehicle}`,
       hrs ? `Fare: $${fare} for ${hrs} hours ($${Math.round(fare / hrs)}/h)` : `Fare: $${fare} one-way`,
+      ...stopFareLines,
       `Baby/child seats: ${seats} ($${CHILD_SEAT_PRICE} each${ret ? ", each leg" : ""})`,
       `Luggage trailer: ${trailer ? `YES (+$${TRAILER_PRICE}${ret ? " each leg" : ""})` : "No"}`,
       ...returnLines,
@@ -926,6 +965,16 @@ app.post("/create-checkout", async (req, res) => {
         quantity: legs,
       });
     }
+    if (summary.stopsExtra > 0) {
+      lineItems.push({
+        price_data: {
+          currency: "aud",
+          unit_amount: summary.stopsExtra * 100,
+          product_data: { name: `Stops on the way (${b.stops.length})`, description: `Adds ${b.stopsKm} km to the route` },
+        },
+        quantity: 1,
+      });
+    }
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
       // Card only, on purpose. Left unset, Stripe falls back to automatic
@@ -955,6 +1004,10 @@ app.post("/create-checkout", async (req, res) => {
         trip_type: hourlyHours(b) ? "hourly" : ret ? "return" : "one-way",
         hours: hourlyHours(b) ? String(hourlyHours(b)) : "",
         km_road: b.kmRoad ? String(b.kmRoad) : "",
+        /* Stripe metadata values are capped at 500 characters. */
+        stops: Array.isArray(b.stops) && b.stops.length ? b.stops.map((x) => x.address || x.suburb).join(" | ").slice(0, 480) : "",
+        stops_extra: summary.stopsExtra ? String(summary.stopsExtra) : "",
+        stops_km: summary.stopsExtra ? String(b.stopsKm) : "",
         return_date: ret ? ret.date : "",
         return_time: ret ? ret.time : "",
         return_flight: ret ? ret.flight : "",
@@ -992,6 +1045,9 @@ app.post("/stripe-webhook", async (req, res) => {
         returnFlight: m.return_flight || "",
         hourly: m.hours ? { hours: parseInt(m.hours, 10) } : undefined,
         kmRoad: parseInt(m.km_road, 10) || undefined,
+        stops: m.stops ? String(m.stops).split(" | ").filter(Boolean).map((a) => ({ address: a })) : undefined,
+        stopsExtra: parseInt(m.stops_extra, 10) || 0,
+        stopsKm: m.stops_km ? Number(m.stops_km) : undefined,
         paymentIntent: typeof sess.payment_intent === "string" ? sess.payment_intent : (sess.payment_intent && sess.payment_intent.id) || "",
       };
       /* An account invoice paid by card. Not a booking: mark the invoice
@@ -1147,6 +1203,24 @@ try {
   });
 } catch (err) {
   console.error("km fares not mounted (bookings unaffected):", err.message);
+}
+
+/* Stops along the way, priced by the extra distance (stops.js). A booking
+   with stops cannot be priced if this fails to mount; one without is unaffected. */
+try {
+  stopsMod = require("./stops")({
+    VEHICLES, VEHICLE_ALIASES, QUOTE_ONLY,
+    HUB_ADDRESS: (kmq && kmq.hubAddress) || {
+      [OOL]: "Gold Coast Airport terminal, Eastern Ave, Bilinga QLD 4225, Australia",
+      [BNE]: "Brisbane Airport Domestic Terminal, Brisbane Airport QLD 4008, Australia",
+      [CRUISE]: "Brisbane International Cruise Terminal, Pinkenba QLD 4008, Australia",
+    },
+  });
+  stopsMod.mount(app);
+  console.log("stops: quote endpoint ready");
+} catch (err) {
+  stopsMod = null;
+  console.error("stops not mounted (bookings without stops unaffected):", err.message);
 }
 
 /* Operations - the dispatch board, drivers, vehicles, and the driver job
