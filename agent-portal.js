@@ -131,8 +131,35 @@ module.exports = function installAgentPortal(ctx) {
       ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS ends          TEXT;
       -- stops on the way (outbound): JSON {list, extra, km}, as web_bookings
       ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS stops         TEXT;
+      -- staff logins (19 Oct 2026): who made or last changed a booking, and
+      -- the tour a booking was made in, if it was booked as part of one
+      ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS booked_by     TEXT;
+      ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS booked_by_id  INTEGER;
+      ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS changed_by    TEXT;
+      ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS tour_ref      TEXT;
+      ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS tour_name     TEXT;
+      ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS tour_seq      INTEGER;
       CREATE INDEX IF NOT EXISTS agent_bookings_by_agent
         ON agent_bookings (agent_code, created_at DESC);
+      CREATE INDEX IF NOT EXISTS agent_bookings_by_tour ON agent_bookings (tour_ref);
+      -- One row per staff login. The agency's own code + PIN stays the main
+      -- login; these are extra people at the same agency, each with their own
+      -- PIN. role: 'manager' (everything, team included) or 'staff' (bookings
+      -- only - no wallet, commission or invoices). pin_ver goes up on a PIN
+      -- reset so sessions signed in with the old PIN end.
+      CREATE TABLE IF NOT EXISTS agent_users (
+        id            SERIAL PRIMARY KEY,
+        agent_code    TEXT NOT NULL REFERENCES agents(code),
+        name          TEXT NOT NULL,
+        email         TEXT,
+        pin_hash      TEXT NOT NULL,
+        pin_ver       INTEGER NOT NULL DEFAULT 1,
+        role          TEXT NOT NULL DEFAULT 'staff',
+        active        BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+        last_login_at TIMESTAMPTZ
+      );
+      CREATE INDEX IF NOT EXISTS agent_users_by_agent ON agent_users (agent_code);
       CREATE TABLE IF NOT EXISTS web_bookings (
         ref             TEXT PRIMARY KEY,
         pickup          TEXT,
@@ -264,8 +291,8 @@ module.exports = function installAgentPortal(ctx) {
      payload.signature, no library. Twelve hours for agents, long enough for a
      working day and short enough that a shared office computer forgets by
      morning; the admin session is deliberately shorter. */
-  function signToken(code, role, ttlMs) {
-    const body = Buffer.from(JSON.stringify({ code, role, exp: Date.now() + ttlMs })).toString("base64url");
+  function signToken(code, role, ttlMs, extra) {
+    const body = Buffer.from(JSON.stringify({ ...(extra || {}), code, role, exp: Date.now() + ttlMs })).toString("base64url");
     const sig = crypto.createHmac("sha256", AGENT_SECRET).update(body).digest("base64url");
     return `${body}.${sig}`;
   }
@@ -292,8 +319,33 @@ module.exports = function installAgentPortal(ctx) {
       "SELECT code, name, email, commission_pct, active FROM agents WHERE code = $1", [claim.code]);
     if (!rows.length || !rows[0].active) return res.status(401).json({ error: "This account is no longer active." });
     req.agent = rows[0];
+    /* A staff login is re-checked on every request, so switching someone off
+       or resetting their PIN takes effect at once, not when the token expires. */
+    if (claim.uid) {
+      const { rows: us } = await pool.query(
+        "SELECT id, name, email, role, active, pin_ver FROM agent_users WHERE id = $1 AND agent_code = $2", [claim.uid, claim.code]);
+      const u = us[0];
+      if (!u || !u.active || Number(u.pin_ver) !== Number(claim.pv)) return res.status(401).json({ error: "This login has been switched off or its PIN changed — please sign in again." });
+      req.user = { id: u.id, name: u.name, email: u.email, role: u.role === "manager" ? "manager" : "staff" };
+    } else {
+      req.user = { id: null, name: rows[0].name, email: rows[0].email, role: "owner" };
+    }
     next();
   }
+  /* Bookings-only staff see fares but not the commission, the wallet or the
+     agency's invoices; the main login and managers see everything. */
+  const canMoney = (req) => !req.user || req.user.role !== "staff";
+  const canManage = (req) => !!req.user && (req.user.role === "owner" || req.user.role === "manager");
+  const ACCOUNTS_ONLY = "Your login is for bookings only — ask whoever manages your agency's account.";
+  function requireAgentAccounts(req, res, next) {
+    requireAgent(req, res, () => {
+      if (!canMoney(req)) return res.status(403).json({ error: ACCOUNTS_ONLY });
+      next();
+    }).catch((err) => { console.error("agent auth:", err); res.status(500).json({ error: "Could not check your sign-in just now." }); });
+  }
+  /* "Jane Smith at Nexus Travel (NEXUS)" for a staff login, else the agency. */
+  const whoDid = (req) => (req.user && req.user.id ? `${req.user.name} at ` : "") + `${req.agent.name} (${req.agent.code})`;
+  const bookedByOf = (req) => (req.user && req.user.id ? req.user.name : null);
 
   function requireAdmin(req, res, next) {
     if (!AGENTS_ON) return res.status(503).json({ error: "The agent portal is not configured on this server." });
@@ -322,12 +374,29 @@ module.exports = function installAgentPortal(ctx) {
       const a = rows[0];
       /* One message for every failure, so the form cannot be used to discover
          which agent codes exist. */
-      if (!a || !a.active || !pinMatches(pin, a.pin_hash)) {
+      /* The agency's own PIN first, then its staff logins: everyone signs in
+         with the agency code and their own PIN, so the form stays the same. */
+      let user = null;
+      const main = !!(a && a.active && pinMatches(pin, a.pin_hash));
+      if (a && a.active && !main) {
+        const { rows: us } = await pool.query(
+          "SELECT id, name, role, pin_hash, pin_ver FROM agent_users WHERE agent_code = $1 AND active ORDER BY id", [code]);
+        user = us.find((u) => pinMatches(pin, u.pin_hash)) || null;
+      }
+      if (!main && !user) {
         noteLoginFail(code);
         return res.status(401).json({ error: "That code and PIN do not match." });
       }
       LOGIN_FAILS.delete(code);
-      res.json({ token: signToken(a.code, "agent", 12 * 3600 * 1000), name: a.name, code: a.code, commissionPct: agentPct(a) });
+      if (user) {
+        await pool.query("UPDATE agent_users SET last_login_at = now() WHERE id = $1", [user.id]).catch(() => {});
+        const role = user.role === "manager" ? "manager" : "staff";
+        return res.json({ token: signToken(a.code, "agent", 12 * 3600 * 1000, { uid: user.id, pv: Number(user.pin_ver) }),
+                          name: a.name, code: a.code, user: { name: user.name, role },
+                          commissionPct: role === "staff" ? null : agentPct(a) });
+      }
+      res.json({ token: signToken(a.code, "agent", 12 * 3600 * 1000), name: a.name, code: a.code,
+                 user: { name: a.name, role: "owner" }, commissionPct: agentPct(a) });
     } catch (err) {
       console.error("agent login:", err);
       res.status(500).json({ error: "Could not sign you in just now." });
@@ -431,13 +500,13 @@ module.exports = function installAgentPortal(ctx) {
            after the discount - before seats and trailer */
         const total = bookingSummary(withStops({ pickup: t.pickup, dropoff: t.dropoff, vehicle: v, hourly: t.hours ? { hours: t.hours } : undefined }, r),
           r.fare, 0, false, isReturn ? { date: "", time: "", flight: "" } : null).total;
-        return { vehicle: v, fare: r.fare, total, stopsExtra: r.stopsExtra, commission: commissionOf(total * 100, pct) / 100 };
+        return { vehicle: v, fare: r.fare, total, stopsExtra: r.stopsExtra, commission: canMoney(req) ? commissionOf(total * 100, pct) / 100 : null };
       }).filter(Boolean);
       const stopsKm = (fares.find((r) => r && r.stopsKm != null) || {}).stopsKm;
       if (!out.length) {
         return res.json({ quotable: false, message: "We can't fix a price for that trip online — call +61 481 437 772 and we'll price it for you." });
       }
-      res.json({ quotable: true, commissionPct: pct, kind: t.hours ? "hourly" : isReturn ? "return" : "oneway", hours: t.hours,
+      res.json({ quotable: true, commissionPct: canMoney(req) ? pct : null, kind: t.hours ? "hourly" : isReturn ? "return" : "oneway", hours: t.hours,
                  stops: t.stops.length, stopsKm: stopsKm != null ? stopsKm : null, vehicles: out });
     } catch (err) {
       console.error("agent quote:", err);
@@ -488,6 +557,42 @@ module.exports = function installAgentPortal(ctx) {
     }).catch((e) => console.error("agent portal email:", e.message));
   }
 
+  /* One INSERT for a single booking and for every leg of a tour. q is the
+     pool, or a client inside a transaction. */
+  function insertAgentBooking(q, req, b, p, pct, tour) {
+    return q.query(
+      `INSERT INTO agent_bookings
+         (ref, agent_code, pickup, dropoff, vehicle, pickup_date, pickup_time,
+          passenger_name, passenger_phone, passenger_email, flight, address, notes,
+          pax, child_seats, trailer, total_cents, commission_cents, commission_pct,
+          client_ref, return_date, return_time, return_flight, hire_hours, ends, stops,
+          booked_by, booked_by_id, tour_ref, tour_name, tour_seq)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31)`,
+      [b.ref, req.agent.code, b.pickup, b.dropoff, b.vehicle, b.date, b.time,
+       b.name, b.phone, p.email, b.flight || null, b.address || null, b.notes || null,
+       p.pax, p.seats, p.trailer, p.totalCents, p.commissionCents, pct,
+       p.clientRef, p.ret ? p.ret.date : null, p.ret ? p.ret.time : null, p.ret ? (p.ret.flight || null) : null, p.hours, p.ends, p.stops,
+       bookedByOf(req), req.user && req.user.id ? req.user.id : null,
+       tour ? tour.ref : null, tour ? tour.name : null, tour ? tour.seq : null]
+    );
+  }
+
+  /* The agency's copy goes to the agency's own address, as it always has.
+     A staff login with its own email also gets a copy - without the
+     commission line if their login is bookings only. */
+  function agentCopies(req, subject, lead, body, moneyLines) {
+    if (!mailer) return;
+    const send = (to, withMoney, hi) => mailer.sendMail({
+      from: `"Sky Transfers" <${process.env.GMAIL_USER}>`, to, replyTo: BOOKINGS_EMAIL, subject,
+      text: `Hi ${hi},\n\n${lead}\n\n${body}\n\n` + (withMoney ? moneyLines : "") +
+        `You can download a passenger voucher, change or cancel in the portal up to ` +
+        `${CHANGE_CUTOFF_HOURS} hours before pick-up.\n\nSky Transfers`,
+    }).catch((e) => console.error("agent copy email:", e.message));
+    if (req.agent.email) send(req.agent.email, true, req.agent.name);
+    const mine = req.user && req.user.id && req.user.email ? String(req.user.email).trim() : "";
+    if (mine && mine.toLowerCase() !== String(req.agent.email || "").trim().toLowerCase()) send(mine, canMoney(req), req.user.name.split(" ")[0]);
+  }
+
   app.post("/agent/book", requireAgent, async (req, res) => {
     try {
       const pct = agentPct(req.agent);
@@ -498,48 +603,95 @@ module.exports = function installAgentPortal(ctx) {
       /* again now the reference exists, so the emails carry it */
       p.summary = bookingSummary(withStops({ ...b, email: p.email || b.agentEmail || BOOKINGS_EMAIL }, p.priced), p.fare, p.seats, p.trailer, p.ret);
 
-      await pool.query(
-        `INSERT INTO agent_bookings
-           (ref, agent_code, pickup, dropoff, vehicle, pickup_date, pickup_time,
-            passenger_name, passenger_phone, passenger_email, flight, address, notes,
-            pax, child_seats, trailer, total_cents, commission_cents, commission_pct,
-            client_ref, return_date, return_time, return_flight, hire_hours, ends, stops)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)`,
-        [b.ref, req.agent.code, b.pickup, b.dropoff, b.vehicle, b.date, b.time,
-         b.name, b.phone, p.email, b.flight || null, b.address || null, b.notes || null,
-         p.pax, p.seats, p.trailer, p.totalCents, p.commissionCents, pct,
-         p.clientRef, p.ret ? p.ret.date : null, p.ret ? p.ret.time : null, p.ret ? (p.ret.flight || null) : null, p.hours, p.ends, p.stops]
-      );
+      await insertAgentBooking(pool, req, b, p, pct, null);
 
       notifyOffice(
         `AGENT booking (${req.agent.code}): ${b.pickup} -> ${b.dropoff} (${b.date} ${b.time}) [${b.ref}]`,
-        `AGENT BOOKING — ${req.agent.name} (${req.agent.code})\n` + (p.clientRef ? `Agent reference: ${p.clientRef}\n` : "") + `\n${p.summary.text}\n\n` +
+        `AGENT BOOKING — ${req.agent.name} (${req.agent.code})\n` + (bookedByOf(req) ? `Booked by: ${bookedByOf(req)}\n` : "") +
+        (p.clientRef ? `Agent reference: ${p.clientRef}\n` : "") + `\n${p.summary.text}\n\n` +
         /* Agencies are invoiced the FULL fare; commission sits in their wallet
            and is paid out separately (Aman, 19 Oct 2026). */
         `Invoice the agent the full fare: ${money(p.totalCents)}\n` +
         `Agent commission: ${pct}% = ${money(p.commissionCents)}, to their wallet - paid out separately\n`,
         req.agent
       );
-      if (mailer && req.agent.email) {
-        mailer.sendMail({
-          from: `"Sky Transfers" <${process.env.GMAIL_USER}>`,
-          to: req.agent.email,
-          replyTo: BOOKINGS_EMAIL,
-          subject: `Booking confirmed — ${b.ref} · Sky Transfers`,
-          text:
-            `Hi ${req.agent.name},\n\nYour booking is in and we'll confirm the chauffeur shortly.\n\n` +
-            (p.clientRef ? `Your reference: ${p.clientRef}\n` : "") + `${p.summary.text}\n\n` +
-            `Your commission on this booking: ${money(p.commissionCents)} (${pct}%), added to your wallet and paid out to you separately.\n` +
-            `This booking will appear on your monthly invoice at the full fare, ${money(p.totalCents)}.\n\n` +
-            `You can download a passenger voucher, change or cancel this booking in the portal up to ` +
-            `${CHANGE_CUTOFF_HOURS} hours before pick-up.\n\nSky Transfers`,
-        }).catch((e) => console.error("agent copy email:", e.message));
-      }
+      agentCopies(req, `Booking confirmed — ${b.ref} · Sky Transfers`,
+        "Your booking is in and we'll confirm the chauffeur shortly.",
+        (p.clientRef ? `Your reference: ${p.clientRef}\n` : "") + p.summary.text,
+        `Your commission on this booking: ${money(p.commissionCents)} (${pct}%), added to your wallet and paid out to you separately.\n` +
+        `This booking will appear on your monthly invoice at the full fare, ${money(p.totalCents)}.\n\n`);
 
-      res.json({ ok: true, ref: b.ref, total: p.summary.total, commission: p.commissionCents / 100 });
+      res.json({ ok: true, ref: b.ref, total: p.summary.total, commission: canMoney(req) ? p.commissionCents / 100 : null });
     } catch (err) {
       console.error("agent book:", err);
       res.status(500).json({ error: "Could not save that booking — please call us so it isn't lost." });
+    }
+  });
+
+  /* ---- a whole tour in one go ------------------------------------------
+     Every leg is priced and checked exactly as a single booking is, and
+     either every leg is booked or none is: a group itinerary half-booked is
+     worse than not booked. Each leg is an ordinary booking with its own
+     reference (change, cancel and voucher work on it as normal), tied
+     together by a tour reference and name. */
+  const TOUR_MAX = 15;
+  app.post("/agent/tour", requireAgent, async (req, res) => {
+    let client = null;
+    try {
+      const pct = agentPct(req.agent);
+      const body = req.body || {};
+      const legs = Array.isArray(body.legs) ? body.legs : [];
+      const name = String(body.tourName || "").trim().slice(0, 80);
+      if (legs.length < 2) return res.status(400).json({ error: "A tour needs at least two trips — book a single trip with the normal Book button." });
+      if (legs.length > TOUR_MAX) return res.status(400).json({ error: `A tour can have up to ${TOUR_MAX} trips — split a longer one in two, or call us.` });
+      if (!name) return res.status(400).json({ error: "Give the tour a name — the group or lead passenger — so it's easy to find." });
+      const priced = [];
+      for (let i = 0; i < legs.length; i++) {
+        const b = { ...(legs[i] && typeof legs[i] === "object" ? legs[i] : {}), agentEmail: req.agent.email };
+        if (!String(b.clientRef || "").trim() && body.clientRef) b.clientRef = body.clientRef;
+        const p = await priceBooking(b, pct);
+        if (p.error) return res.status(400).json({ error: `Trip ${i + 1} (${b.date || "no date"}, ${b.pickup || "?"} to ${b.hourly ? "as directed" : (b.dropoff || "?")}): ${p.error}`, leg: i });
+        priced.push({ b, p });
+      }
+      const refs = new Set();
+      for (const x of priced) {
+        let ref; do { ref = makeRef(x.b.date); } while (refs.has(ref));
+        refs.add(ref); x.b.ref = ref;
+        x.p.summary = bookingSummary(withStops({ ...x.b, email: x.p.email || x.b.agentEmail || BOOKINGS_EMAIL }, x.p.priced), x.p.fare, x.p.seats, x.p.trailer, x.p.ret);
+      }
+      const tour = { ref: makeRef(priced[0].b.date).replace(/^ST-/, "TR-"), name };
+
+      client = await pool.connect();
+      await client.query("BEGIN");
+      for (let i = 0; i < priced.length; i++) {
+        await insertAgentBooking(client, req, priced[i].b, priced[i].p, pct, { ...tour, seq: i + 1 });
+      }
+      await client.query("COMMIT");
+      client.release(); client = null;
+
+      const totalCents = priced.reduce((n, x) => n + x.p.totalCents, 0);
+      const commCents = priced.reduce((n, x) => n + x.p.commissionCents, 0);
+      const legText = priced.map((x, i) => `--- TRIP ${i + 1} of ${priced.length} ---\n${x.p.summary.text}`).join("\n\n");
+      notifyOffice(
+        `AGENT TOUR (${req.agent.code}): ${priced.length} trips, ${name}, from ${priced[0].b.date} [${tour.ref}]`,
+        `AGENT TOUR — ${req.agent.name} (${req.agent.code})\n` + (bookedByOf(req) ? `Booked by: ${bookedByOf(req)}\n` : "") +
+        `Tour: ${name}\nTour reference: ${tour.ref}\nTrips: ${priced.length} (${priced.map((x) => x.b.ref).join(", ")})\n\n${legText}\n\n` +
+        `Invoice the agent the full fare: ${money(totalCents)} for the whole tour\n` +
+        `Agent commission: ${pct}% = ${money(commCents)}, to their wallet - paid out separately\n`,
+        req.agent
+      );
+      agentCopies(req, `Tour booked — ${name}, ${priced.length} trips · ${tour.ref} · Sky Transfers`,
+        `Your tour "${name}" is in: ${priced.length} trips, tour reference ${tour.ref}. We'll confirm each chauffeur shortly.`,
+        legText,
+        `Your commission on this tour: ${money(commCents)} (${pct}%), added to your wallet and paid out to you separately.\n` +
+        `These trips will appear on your monthly invoice at the full fare, ${money(totalCents)} in all.\n\n`);
+
+      res.json({ ok: true, tourRef: tour.ref, tourName: name, refs: priced.map((x) => x.b.ref),
+                 total: totalCents / 100, commission: canMoney(req) ? commCents / 100 : null });
+    } catch (err) {
+      if (client) { await client.query("ROLLBACK").catch(() => {}); client.release(); }
+      console.error("agent tour:", err);
+      res.status(500).json({ error: "Could not save that tour — nothing was booked. Please try again or call us." });
     }
   });
 
@@ -564,12 +716,12 @@ module.exports = function installAgentPortal(ctx) {
       if (found.error) return res.status(found.code).json({ error: found.error });
       const bk = found.booking;
       await pool.query(
-        "UPDATE agent_bookings SET status = 'cancelled', cancelled_at = now() WHERE ref = $1", [bk.ref]);
+        "UPDATE agent_bookings SET status = 'cancelled', cancelled_at = now(), changed_by = $2 WHERE ref = $1", [bk.ref, bookedByOf(req)]);
       /* The commission goes with it: the wallet only counts confirmed bookings,
          so cancelling reverses the earning automatically. */
       notifyOffice(
         `AGENT CANCELLED (${req.agent.code}): ${bk.pickup} -> ${bk.dropoff} [${bk.ref}]`,
-        `CANCELLED by ${req.agent.name} (${req.agent.code})\n\n` +
+        `CANCELLED by ${whoDid(req)}\n\n` +
         `Reference: ${bk.ref}\nRoute: ${bk.pickup} -> ${bk.dropoff}\n` +
         `Was: ${bk.pickup_date instanceof Date ? bk.pickup_date.toISOString().slice(0,10) : bk.pickup_date} ${bk.pickup_time}\n` +
         `Passenger: ${bk.passenger_name}\nVehicle: ${bk.vehicle}\n` +
@@ -600,18 +752,18 @@ module.exports = function installAgentPortal(ctx) {
            passenger_name=$7, passenger_phone=$8, passenger_email=$9, flight=$10,
            address=$11, notes=$12, pax=$13, child_seats=$14, trailer=$15,
            total_cents=$16, commission_cents=$17, commission_pct=$18, updated_at=now(),
-           client_ref=$19, return_date=$20, return_time=$21, return_flight=$22, hire_hours=$23, ends=$24, stops=$25
+           client_ref=$19, return_date=$20, return_time=$21, return_flight=$22, hire_hours=$23, ends=$24, stops=$25, changed_by=$26
          WHERE ref = $1`,
         [old.ref, b.pickup, b.dropoff, b.vehicle, b.date, b.time,
          b.name, b.phone, p.email, b.flight || null, b.address || null, b.notes || null,
          p.pax, p.seats, p.trailer, p.totalCents, p.commissionCents, pct,
-         p.clientRef, p.ret ? p.ret.date : null, p.ret ? p.ret.time : null, p.ret ? (p.ret.flight || null) : null, p.hours, p.ends, p.stops]
+         p.clientRef, p.ret ? p.ret.date : null, p.ret ? p.ret.time : null, p.ret ? (p.ret.flight || null) : null, p.hours, p.ends, p.stops, bookedByOf(req)]
       );
 
       const wasDate = old.pickup_date instanceof Date ? old.pickup_date.toISOString().slice(0, 10) : old.pickup_date;
       notifyOffice(
         `AGENT AMENDED (${req.agent.code}): ${b.pickup} -> ${b.dropoff} (${b.date} ${b.time}) [${old.ref}]`,
-        `AMENDED by ${req.agent.name} (${req.agent.code})\n\n` +
+        `AMENDED by ${whoDid(req)}\n\n` +
         `WAS: ${old.pickup} -> ${old.dropoff}, ${old.vehicle}, ${wasDate} ${old.pickup_time}, ` +
         `${old.passenger_name}, total ${money(old.total_cents)}\n\n` +
         `NOW:\n${p.summary.text}\n\n` +
@@ -619,7 +771,7 @@ module.exports = function installAgentPortal(ctx) {
         `Commission now: ${pct}% = ${money(p.commissionCents)} (was ${money(old.commission_cents)}), to their wallet - paid out separately\n`,
         req.agent
       );
-      res.json({ ok: true, ref: old.ref, total: p.summary.total, commission: p.commissionCents / 100 });
+      res.json({ ok: true, ref: old.ref, total: p.summary.total, commission: canMoney(req) ? p.commissionCents / 100 : null });
     } catch (err) {
       console.error("agent update:", err);
       res.status(500).json({ error: "Could not save that change — please call us." });
@@ -631,14 +783,96 @@ module.exports = function installAgentPortal(ctx) {
      fare either. The agent sets their own price with their customer; a
      voucher that quoted what Sky Transfers charges would undercut them in
      front of their own client. It is a service confirmation, not an invoice. */
-  function voucherPdf(bk, agentName) {
+  function pdfBuffer(draw) {
     return new Promise((resolve, reject) => {
       const doc = new PDFDocument({ size: "A4", margin: 0 });
       const chunks = [];
       doc.on("data", (c) => chunks.push(c));
       doc.on("end", () => resolve(Buffer.concat(chunks)));
       doc.on("error", reject);
+      try { draw(doc); doc.end(); } catch (e) { reject(e); }
+    });
+  }
+  const voucherPdf = (bk, agentName) => pdfBuffer((doc) => drawVoucher(doc, bk, agentName));
+  /* A tour: the itinerary first, then one voucher per trip, so the agent can
+     hand the group a single file. Like every voucher, no prices anywhere. */
+  const tourVoucherPdf = (rows, agentName) => pdfBuffer((doc) => {
+    drawItinerary(doc, rows, agentName);
+    rows.forEach((bk) => { doc.addPage({ size: "A4", margin: 0 }); drawVoucher(doc, bk, agentName); });
+  });
+  const isoOf = (d) => (d instanceof Date ? d.toISOString().slice(0, 10) : (d ? String(d) : ""));
 
+  function drawItinerary(doc, rows, agentName) {
+    const W = 595.28, H = 841.89, L = 48, R = W - 48, CW = R - L;
+    const NAVY = "#101828", INK = "#141D30", GOLD = "#C9A227", GOLD_LT = "#D9B44A", MUTED = "#68707F", LINE = "#E5E0D2", CREAM = "#F6F2E8";
+    const first = rows[0] || {};
+    const head = () => {
+      doc.rect(0, 0, W, 118).fill(NAVY);
+      if (HAS_LOGO) { try { doc.image(LOGO, R - 96, 22, { fit: [96, 74] }); } catch (e) {} }
+      doc.font("Times-Roman").fontSize(26).fillColor(CREAM).text("SKY TRANSFERS", L, 34, { characterSpacing: 4 });
+      doc.font("Helvetica-Bold").fontSize(9).fillColor(GOLD_LT).text("TOUR ITINERARY", L, 70, { characterSpacing: 2.5 });
+      doc.font("Helvetica").fontSize(8.5).fillColor("#98A0B0").text("Gold Coast & Brisbane private transfers", L, 86);
+      doc.rect(0, 118, W, 3).fill(GOLD);
+    };
+    const foot = () => {
+      const FY = H - 74;
+      doc.rect(0, FY, W, 74).fill(NAVY);
+      doc.rect(0, FY, W, 2).fill(GOLD);
+      doc.font("Times-Roman").fontSize(13).fillColor(CREAM).text("SKY TRANSFERS", L, FY + 16, { characterSpacing: 3, lineBreak: false });
+      doc.font("Helvetica").fontSize(8.5).fillColor("#98A0B0")
+        .text("24/7  ·  +61 481 437 772  ·  info@skytransfers.com.au  ·  www.skytransfers.com.au", L, FY + 36, { lineBreak: false });
+      doc.font("Helvetica").fontSize(8.5).fillColor(GOLD_LT).text(`Tour ${first.tour_ref || ""}`, L, FY + 16, { width: CW, align: "right", lineBreak: false });
+    };
+    head();
+    let y = 146;
+    doc.font("Helvetica-Bold").fontSize(8).fillColor(MUTED).text("TOUR", L, y, { characterSpacing: 1.5 });
+    doc.font("Helvetica-Bold").fontSize(17).fillColor(INK).text(first.tour_name || "Tour", L, y + 12, { width: CW });
+    y = doc.y + 6;
+    doc.font("Helvetica").fontSize(10).fillColor(MUTED)
+      .text(`Tour reference ${first.tour_ref || ""}   ·   ${rows.length} trips   ·   booked by ${agentName}`, L, y, { width: CW });
+    y = doc.y + 18;
+    const cols = [{ t: "#", w: 22 }, { t: "DATE & TIME", w: 100 }, { t: "TRIP", w: 210 }, { t: "VEHICLE", w: 85 }, { t: "REFERENCE", w: CW - 417 }];
+    const header = () => {
+      let x = L;
+      doc.rect(L, y, CW, 22).fill(NAVY);
+      cols.forEach((c) => { doc.font("Helvetica-Bold").fontSize(7.5).fillColor(CREAM).text(c.t, x + 6, y + 7, { width: c.w - 8, characterSpacing: 1, lineBreak: false }); x += c.w; });
+      y += 22;
+    };
+    header();
+    rows.forEach((bk, i) => {
+      const trip = bk.hire_hours ? `${bk.hire_hours} hours as directed from ${bk.pickup}` : `${bk.pickup}  to  ${bk.dropoff}`;
+      let stops = [];
+      try { const j = bk.stops ? JSON.parse(bk.stops) : null; stops = j && Array.isArray(j.list) ? j.list : []; } catch (e) { stops = []; }
+      const rd = isoOf(bk.return_date);
+      const sub = [stops.length ? `via ${stops.map((s) => s.suburb || s.address).join(", ")}` : "",
+                   rd ? `return ${rd} at ${bk.return_time || ""}` : "", bk.flight ? `flight ${bk.flight}` : ""].filter(Boolean).join("  ·  ");
+      doc.font("Helvetica").fontSize(9.5);
+      const h = Math.max(30, doc.heightOfString(trip, { width: 202 }) + (sub ? doc.heightOfString(sub, { width: 202 }) + 4 : 0) + 14);
+      if (y + h > H - 74 - 20) { foot(); doc.addPage({ size: "A4", margin: 0 }); head(); y = 146; header(); }
+      let x = L;
+      const cells = [String(i + 1), `${isoOf(bk.pickup_date)}\n${bk.pickup_time}`, null, bk.vehicle, bk.ref];
+      cells.forEach((v, k) => {
+        if (k === 2) {
+          doc.font("Helvetica").fontSize(9.5).fillColor(INK).text(trip, x + 6, y + 7, { width: 202 });
+          if (sub) doc.font("Helvetica").fontSize(8).fillColor(MUTED).text(sub, x + 6, doc.y + 2, { width: 202 });
+        } else {
+          doc.font(k === 4 ? "Helvetica-Bold" : "Helvetica").fontSize(k === 4 ? 8.5 : 9.5).fillColor(INK).text(v, x + 6, y + 7, { width: cols[k].w - 8 });
+        }
+        x += cols[k].w;
+      });
+      y += h;
+      doc.moveTo(L, y).lineTo(R, y).lineWidth(0.5).strokeColor(LINE).stroke();
+    });
+    y += 16;
+    if (y + 40 < H - 74 - 8) {
+      doc.font("Helvetica-Oblique").fontSize(9).fillColor(MUTED)
+        .text("Each trip has its own voucher on the pages that follow. Please show the right one to your chauffeur. Any changes should go through the travel agent who made this booking.", L, y, { width: CW });
+    }
+    foot();
+  }
+
+  function drawVoucher(doc, bk, agentName) {
+    {
       const W = 595.28, L = 48, R = W - 48, CW = R - L;
       const NAVY = "#101828", INK = "#141D30", GOLD = "#C9A227", GOLD_D = "#8E701C",
             GOLD_LT = "#D9B44A", MUTED = "#68707F", LINE = "#E5E0D2", SOFT = "#F6EED9", CREAM = "#F6F2E8";
@@ -677,6 +911,7 @@ module.exports = function installAgentPortal(ctx) {
                  return l.length ? ["STOPS ON THE WAY", l.map((x, i) => `${i + 1}) ${x.address || x.suburb}`).join("\n")] : null; })(),
         rdate ? ["RETURN",`${rdate} at ${bk.return_time || ""}  ·  ${bk.dropoff}  to  ${bk.pickup}${bk.return_flight ? "  ·  flight " + bk.return_flight : ""}`] : null,
         bk.client_ref ? ["YOUR REFERENCE", bk.client_ref] : null,
+        bk.tour_ref ? ["TOUR", `${bk.tour_name || bk.tour_ref}${bk.tour_seq ? "  ·  trip " + bk.tour_seq : ""}  ·  ${bk.tour_ref}`] : null,
         ["VEHICLE", bk.vehicle],
         ["PASSENGERS", String(bk.pax || "—")],
         bk.flight ? ["FLIGHT", bk.flight] : null,
@@ -736,9 +971,7 @@ module.exports = function installAgentPortal(ctx) {
         .text("24/7  ·  +61 481 437 772  ·  info@skytransfers.com.au  ·  www.skytransfers.com.au", L, FY + 36);
       doc.font("Helvetica").fontSize(8.5).fillColor(GOLD_LT)
         .text(`Ref ${bk.ref}`, L, FY + 16, { width: CW, align: "right" });
-
-      doc.end();
-    });
+    }
   }
 
   /* A GET so the browser can save it straight to disk; the token rides in the
@@ -754,6 +987,131 @@ module.exports = function installAgentPortal(ctx) {
     } catch (err) {
       console.error("voucher:", err);
       res.status(500).json({ error: "Could not build that voucher." });
+    }
+  });
+
+  app.get("/agent/tour/voucher", requireAgent, async (req, res) => {
+    try {
+      const { rows } = await pool.query(
+        `SELECT * FROM agent_bookings WHERE tour_ref = $1 AND agent_code = $2 AND status = 'confirmed'
+          ORDER BY tour_seq, pickup_date, pickup_time`, [String(req.query.tour || ""), req.agent.code]);
+      if (!rows.length) return res.status(404).json({ error: "We can't find that tour, or every trip in it is cancelled." });
+      const pdf = await tourVoucherPdf(rows, req.agent.name);
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader("Content-Disposition", `attachment; filename="SkyTransfers-${rows[0].tour_ref}.pdf"`);
+      res.send(pdf);
+    } catch (err) {
+      console.error("tour voucher:", err);
+      res.status(500).json({ error: "Could not build that tour voucher." });
+    }
+  });
+
+  /* ---- the agency's team: staff logins --------------------------------
+     The main login and managers add people, choose bookings-only or full
+     access, reset a PIN or switch a login off. A PIN is made here, six
+     digits, never the same as another login at the agency, and shown once:
+     it is not stored anywhere it could be read back. */
+  const TEAM_MAX = 25;
+  const userRow = (u) => ({ id: u.id, name: u.name, email: u.email || "", role: u.role === "manager" ? "manager" : "staff",
+    active: u.active, created: u.created_at, lastLogin: u.last_login_at || null, bookings: Number(u.bookings || 0) });
+  function requireManager(req, res, next) {
+    requireAgent(req, res, () => {
+      if (!canManage(req)) return res.status(403).json({ error: "Only your agency's main login or a manager can change the team." });
+      next();
+    }).catch((err) => { console.error("agent auth:", err); res.status(500).json({ error: "Could not check your sign-in just now." }); });
+  }
+  async function freshStaffPin(code) {
+    const { rows: a } = await pool.query("SELECT pin_hash FROM agents WHERE code = $1", [code]);
+    const { rows: us } = await pool.query("SELECT pin_hash FROM agent_users WHERE agent_code = $1 AND active", [code]);
+    const taken = a.concat(us).map((r) => r.pin_hash);
+    for (let i = 0; i < 20; i++) {
+      const pin = String(crypto.randomInt(100000, 1000000));
+      if (!taken.some((h) => pinMatches(pin, h))) return pin;
+    }
+    throw new Error("could not find a free PIN");
+  }
+  const cleanRole = (r) => (r === "manager" ? "manager" : r === "staff" ? "staff" : null);
+
+  app.get("/agent/team", requireManager, async (req, res) => {
+    try {
+      const { rows } = await pool.query(
+        `SELECT u.id, u.name, u.email, u.role, u.active, u.created_at, u.last_login_at, COUNT(b.ref) AS bookings
+           FROM agent_users u LEFT JOIN agent_bookings b ON b.booked_by_id = u.id
+          WHERE u.agent_code = $1
+          GROUP BY u.id, u.name, u.email, u.role, u.active, u.created_at, u.last_login_at
+          ORDER BY u.active DESC, u.name`, [req.agent.code]);
+      res.json({ you: req.user.id, max: TEAM_MAX, team: rows.map(userRow) });
+    } catch (err) {
+      console.error("agent team:", err);
+      res.status(500).json({ error: "Could not load your team just now." });
+    }
+  });
+
+  app.post("/agent/team/add", requireManager, async (req, res) => {
+    try {
+      const name = String(req.body?.name || "").trim().replace(/\s+/g, " ").slice(0, 80);
+      const email = String(req.body?.email || "").trim().slice(0, 120);
+      const role = cleanRole(req.body?.role);
+      if (name.length < 2) return res.status(400).json({ error: "Enter the person's name." });
+      if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: "That email doesn't look right." });
+      if (!role) return res.status(400).json({ error: "Choose what they can see: bookings only, or everything." });
+      const { rows: n } = await pool.query("SELECT COUNT(*) AS n FROM agent_users WHERE agent_code = $1 AND active", [req.agent.code]);
+      if (Number(n[0].n) >= TEAM_MAX) return res.status(400).json({ error: `You have ${TEAM_MAX} logins already — switch one off first, or call us.` });
+      const pin = await freshStaffPin(req.agent.code);
+      const { rows } = await pool.query(
+        `INSERT INTO agent_users (agent_code, name, email, pin_hash, role) VALUES ($1, $2, $3, $4, $5)
+         RETURNING id, name, email, role, active, created_at, last_login_at`,
+        [req.agent.code, name, email || null, makePinHash(pin), role]);
+      notifyOffice(`AGENT TEAM (${req.agent.code}): ${name} added`,
+        `${whoDid(req)} added a login for ${name}${email ? " (" + email + ")" : ""}: ${role === "manager" ? "manager - everything" : "bookings only"}.\n`, req.agent);
+      res.json({ ok: true, user: userRow(rows[0]), pin });
+    } catch (err) {
+      console.error("agent team add:", err);
+      res.status(500).json({ error: "Could not add that login just now." });
+    }
+  });
+
+  async function ownUser(req, id) {
+    const { rows } = await pool.query("SELECT * FROM agent_users WHERE id = $1 AND agent_code = $2", [parseInt(id, 10) || 0, req.agent.code]);
+    return rows[0] || null;
+  }
+
+  app.post("/agent/team/update", requireManager, async (req, res) => {
+    try {
+      const u = await ownUser(req, req.body?.id);
+      if (!u) return res.status(404).json({ error: "We can't find that login." });
+      if (req.user.id && u.id === req.user.id) return res.status(400).json({ error: "You can't change your own login — ask your agency's main login or another manager." });
+      const role = req.body?.role != null ? cleanRole(req.body.role) : (u.role === "manager" ? "manager" : "staff");
+      if (!role) return res.status(400).json({ error: "Choose bookings only, or everything." });
+      const active = req.body?.active != null ? req.body.active === true || req.body.active === "true" : u.active;
+      if (active && !u.active) {
+        const { rows: n } = await pool.query("SELECT COUNT(*) AS n FROM agent_users WHERE agent_code = $1 AND active", [req.agent.code]);
+        if (Number(n[0].n) >= TEAM_MAX) return res.status(400).json({ error: `You have ${TEAM_MAX} logins already — switch one off first.` });
+      }
+      /* switching a login back on gives it a new PIN: the old one may have
+         been reused by someone else since */
+      let pin = null;
+      if (active && !u.active) pin = await freshStaffPin(req.agent.code);
+      await pool.query(
+        `UPDATE agent_users SET role = $2, active = $3${pin ? ", pin_hash = $4, pin_ver = pin_ver + 1" : ""} WHERE id = $1`,
+        pin ? [u.id, role, active, makePinHash(pin)] : [u.id, role, active]);
+      res.json({ ok: true, pin });
+    } catch (err) {
+      console.error("agent team update:", err);
+      res.status(500).json({ error: "Could not save that just now." });
+    }
+  });
+
+  app.post("/agent/team/pin", requireManager, async (req, res) => {
+    try {
+      const u = await ownUser(req, req.body?.id);
+      if (!u || !u.active) return res.status(404).json({ error: "We can't find that login, or it is switched off." });
+      const pin = await freshStaffPin(req.agent.code);
+      await pool.query("UPDATE agent_users SET pin_hash = $2, pin_ver = pin_ver + 1 WHERE id = $1", [u.id, makePinHash(pin)]);
+      res.json({ ok: true, pin });
+    } catch (err) {
+      console.error("agent team pin:", err);
+      res.status(500).json({ error: "Could not reset that PIN just now." });
     }
   });
 
@@ -784,6 +1142,11 @@ module.exports = function installAgentPortal(ctx) {
     returnTime: r.return_time || null,
     returnFlight: r.return_flight || "",
     hours: r.hire_hours || null,
+    bookedBy: r.booked_by || "",
+    changedBy: r.changed_by || "",
+    tourRef: r.tour_ref || null,
+    tourName: r.tour_name || "",
+    tourSeq: r.tour_seq || null,
     ends: (() => { try { return r.ends ? JSON.parse(r.ends) : null; } catch (e) { return null; } })(),
     ...(() => {
       try { const j = r.stops ? JSON.parse(r.stops) : null; return { stops: j && Array.isArray(j.list) ? j.list : [], stopsExtra: j && j.extra || 0 }; }
@@ -811,15 +1174,23 @@ module.exports = function installAgentPortal(ctx) {
       const live = rows.filter((r) => r.status === "confirmed");
       const earned = live.reduce((n, r) => n + r.commission_cents, 0);
       const paid = live.filter((r) => r.settled).reduce((n, r) => n + r.commission_cents, 0);
+      const money_ = canMoney(req);
+      /* trips per tour, counting the cancelled ones too, so "2 of 5" stays true */
+      const tourCount = {};
+      rows.forEach((r) => { if (r.tour_ref) tourCount[r.tour_ref] = (tourCount[r.tour_ref] || 0) + 1; });
       res.json({
-        agent: { code: req.agent.code, name: req.agent.name, commissionPct: agentPct(req.agent) },
-        wallet: { earned: earned / 100, paid: paid / 100, balance: (earned - paid) / 100 },
+        agent: { code: req.agent.code, name: req.agent.name, commissionPct: money_ ? agentPct(req.agent) : null },
+        user: { name: req.user.name, role: req.user.role, canMoney: money_, canManage: canManage(req) },
+        wallet: money_ ? { earned: earned / 100, paid: paid / 100, balance: (earned - paid) / 100 } : null,
         changeCutoffHours: CHANGE_CUTOFF_HOURS,
+        tourMax: TOUR_MAX,
         bookings: rows.map((r) => {
           const b = bookingRow(r);
           const h = hoursUntil(b.date, b.time);
           b.changeable = r.status === "confirmed" && h != null && h >= CHANGE_CUTOFF_HOURS;
           b.trip = trips[b.ref] || null;
+          if (b.tourRef) b.tourCount = tourCount[b.tourRef];
+          if (!money_) { b.commission = null; b.settled = null; }
           return b;
         }),
       });
@@ -2117,5 +2488,5 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
      is handed out so other modules can sit behind the same admin login rather
      than growing a second path that accepts the PIN. */
   /* pool goes to ops.js (the dispatch board), which reads these same tables. */
-  return { saveWebBooking, actionLinks, findOpenWebBooking, requireAdmin, getWebBooking, rowToBooking, summaryForRow, settleBalance, pool, setTripStatus, requireAgent };
+  return { saveWebBooking, actionLinks, findOpenWebBooking, requireAdmin, getWebBooking, rowToBooking, summaryForRow, settleBalance, pool, setTripStatus, requireAgent, requireAgentAccounts };
 };
