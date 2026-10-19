@@ -678,6 +678,70 @@ module.exports = function installBilling(ctx) {
     }
   });
 
+  /* ================= the agency's own view (agent.html) =================
+     An agency sees only the invoices issued to it - party_type 'agent' and
+     its own code - never another agency's and never a void one. Read only:
+     paying is the Stripe link already on each invoice. The statement adds
+     what is not invoiced yet (its past trips not on a live invoice), so
+     nothing it owes is hidden from it. */
+  if (typeof ctx.requireAgent === "function") {
+    const requireAgent = ctx.requireAgent;
+    app.get("/agent/invoices", requireAgent, async (req, res) => {
+      try {
+        const code = req.agent.code, t = today();
+        const { rows } = await pool.query(
+          `SELECT i.*, to_char(i.issued_on, 'YYYY-MM-DD') AS issued, to_char(i.due_on, 'YYYY-MM-DD') AS due,
+                  to_char(i.period_from, 'YYYY-MM-DD') AS pfrom, to_char(i.period_to, 'YYYY-MM-DD') AS pto
+             FROM ops_invoices i WHERE i.party_type = 'agent' AND i.party_key = $1 AND i.status <> 'void'
+            ORDER BY i.id DESC LIMIT 200`, [code]);
+        const ids = rows.map((r) => r.id);
+        const counts = ids.length
+          ? (await pool.query(`SELECT invoice_id, count(*)::int AS n FROM ops_invoice_lines WHERE invoice_id IN (${inList(ids.length)}) GROUP BY invoice_id`, ids)).rows : [];
+        const byId = new Map(counts.map((c) => [c.invoice_id, c.n]));
+        const invoices = rows.map((r) => {
+          const p = publicInvoice({ ...r, line_count: byId.get(r.id) || 0 });
+          return { id: p.id, number: p.number, issued: p.issued, due: p.due, from: p.from, to: p.to, total: p.total, gst: p.gst,
+                   status: p.status, overdue: p.overdue, daysOverdue: p.daysOverdue, paidAt: p.paidAt, trips: p.lineCount,
+                   payUrl: p.status === "issued" ? p.payUrl || null : null };
+        });
+        const open = invoices.filter((i) => i.status === "issued");
+        const late = open.filter((i) => i.overdue);
+        const billed = await billedRefs();
+        const unbilled = (await pool.query(
+          `SELECT ref, total_cents FROM agent_bookings WHERE agent_code = $1 AND status = 'confirmed' AND pickup_date <= $2`, [code, t]))
+          .rows.filter((r) => !billed.has(r.ref));
+        const sum = (list, f) => Math.round(list.reduce((a, x) => a + f(x), 0) * 100) / 100;
+        res.json({
+          today: t, invoices,
+          statement: {
+            owing: sum(open, (i) => i.total), owingCount: open.length,
+            overdue: sum(late, (i) => i.total), overdueCount: late.length,
+            uninvoiced: sum(unbilled, (r) => r.total_cents / 100), uninvoicedCount: unbilled.length,
+          },
+        });
+      } catch (err) {
+        console.error("agent invoices:", err);
+        res.status(500).json({ error: "Could not load your invoices just now." });
+      }
+    });
+    app.get("/agent/invoice/pdf", requireAgent, async (req, res) => {
+      try {
+        const inv = await invoiceWithLines(int(req.query.id, 1, 1e9, 0));
+        if (!inv || inv.party_type !== "agent" || inv.party_key !== req.agent.code || inv.status === "void") {
+          return res.status(404).json({ error: "We can't find that invoice." });
+        }
+        const pdf = await invoicePdf(inv);
+        res.set("Content-Type", "application/pdf");
+        res.set("Content-Disposition", `attachment; filename="${inv.number}.pdf"`);
+        res.set("Cache-Control", "no-store");
+        res.end(pdf);
+      } catch (err) {
+        console.error("agent invoice pdf:", err);
+        res.status(500).json({ error: "Could not make that PDF." });
+      }
+    });
+  }
+
   app.get("/ops/invoice/pdf", requireAdmin, async (req, res) => {
     try {
       const inv = await invoiceWithLines(int(req.query.id, 1, 1e9, 0));
