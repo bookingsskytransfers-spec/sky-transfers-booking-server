@@ -185,6 +185,7 @@ module.exports = function installOps(ctx) {
       ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS return_time   TEXT;
       ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS return_flight TEXT;
       ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS hire_hours    INTEGER;
+      ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS stops         TEXT;
     `).catch((e) => console.error("ops: agent_bookings v2 columns:", e.message));
   }
 
@@ -202,7 +203,7 @@ module.exports = function installOps(ctx) {
     a.passenger_name, a.passenger_phone, a.passenger_email, a.flight, a.address, a.notes,
     a.pax, a.child_seats, a.trailer, a.total_cents, a.status, a.agent_code, g.name AS agent_name,
     a.client_ref AS account_ref, to_char(a.return_date, 'YYYY-MM-DD') AS rd, a.return_time AS rt,
-    a.return_flight AS rf, a.hire_hours`;
+    a.return_flight AS rf, a.hire_hours, a.stops`;
   const JOB_COLS = `ref, account, account_ref, pickup, dropoff, vehicle,
     to_char(pickup_date, 'YYYY-MM-DD') AS d, pickup_time AS t,
     to_char(return_date, 'YYYY-MM-DD') AS rd, return_time AS rt, return_flight AS rf,
