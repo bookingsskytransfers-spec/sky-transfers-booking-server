@@ -38,16 +38,29 @@ module.exports = function installBilling(ctx) {
   const LOGO = path.join(__dirname, "logo.png");
   const HAS_LOGO = fs.existsSync(LOGO);
 
+  /* The legal name was confirmed by Aman on 9 Sept 2026; "Australia Wide Cars
+     Pty Ltd", on some earlier hand-made invoices, is not it. The operator
+     accreditation is Queensland TMR's. The booking entity authorisation (BEA)
+     is left off until Aman confirms the number from the certificate (two
+     different ones were on old invoices) - set INVOICE_BEA on Render to print it. */
   const SELLER = {
     name: "Australia Wide Car Services Pty Ltd",
     trading: "trading as Sky Transfers",
+    short: "Australia Wide Car Services Pty Ltd T/A Sky Transfers",
     abn: "22 680 932 003",
+    oa: "900595993",
+    bea: String(process.env.INVOICE_BEA || "").trim(),
+    contact: "Amandeep Singh",
     email: "info@skytransfers.com.au",
     phone: "+61 481 437 772",
     web: "www.skytransfers.com.au",
+    address: "43 Riversdale Rd, Oxenford QLD 4210",
   };
-  /* Bank details are the office's to set (Render env var), never guessed. */
+  /* Bank details are the office's to set (Render env var), never guessed.
+     One per line on the invoice: typed on one line in Render with " · ", "|"
+     or ";" between the parts, or with real line breaks. */
   const BANK = String(process.env.INVOICE_BANK_DETAILS || "").trim();
+  const BANK_LINES = BANK.replace(/\\n/g, "\n").split(/\r?\n|\s+[·|]\s+|\s*;\s*/).map((s) => s.trim()).filter(Boolean);
   const SITE = String(process.env.PUBLIC_SITE_URL || "https://www.skytransfers.com.au").replace(/\/+$/, "");
 
   const isoDate = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(String(v || "")) ? String(v) : null);
@@ -115,6 +128,13 @@ module.exports = function installBilling(ctx) {
       CREATE INDEX IF NOT EXISTS ops_invoice_lines_inv ON ops_invoice_lines (invoice_id);
       -- Autopilot: the addresses or domains this account emails bookings from.
       ALTER TABLE ops_accounts ADD COLUMN IF NOT EXISTS intake_from TEXT;
+      -- The client's phone on the invoice, and each line's trip detail (JSON:
+      -- time, passenger, references, both ends, flight, service, stops, the
+      -- return leg and the times the driver recorded). Lines from before this
+      -- have no detail and print their description as they always did.
+      ALTER TABLE ops_accounts ADD COLUMN IF NOT EXISTS phone TEXT;
+      ALTER TABLE ops_invoices ADD COLUMN IF NOT EXISTS bill_phone TEXT;
+      ALTER TABLE ops_invoice_lines ADD COLUMN IF NOT EXISTS detail TEXT;
     `);
   }
 
@@ -144,6 +164,46 @@ module.exports = function installBilling(ctx) {
     return parts.join("; ");
   }
 
+  /* "Private airport chauffeur transfer (Sedan)" and the like - what the
+     client's accounts team needs to see the job was. */
+  const HUB_RE = /airport|cruise terminal/i;
+  function serviceOf(r) {
+    const v = r.vehicle ? ` (${r.vehicle})` : "";
+    if (r.hire_hours && (!r.dropoff || r.dropoff === "As directed")) return `${r.hire_hours} hours as directed${v}`;
+    if (HUB_RE.test(r.pickup || "") || HUB_RE.test(r.dropoff || "")) return `Private airport chauffeur transfer${v}`;
+    return `Private chauffeur transfer${v}`;
+  }
+  /* HH:MM in Brisbane (UTC+10, no daylight saving) from a timestamp. */
+  function bneTime(ts) {
+    if (!ts) return null;
+    const t = ts instanceof Date ? ts.getTime() : Date.parse(ts);
+    return Number.isFinite(t) ? new Date(t + 10 * 3600e3).toISOString().slice(11, 16) : null;
+  }
+  function stopList(v) {
+    try {
+      const j = v ? JSON.parse(v) : null;
+      const list = Array.isArray(j) ? j : j && Array.isArray(j.list) ? j.list : [];
+      return list.map((x) => (typeof x === "string" ? x : x && (x.address || x.suburb) || "")).filter(Boolean).slice(0, 3);
+    } catch (e) { return []; }
+  }
+  /* What one invoice line shows, frozen when the invoice is issued. The times
+     the driver recorded (on board, and done) are the actual pick-up and
+     drop-off times - government and corporate clients ask for both. */
+  function detailOf(r, disp) {
+    const leg = (l) => disp.find((x) => x.ref === r.ref && x.leg === l) || null;
+    const times = (d) => (d ? { pu: bneTime(d.pob_at), do: bneTime(d.done_at) } : {});
+    const hourly = !!(r.hire_hours && (!r.dropoff || r.dropoff === "As directed"));
+    const det = {
+      time: r.t || "", passenger: r.passenger_name || "", pax: r.pax || null,
+      clientRef: r.account_ref || "", pickup: r.pickup || "", dropoff: hourly ? "As directed" : (r.dropoff || ""),
+      address: r.address || "", addressEnd: HUB_RE.test(r.pickup || "") ? "dropoff" : "pickup",
+      flight: r.flight || "", service: serviceOf(r), stops: stopList(r.stops),
+      childSeats: r.child_seats || 0, trailer: !!r.trailer, actual: times(leg("out")),
+    };
+    if (r.rd) det.ret = { date: r.rd, time: r.rt || "", flight: r.rflight || "", actual: times(leg("ret")) };
+    return det;
+  }
+
   /* The jobs a party has in a date window that are not yet on a live
      invoice, as invoice lines. */
   async function draftLines(partyType, partyKey, from, to) {
@@ -153,32 +213,33 @@ module.exports = function installBilling(ctx) {
       if (!acc) return { error: "No such account." };
       rows = (await pool.query(
         `SELECT ref, account_ref, pickup, dropoff, vehicle, to_char(pickup_date, 'YYYY-MM-DD') AS d, pickup_time AS t,
-                to_char(return_date, 'YYYY-MM-DD') AS rd, return_time AS rt, hire_hours, passenger_name, pax,
-                price_cents AS cents
+                to_char(return_date, 'YYYY-MM-DD') AS rd, return_time AS rt, return_flight AS rflight, hire_hours,
+                passenger_name, pax, flight, address, stops, child_seats, trailer, price_cents AS cents
            FROM ops_jobs WHERE status <> 'cancelled' AND lower(account) = lower($1) AND pickup_date >= $2 AND pickup_date <= $3`,
         [acc.name, from, to])).rows;
       var party = { type: "account", key: String(acc.id), name: acc.name, email: acc.billing_email, contact: acc.contact,
-                    abn: acc.abn, address: acc.address, terms: acc.terms_days || 14 };
+                    abn: acc.abn, address: acc.address, phone: acc.phone, terms: acc.terms_days || 14 };
     } else if (partyType === "agent") {
       const ag = await getAgent(txt(partyKey, 40));
       if (!ag) return { error: "No such agent." };
       rows = (await pool.query(
         `SELECT ref, NULL AS account_ref, pickup, dropoff, vehicle, to_char(pickup_date, 'YYYY-MM-DD') AS d, pickup_time AS t,
-                NULL AS rd, NULL AS rt, NULL AS hire_hours, passenger_name, pax, total_cents AS cents
+                NULL AS rd, NULL AS rt, NULL AS rflight, NULL AS hire_hours, passenger_name, pax, flight, address,
+                NULL AS stops, child_seats, trailer, total_cents AS cents
            FROM agent_bookings WHERE status <> 'cancelled' AND agent_code = $1 AND pickup_date >= $2 AND pickup_date <= $3`,
         [ag.code, from, to])).rows;
-      party = { type: "agent", key: ag.code, name: ag.name, email: ag.email, contact: null, abn: null, address: null, terms: 14 };
+      party = { type: "agent", key: ag.code, name: ag.name, email: ag.email, contact: null, abn: null, address: null, phone: null, terms: 14 };
     } else return { error: "Unknown kind of account." };
     const billed = await billedRefs();
     const refs = rows.map((r) => r.ref);
     const disp = refs.length
-      ? (await pool.query(`SELECT ref, leg, status FROM ops_dispatch WHERE ref IN (${inList(refs.length)})`, refs)).rows : [];
+      ? (await pool.query(`SELECT ref, leg, status, pob_at, done_at FROM ops_dispatch WHERE ref IN (${inList(refs.length)})`, refs)).rows : [];
     const statusOf = (ref) => { const d = disp.find((x) => x.ref === ref && x.leg === "out"); return d ? d.status : "unassigned"; };
     const lines = rows.filter((r) => !billed.has(r.ref))
       .sort((a, b) => (a.d + a.t).localeCompare(b.d + b.t))
       .map((r) => ({
         ref: r.ref, date: r.d, time: r.t, description: describeJob(r), amountCents: r.cents || 0,
-        status: statusOf(r.ref), future: r.d > today(),
+        status: statusOf(r.ref), future: r.d > today(), detail: detailOf(r, disp),
       }));
     return { party, lines };
   }
@@ -215,8 +276,9 @@ module.exports = function installBilling(ctx) {
     const inv = rows[0];
     if (!inv) return null;
     inv.lines = (await pool.query(
-      `SELECT ref, to_char(service_date, 'YYYY-MM-DD') AS date, description, amount_cents
+      `SELECT ref, to_char(service_date, 'YYYY-MM-DD') AS date, description, amount_cents, detail
          FROM ops_invoice_lines WHERE invoice_id = $1 ORDER BY service_date, id`, [id])).rows;
+    for (const l of inv.lines) { try { l.detail = l.detail ? JSON.parse(l.detail) : null; } catch (e) { l.detail = null; } }
     return inv;
   }
   const publicInvoice = (inv) => ({
@@ -230,81 +292,216 @@ module.exports = function installBilling(ctx) {
   });
 
   /* ---- the PDF --------------------------------------------------------------
+     A4 landscape, laid out like the invoices the office made by hand: seller
+     with accreditation, bill-to, a row per trip (date and time, passenger,
+     references, both ends with flights, service, price), GST split out, and
+     how to pay. Built to the list COMCAR (and any corporate accounts team)
+     rejects invoices against: "Tax Invoice", ABN, contact, phone, current bank
+     details, client's name, trip date, pick-up AND drop-off times, their trip
+     reference, extra charges, total with GST.
      pdfkit's built-in fonts are WinAnsi only: no arrows, routes say "to". */
+  const ddmmyy = (d) => (d ? d.slice(8, 10) + "/" + d.slice(5, 7) + "/" + d.slice(2, 4) : "");
+  const ddmmyyyy = (d) => (d ? d.slice(8, 10) + "/" + d.slice(5, 7) + "/" + d.slice(0, 4) : "");
+  function termsText(inv) {
+    const days = Math.round((Date.parse(inv.due) - Date.parse(inv.issued)) / 864e5);
+    return days > 0 ? days + " days" : "Due on receipt";
+  }
+  function paidMethod(note) {
+    const n = String(note || "");
+    if (/^card via stripe/i.test(n)) return "Card (online, via Stripe)";
+    return n ? n.charAt(0).toUpperCase() + n.slice(1) : "Recorded by the office";
+  }
+
   function invoicePdf(inv) {
     return new Promise((resolve, reject) => {
-      const doc = new PDFDocument({ size: "A4", margin: 48 });
+      const doc = new PDFDocument({ size: "A4", layout: "landscape", margins: { top: 34, bottom: 20, left: 40, right: 40 }, bufferPages: true });
       const bufs = []; doc.on("data", (b) => bufs.push(b)); doc.on("end", () => resolve(Buffer.concat(bufs))); doc.on("error", reject);
-      const INK = "#141D30", MUTED = "#68707F", GOLD = "#C9A227", LINE = "#E5E0D2", SOFT = "#F6EED9";
-      const L = 48, R = doc.page.width - 48, W = R - L;
-      if (HAS_LOGO) { try { doc.image(LOGO, R - 110, 40, { fit: [110, 56] }); } catch (e) {} }
-      doc.font("Helvetica-Bold").fontSize(22).fillColor(INK).text(inv.status === "paid" ? "TAX INVOICE - PAID" : "TAX INVOICE", L, 48);
-      doc.font("Helvetica").fontSize(9.5).fillColor(MUTED)
-        .text(`${SELLER.name}, ${SELLER.trading}`, L, 80)
-        .text(`ABN ${SELLER.abn}`)
-        .text(`${SELLER.email}  ·  ${SELLER.phone}  ·  ${SELLER.web}`);
-      let y = 136;
-      const meta = [["Invoice number", inv.number], ["Date issued", nice(inv.issued)], ["Due", nice(inv.due)],
-        ["Period", inv.pfrom && inv.pto ? `${nice(inv.pfrom)} to ${nice(inv.pto)}` : ""]];
-      doc.roundedRect(L, y, W, 74, 8).fill(SOFT);
-      meta.forEach(([k, v], i) => {
-        const x = L + 16 + (i % 2) * (W / 2), yy = y + 12 + Math.floor(i / 2) * 30;
-        doc.font("Helvetica-Bold").fontSize(7.5).fillColor(MUTED).text(k.toUpperCase(), x, yy, { characterSpacing: 1 });
-        doc.font("Helvetica").fontSize(10.5).fillColor(INK).text(v || "-", x, yy + 10);
+      const INK = "#141D30", MUTED = "#68707F", GOLD = "#C9A227", LINE = "#E5E0D2", SOFT = "#F4F1EA", ZEBRA = "#FBF9F4", OK = "#1E8A4C";
+      const PW = doc.page.width, PH = doc.page.height, L = 40, R = PW - 40, W = R - L;
+      const paid = inv.status === "paid";
+
+      /* ---- seller ---- */
+      doc.font("Helvetica-Bold").fontSize(26).fillColor(INK).text("TAX INVOICE", L, 36);
+      doc.font("Helvetica").fontSize(9).fillColor(MUTED).text("CHAUFFEUR & TRANSFER SERVICES", L, 68, { characterSpacing: 1 });
+      if (paid) {
+        doc.save().rotate(-8, { origin: [L + 330, 58] });
+        doc.roundedRect(L + 260, 38, 140, 40, 8).lineWidth(2.5).strokeColor(OK).stroke();
+        doc.font("Helvetica-Bold").fontSize(24).fillColor(OK).text("PAID", L + 260, 47, { width: 140, align: "center", characterSpacing: 2 });
+        doc.restore();
+      }
+      let sy = 34;
+      if (HAS_LOGO) { try { doc.image(LOGO, R - 120, 30, { fit: [120, 44], align: "right" }); sy = 78; } catch (e) {} }
+      const sellerLines = [
+        [SELLER.short, true],
+        [`ABN ${SELLER.abn}`],
+        [`Operator accreditation OA ${SELLER.oa}` + (SELLER.bea ? `  ·  BEA ${SELLER.bea}` : "")],
+        [`Contact: ${SELLER.contact}  ·  ${SELLER.phone}`],
+        [`${SELLER.email}  ·  ${SELLER.web}`],
+        [SELLER.address],
+      ];
+      sellerLines.forEach(([t, bold]) => {
+        doc.font(bold ? "Helvetica-Bold" : "Helvetica").fontSize(bold ? 9.5 : 8.8).fillColor(bold ? INK : MUTED)
+          .text(t, L + W / 2, sy, { width: W / 2, align: "right" });
+        sy = doc.y + 1;
       });
-      y += 92;
-      doc.font("Helvetica-Bold").fontSize(7.5).fillColor(MUTED).text("BILL TO", L, y, { characterSpacing: 1 });
-      y += 11;
-      doc.font("Helvetica-Bold").fontSize(11.5).fillColor(INK).text(inv.party_name, L, y); y = doc.y;
-      doc.font("Helvetica").fontSize(9.5).fillColor(INK);
-      [inv.bill_contact, inv.bill_address, inv.bill_abn ? "ABN " + inv.bill_abn : null, inv.bill_email].filter(Boolean)
-        .forEach((t) => { doc.text(t, L, y); y = doc.y; });
-      y += 16;
-      const cols = [[L, 66, "DATE"], [L + 70, 96, "REFERENCE"], [L + 170, W - 170 - 90, "DESCRIPTION"], [R - 86, 86, "AMOUNT"]];
+      let y = Math.max(sy, 96) + 8;
+      doc.rect(L, y, W, 1.5).fill(GOLD);
+      y += 12;
+
+      /* ---- bill to / invoice details ---- */
+      const half = (W - 14) / 2;
+      const billRows = [["Client", inv.party_name, true], ["Attn", inv.bill_contact], ["Address", inv.bill_address],
+        ["ABN", inv.bill_abn], ["Email", inv.bill_email], ["Phone", inv.bill_phone]].filter((r) => r[1]);
+      const detRows = [["Invoice no.", inv.number, true], ["Date of issue", ddmmyyyy(inv.issued)],
+        ["Payment terms", paid ? "Paid" : termsText(inv)], ["Due date", ddmmyyyy(inv.due)],
+        ["Period", inv.pfrom && inv.pto ? `${ddmmyyyy(inv.pfrom)} to ${ddmmyyyy(inv.pto)}` : ""],
+        ["Amount due", paid ? dollars(0) : dollars(inv.total_cents), true]].filter((r) => r[1]);
+      const boxH = Math.max(billRows.length, detRows.length) * 14 + 34;
+      doc.rect(L, y, half, boxH).fill(SOFT);
+      doc.rect(L + half + 14, y, half, boxH).fill(SOFT);
+      const box = (x, title, rows) => {
+        doc.font("Helvetica-Bold").fontSize(9.5).fillColor(INK).text(title, x + 14, y + 10);
+        let ry = y + 26;
+        rows.forEach(([k, v, bold]) => {
+          doc.font("Helvetica").fontSize(8.8).fillColor(MUTED).text(k, x + 14, ry, { width: 80 });
+          doc.font(bold ? "Helvetica-Bold" : "Helvetica").fontSize(8.8).fillColor(INK).text(String(v), x + 100, ry, { width: half - 114, height: 13, ellipsis: true });
+          ry += 14;
+        });
+      };
+      box(L, "BILL TO", billRows);
+      box(L + half + 14, "INVOICE DETAILS", detRows);
+      y += boxH + 16;
+
+      /* ---- the trips ---- */
+      doc.font("Helvetica-Bold").fontSize(10).fillColor(INK).text("TRANSFER / BOOKING DETAILS", L, y);
+      y += 15;
+      const COLS = [["DATE & TIME", 80], ["PASSENGER", 112], ["BOOKING REF", 86], ["PICK UP", 150], ["DROP OFF", 150], ["SERVICE TYPE", 104], ["PRICE (INC GST)", 80]];
+      const X = []; COLS.reduce((x, c) => { X.push(x); return x + c[1]; }, L);
       const head = () => {
         doc.rect(L, y, W, 20).fill(INK);
-        cols.forEach(([x, w, t], i) => doc.font("Helvetica-Bold").fontSize(7.5).fillColor("#F6F2E8")
-          .text(t, x + 6, y + 6.5, { width: w - 10, align: i === 3 ? "right" : "left", characterSpacing: 0.8 }));
-        y += 24;
+        COLS.forEach(([t, w], i) => doc.font("Helvetica-Bold").fontSize(7.2).fillColor("#F6F2E8")
+          .text(t, X[i] + 5, y + 7, { width: w - 10, align: i === 6 ? "right" : "left", characterSpacing: 0.2, lineBreak: false }));
+        y += 22;
+      };
+      /* A cell is a list of [text, style]: "" body, "m" muted small, "b" bold. */
+      const FONT = { "": ["Helvetica", 8.4, INK], m: ["Helvetica", 7.4, MUTED], b: ["Helvetica-Bold", 8.4, INK] };
+      const cellH = (parts, w) => parts.reduce((h, [t, s]) => { const f = FONT[s || ""]; doc.font(f[0]).fontSize(f[1]); return h + doc.heightOfString(t, { width: w - 10 }) + 1; }, 0);
+      const drawCell = (parts, x, w, top, right) => {
+        let cy = top;
+        parts.forEach(([t, s]) => { const f = FONT[s || ""]; doc.font(f[0]).fontSize(f[1]).fillColor(f[2]).text(t, x + 5, cy, { width: w - 10, align: right ? "right" : "left" }); cy = doc.y + 1; });
+      };
+      const rowsOf = (ln) => {
+        const d = ln.detail;
+        if (!d) return [[[[ln.date ? ddmmyy(ln.date) : ""]], [], [[ln.ref]], [[ln.description]], null, null, [[dollars(ln.amount_cents), "b"]]]];
+        const timesOf = (a) => [a && a.pu ? [`Picked up ${a.pu}`, "m"] : null, a && a.do ? [`Dropped off ${a.do}`, "m"] : null].filter(Boolean);
+        const pax = d.pax ? ` (${d.pax} pax)` : "";
+        const refCell = d.clientRef ? [[d.clientRef, "b"], [`Our ref ${ln.ref}`, "m"]] : [[ln.ref]];
+        /* the flight sits under the airport end - arriving or departing */
+        const flightEnd = HUB_RE.test(d.pickup) ? "pickup" : HUB_RE.test(d.dropoff) ? "dropoff" : "pickup";
+        const pu = [[d.pickup]], dr = [[d.dropoff]];
+        if (d.flight) (flightEnd === "pickup" ? pu : dr).push([`Flight ${d.flight}`, "m"]);
+        if (d.address) (d.addressEnd === "dropoff" ? dr : pu).push([d.address, "m"]);
+        if (d.stops && d.stops.length) dr.push([`Stops on the way: ${d.stops.join("; ")}`, "m"]);
+        const svc = [[d.service]];
+        if (d.childSeats) svc.push([`${d.childSeats} child seat${d.childSeats === 1 ? "" : "s"}`, "m"]);
+        if (d.trailer) svc.push(["Luggage trailer", "m"]);
+        if (d.ret) svc.push(["Return trip - both legs", "m"]);
+        const out = [[[`${ddmmyy(ln.date)} ${d.time}`.trim()]].concat(timesOf(d.actual)), [[d.passenger + pax]], refCell, pu, dr, svc, [[dollars(ln.amount_cents), "b"]]];
+        const rows = [out];
+        if (d.ret) {
+          const rpu = [[d.dropoff]], rdr = [[d.pickup]];
+          if (d.ret.flight) (HUB_RE.test(d.pickup) ? rdr : rpu).push([`Flight ${d.ret.flight}`, "m"]);
+          if (d.address) (d.addressEnd === "dropoff" ? rpu : rdr).push([d.address, "m"]);
+          rows.push([[[`${ddmmyy(d.ret.date)} ${d.ret.time}`.trim()]].concat(timesOf(d.ret.actual)), [[d.passenger + pax]], [["Return leg", "m"]],
+            rpu, rdr, [["Return leg of the trip above", "m"]], [["Incl.", "m"]]]);
+        }
+        return rows;
       };
       head();
-      inv.lines.forEach((ln, i) => {
-        doc.font("Helvetica").fontSize(9);
-        const h = Math.max(16, doc.heightOfString(ln.description, { width: cols[2][1] - 10 }) + 8);
-        if (y + h > doc.page.height - 150) { doc.addPage(); y = 48; head(); }
-        if (i % 2) doc.rect(L, y - 2, W, h).fill("#FBF9F4");
-        doc.fillColor(INK).font("Helvetica").fontSize(9)
-          .text(ln.date ? nice(ln.date) : "", cols[0][0] + 6, y + 2, { width: cols[0][1] - 8 })
-          .text(ln.ref, cols[1][0] + 6, y + 2, { width: cols[1][1] - 8 })
-          .text(ln.description, cols[2][0] + 6, y + 2, { width: cols[2][1] - 10 })
-          .text(dollars(ln.amount_cents), cols[3][0] + 6, y + 2, { width: cols[3][1] - 12, align: "right" });
-        y += h;
+      let zebra = false;
+      inv.lines.forEach((ln) => {
+        const rows = rowsOf(ln);
+        rows.forEach((cells, ri) => {
+          /* the old free-text description spans the route and service columns */
+          const merged = cells[4] === null;
+          const widthOf = (i) => (merged && i === 3 ? COLS[3][1] + COLS[4][1] + COLS[5][1] : COLS[i][1]);
+          const h = Math.max(18, ...cells.map((c, i) => (c ? cellH(c, widthOf(i)) : 0))) + 8;
+          if (y + h > PH - 54) { doc.addPage(); y = 40; head(); }
+          if (ri === 0) zebra = !zebra;
+          if (zebra) doc.rect(L, y - 2, W, h).fill(ZEBRA);
+          cells.forEach((c, i) => { if (c) drawCell(c, X[i], widthOf(i), y + 3, i === 6); });
+          y += h;
+        });
+        doc.moveTo(L, y - 1).lineTo(R, y - 1).lineWidth(0.5).strokeColor(LINE).stroke();
       });
-      doc.moveTo(L, y + 4).lineTo(R, y + 4).lineWidth(0.8).strokeColor(LINE).stroke();
-      y += 14;
-      if (y > doc.page.height - 190) { doc.addPage(); y = 48; }
-      const tot = [["Total (GST inclusive)", dollars(inv.total_cents), true], ["Includes GST of", dollars(inv.gst_cents), false]]
-        .concat(inv.status === "paid"
-          ? [["Paid", dollars(inv.total_cents), false], ["Balance due", dollars(0), true]]
-          : [["Amount due", dollars(inv.total_cents), true]]);
-      tot.forEach(([k, v, bold]) => {
-        doc.font(bold ? "Helvetica-Bold" : "Helvetica").fontSize(bold ? 11 : 9.5).fillColor(INK)
-          .text(k, R - 260, y, { width: 160, align: "right" }).text(v, R - 96, y, { width: 96, align: "right" });
-        y += bold ? 18 : 15;
-      });
-      doc.rect(R - 260, y - 2, 260, 2).fill(GOLD);
-      y += 20;
-      if (inv.status !== "paid") {
-        doc.font("Helvetica-Bold").fontSize(10).fillColor(INK).text("How to pay", L, y); y = doc.y + 3;
-        doc.font("Helvetica").fontSize(9.5).fillColor(INK);
-        if (inv.pay_link_url) { doc.text("By card, securely through Stripe:", L, y); doc.fillColor("#1F5FA8").text(inv.pay_link_url, L, doc.y, { link: inv.pay_link_url, underline: true }); doc.fillColor(INK); y = doc.y + 4; }
-        if (BANK) { doc.text("By bank transfer:", L, y); doc.text(BANK, L + 10, doc.y); y = doc.y + 4; }
-        doc.text(`Please quote ${inv.number} with your payment. Payment due by ${nice(inv.due)}.`, L, y); y = doc.y;
-      } else if (inv.paid_at) {
-        doc.font("Helvetica").fontSize(9.5).fillColor(INK).text(`Paid in full ${nice(new Date(inv.paid_at).toISOString().slice(0, 10))}. Thank you.`, L, y);
+      y += 12;
+
+      /* ---- totals (right) and how to pay / payment received (left) ---- */
+      const payLines = [];
+      if (!paid) {
+        if (BANK_LINES.length) {
+          payLines.push(["Direct bank deposit", "b"]);
+          BANK_LINES.forEach((t) => payLines.push([t, ""]));
+          payLines.push([`Reference: ${inv.number}`, ""]);
+          payLines.push(["", ""]);
+        }
+        payLines.push(["Credit card / online payment", "b"]);
+        payLines.push(inv.pay_link_url ? [inv.pay_link_url, "link"] : ["Ask us for a secure card payment link.", ""]);
+        payLines.push(["", ""]);
+        payLines.push([`Please quote ${inv.number} with your payment. Payment due by ${ddmmyyyy(inv.due)}.`, ""]);
+      } else {
+        payLines.push(["Status: PAID IN FULL", "b"]);
+        if (inv.paid_at) payLines.push([`Date paid: ${ddmmyyyy(new Date(new Date(inv.paid_at).getTime() + 10 * 3600e3).toISOString().slice(0, 10))}`, ""]);
+        payLines.push([`Method: ${paidMethod(inv.paid_note)}`, ""]);
+        payLines.push([`Reference: ${inv.number}`, ""]);
       }
-      doc.font("Helvetica").fontSize(8).fillColor(MUTED)
-        .text(`${SELLER.name} ${SELLER.trading} · ABN ${SELLER.abn} · ${SELLER.web}`, L, doc.page.height - 60, { width: W, align: "center" });
+      const leftW = W - 300;
+      const payH = 18 + payLines.reduce((h, [t]) => { doc.font("Helvetica").fontSize(8.8); return h + (t ? doc.heightOfString(t, { width: leftW }) + 2 : 6); }, 0);
+      if (y + Math.max(payH, 110) > PH - 60) { doc.addPage(); y = 40; }
+      const top = y;
+      doc.font("Helvetica-Bold").fontSize(10).fillColor(INK).text(paid ? "PAYMENT RECEIVED" : "PAYMENT METHODS", L, y);
+      let py = y + 16;
+      payLines.forEach(([t, s]) => {
+        if (!t) { py += 6; return; }
+        if (s === "link") doc.font("Helvetica").fontSize(8.8).fillColor("#1F5FA8").text(t, L, py, { width: leftW, link: t, underline: true });
+        else doc.font(s === "b" ? "Helvetica-Bold" : "Helvetica").fontSize(8.8).fillColor(INK).text(t, L, py, { width: leftW });
+        py = doc.y + 2;
+      });
+      const TX = R - 270, TW = 270;
+      let ty = top;
+      const gst = inv.gst_cents;
+      [["Subtotal (ex GST)", dollars(inv.total_cents - gst)], ["GST (10%)", dollars(gst)]].forEach(([k, v]) => {
+        doc.font("Helvetica").fontSize(9.5).fillColor(MUTED).text(k, TX + 10, ty, { width: 150 });
+        doc.fillColor(INK).text(v, TX + 160, ty, { width: TW - 170, align: "right" });
+        ty += 17;
+      });
+      doc.rect(TX, ty, TW, 26).fill(INK);
+      doc.font("Helvetica-Bold").fontSize(11.5).fillColor("#FFFFFF").text("Total (AUD)", TX + 10, ty + 8, { width: 150 })
+        .text(dollars(inv.total_cents), TX + 160, ty + 8, { width: TW - 170, align: "right" });
+      ty += 34;
+      if (paid) {
+        doc.font("Helvetica").fontSize(9.5).fillColor(MUTED)
+          .text(`Less: paid${inv.paid_at ? " " + ddmmyyyy(new Date(new Date(inv.paid_at).getTime() + 10 * 3600e3).toISOString().slice(0, 10)) : ""}`, TX + 10, ty, { width: 150 });
+        doc.fillColor(INK).text("-" + dollars(inv.total_cents), TX + 160, ty, { width: TW - 170, align: "right" });
+        ty += 17;
+        doc.font("Helvetica-Bold").fontSize(11).fillColor(INK).text("Balance due", TX + 10, ty, { width: 150 })
+          .text(dollars(0), TX + 160, ty, { width: TW - 170, align: "right" });
+      } else {
+        doc.font("Helvetica-Bold").fontSize(11).fillColor(INK).text("Amount due", TX + 10, ty, { width: 150 })
+          .text(dollars(inv.total_cents), TX + 160, ty, { width: TW - 170, align: "right" });
+      }
+
+      /* ---- footer on every page ---- */
+      const range = doc.bufferedPageRange();
+      for (let i = 0; i < range.count; i++) {
+        doc.switchToPage(range.start + i);
+        if (i > 0) doc.font("Helvetica").fontSize(7.8).fillColor(MUTED)
+          .text(`Tax invoice ${inv.number}  ·  ${inv.party_name}  ·  continued`, L, 18, { width: W, lineBreak: false });
+        doc.moveTo(L, PH - 44).lineTo(R, PH - 44).lineWidth(0.8).strokeColor(GOLD).stroke();
+        doc.font("Helvetica-Oblique").fontSize(8.5).fillColor(GOLD).text("Thank you for your business.", L, PH - 36, { width: 200, lineBreak: false });
+        doc.font("Helvetica").fontSize(7.8).fillColor(MUTED)
+          .text(`${SELLER.short}  |  ABN ${SELLER.abn}  |  ${SELLER.address}  |  Page ${i + 1} of ${range.count}`, L + 200, PH - 36, { width: W - 200, align: "right", lineBreak: false });
+      }
       doc.end();
     });
   }
@@ -338,7 +535,7 @@ module.exports = function installBilling(ctx) {
       const out = accounts.map((a) => {
         const u = ub.get(a.name.toLowerCase()) || { count: 0, cents: 0 }, o = open("account", String(a.id));
         return { type: "account", key: String(a.id), id: a.id, name: a.name, email: a.billing_email, contact: a.contact, abn: a.abn,
-                 address: a.address, terms: a.terms_days, notes: a.notes, active: a.active, intakeFrom: a.intake_from || "",
+                 address: a.address, phone: a.phone || "", terms: a.terms_days, notes: a.notes, active: a.active, intakeFrom: a.intake_from || "",
                  unbilledCount: u.count, unbilled: u.cents / 100, open: o.open / 100, overdue: o.overdue / 100 };
       }).concat(agents.map((g) => {
         const u = ubA.get(g.code) || { count: 0, cents: 0 }, o = open("agent", g.code);
@@ -372,17 +569,18 @@ module.exports = function installBilling(ctx) {
         txt(b.address, 300) || null, int(b.terms, 0, 120, 14), txt(b.notes, 1000) || null,
         b.active === false || b.active === "false" ? false : true,
         /* lower-case, comma separated, addresses or @domains only */
-        String(b.intakeFrom || "").toLowerCase().split(/[\s,;]+/).filter((x) => /^[^\s@]*@[^\s@]+\.[^\s@]+$/.test(x)).join(",") || null];
+        String(b.intakeFrom || "").toLowerCase().split(/[\s,;]+/).filter((x) => /^[^\s@]*@[^\s@]+\.[^\s@]+$/.test(x)).join(",") || null,
+        txt(b.phone, 60) || null];
       if (id) {
         const r = await pool.query(
-          `UPDATE ops_accounts SET name=$1, billing_email=$2, contact=$3, abn=$4, address=$5, terms_days=$6, notes=$7, active=$8, intake_from=$9 WHERE id=$10`,
+          `UPDATE ops_accounts SET name=$1, billing_email=$2, contact=$3, abn=$4, address=$5, terms_days=$6, notes=$7, active=$8, intake_from=$9, phone=$10 WHERE id=$11`,
           vals.concat([id]));
         if (!r.rowCount) return res.status(404).json({ error: "No such account." });
         return res.json({ ok: true, id });
       }
       const { rows } = await pool.query(
-        `INSERT INTO ops_accounts (name, billing_email, contact, abn, address, terms_days, notes, active, intake_from)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`, vals);
+        `INSERT INTO ops_accounts (name, billing_email, contact, abn, address, terms_days, notes, active, intake_from, phone)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`, vals);
       res.json({ ok: true, id: rows[0].id });
     } catch (err) {
       console.error("billing account:", err);
@@ -430,10 +628,10 @@ module.exports = function installBilling(ctx) {
        d.party.address || null, from, to, issued, due, total, gstOf(total)]);
     const id = rows[0].id;
     const number = "SKY-" + issued.slice(0, 4) + "-" + String(id).padStart(4, "0");
-    await pool.query(`UPDATE ops_invoices SET number = $2 WHERE id = $1`, [id, number]);
+    await pool.query(`UPDATE ops_invoices SET number = $2, bill_phone = $3 WHERE id = $1`, [id, number, d.party.phone || null]);
     for (const l of lines) {
-      await pool.query(`INSERT INTO ops_invoice_lines (invoice_id, ref, service_date, description, amount_cents) VALUES ($1,$2,$3,$4,$5)`,
-        [id, l.ref, l.date, l.description, l.amountCents]);
+      await pool.query(`INSERT INTO ops_invoice_lines (invoice_id, ref, service_date, description, amount_cents, detail) VALUES ($1,$2,$3,$4,$5,$6)`,
+        [id, l.ref, l.date, l.description, l.amountCents, l.detail ? JSON.stringify(l.detail) : null]);
     }
     /* The race the draft check cannot see: two issues at the same moment.
        If any line is now on two live invoices, this one stands down. */
@@ -517,8 +715,10 @@ module.exports = function installBilling(ctx) {
                 (fresh.pfrom ? ` from ${nice(fresh.pfrom)} to ${nice(fresh.pto)}` : "") + `.\n\n` +
                 `Amount due: ${dollars(fresh.total_cents)} (GST inclusive), by ${nice(fresh.due)}.\n` +
                 (fresh.pay_link_url ? `\nPay by card: ${fresh.pay_link_url}\n` : "") +
-                (BANK ? `\nBank transfer:\n${BANK}\nPlease quote ${fresh.number}.\n` : "")) +
-        `\nAny questions, reply to this email or call ${SELLER.phone}.\n\nSky Transfers\n${SELLER.name}, ABN ${SELLER.abn}`,
+                (BANK_LINES.length ? `\nDirect bank deposit:\n${BANK_LINES.join("\n")}\nReference: ${fresh.number}\n` : "")) +
+        `\nAny questions, reply to this email or call ${SELLER.phone}.\n\nKind regards,\n${SELLER.contact}\nSky Transfers\n` +
+        `${SELLER.short}\nABN ${SELLER.abn}  ·  Operator accreditation OA ${SELLER.oa}${SELLER.bea ? "  ·  BEA " + SELLER.bea : ""}\n` +
+        `${SELLER.address}\n${SELLER.phone}  ·  ${SELLER.email}  ·  ${SELLER.web}`,
       attachments: [{ filename: fresh.number + ".pdf", content: pdf, contentType: "application/pdf" }],
     });
     await pool.query(`UPDATE ops_invoices SET sent_at = now(), sent_to = $2 WHERE id = $1`, [fresh.id, to]);
