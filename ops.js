@@ -167,8 +167,16 @@ module.exports = function installOps(ctx) {
       -- Phase 4 (la-import.js): the key that stops a Limo Anywhere row being
       -- imported twice.
       ALTER TABLE ops_jobs ADD COLUMN IF NOT EXISTS import_key TEXT;
+      -- Stops along the way on an account job: a JSON list of addresses.
+      ALTER TABLE ops_jobs ADD COLUMN IF NOT EXISTS stops TEXT;
       CREATE INDEX IF NOT EXISTS ops_jobs_import_key ON ops_jobs (import_key);
     `);
+    /* The board reads web_bookings.stops. agent-portal.js adds that column
+       too, but this must not depend on which module's setup ran first. A
+       separate statement, so a missing web_bookings table can't stop the
+       schema above. */
+    await pool.query(`ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS stops TEXT`)
+      .catch((e) => console.error("ops: web_bookings.stops:", e.message));
   }
 
   /* ---- reading every booking source as legs ------------------------------
@@ -179,7 +187,7 @@ module.exports = function installOps(ctx) {
     to_char(pickup_date, 'YYYY-MM-DD') AS d, pickup_time AS t,
     to_char(return_date, 'YYYY-MM-DD') AS rd, return_time AS rt, return_flight AS rf,
     hire_hours, passenger_name, passenger_phone, passenger_email, flight, address, notes,
-    pax, child_seats, trailer, total_cents, status, balance_cents`;
+    pax, child_seats, trailer, total_cents, status, balance_cents, stops`;
   const AGENT_COLS = `a.ref, a.pickup, a.dropoff, a.vehicle,
     to_char(a.pickup_date, 'YYYY-MM-DD') AS d, a.pickup_time AS t,
     a.passenger_name, a.passenger_phone, a.passenger_email, a.flight, a.address, a.notes,
@@ -188,7 +196,17 @@ module.exports = function installOps(ctx) {
     to_char(pickup_date, 'YYYY-MM-DD') AS d, pickup_time AS t,
     to_char(return_date, 'YYYY-MM-DD') AS rd, return_time AS rt, return_flight AS rf,
     hire_hours, passenger_name, passenger_phone, passenger_email, flight, address, notes,
-    pax, child_seats, trailer, price_cents, status, needs_review, source_note`;
+    pax, child_seats, trailer, price_cents, status, needs_review, source_note, stops`;
+
+  /* Stops are on the outbound journey only. A website booking stores
+     {list:[{address}]}; an account job a plain list of addresses. */
+  function stopList(v) {
+    try {
+      const j = v ? JSON.parse(v) : null;
+      const list = Array.isArray(j) ? j : j && Array.isArray(j.list) ? j.list : [];
+      return list.map((x) => (typeof x === "string" ? x : x && (x.address || x.suburb) || "")).filter(Boolean).slice(0, 3);
+    } catch (e) { return []; }
+  }
 
   function legsOf(r, source) {
     const total = source === "account" ? (r.price_cents || 0) : (r.total_cents || 0);
@@ -209,8 +227,8 @@ module.exports = function installOps(ctx) {
       isReturn: hasRet,
       needsReview: !!r.needs_review, sourceNote: r.source_note || "",
     };
-    const out = [{ ...base, leg: "out", date: r.d, time: r.t, from: r.pickup, to: r.dropoff, flight: r.flight || "" }];
-    if (hasRet) out.push({ ...base, leg: "ret", date: r.rd, time: r.rt, from: r.dropoff, to: r.pickup, flight: r.rf || "" });
+    const out = [{ ...base, leg: "out", date: r.d, time: r.t, from: r.pickup, to: r.dropoff, flight: r.flight || "", stops: stopList(r.stops) }];
+    if (hasRet) out.push({ ...base, stops: [], leg: "ret", date: r.rd, time: r.rt, from: r.dropoff, to: r.pickup, flight: r.rf || "" });
     return out;
   }
 
@@ -219,7 +237,7 @@ module.exports = function installOps(ctx) {
     const byRef = Array.isArray(refs);
     if (byRef && !refs.length) return [];
     const web = await pool.query(
-      `SELECT ${WEB_COLS} FROM web_bookings WHERE status <> 'declined' AND ` +
+      `SELECT ${WEB_COLS} FROM web_bookings WHERE status NOT IN ('declined', 'cancelled') AND ` +
       (byRef ? `ref IN (${inList(refs.length)})` : `((pickup_date >= $1 AND pickup_date <= $2) OR (return_date >= $1 AND return_date <= $2))`),
       byRef ? refs : [from, to]);
     const agent = await pool.query(
@@ -562,6 +580,8 @@ module.exports = function installOps(ctx) {
         flight: txt(b.flight, 40) || null, address: txt(b.address, 300) || null, notes: txt(b.notes, 1000) || null,
         pax: int(b.pax, 1, 60, 1), seats: int(b.childSeats, 0, 6, 0), trailer: b.trailer === true || b.trailer === "true",
         price: cents(b.price),
+        stops: (Array.isArray(b.stops) ? b.stops : String(b.stops || "").split(/\r?\n/))
+          .map((x) => txt(x, 200)).filter((x) => x.length >= 3).slice(0, 3),
       };
       const missing = [["pickup", j.pickup], ["drop-off", j.dropoff || (j.hours ? "As directed" : "")], ["date", j.date], ["time", j.time]]
         .filter((x) => !x[1]).map((x) => x[0]);
@@ -585,6 +605,7 @@ module.exports = function installOps(ctx) {
         if (!r.rowCount) return res.status(404).json({ error: "No such account job." });
         /* A return that has been taken away leaves no leg to drive. */
         if (!j.returnDate) await pool.query(`DELETE FROM ops_dispatch WHERE ref = $1 AND leg = 'ret'`, [editRef]);
+        await pool.query(`UPDATE ops_jobs SET stops = $2 WHERE ref = $1`, [editRef, j.stops.length ? JSON.stringify(j.stops) : null]);
         console.log("ops job updated:", editRef);
         return res.json({ ok: true, ref: editRef });
       }
@@ -600,6 +621,7 @@ module.exports = function installOps(ctx) {
         if (r.rowCount) ref = tryRef;
       }
       if (!ref) return res.status(500).json({ error: "Could not make a reference - try again." });
+      if (j.stops.length) await pool.query(`UPDATE ops_jobs SET stops = $2 WHERE ref = $1`, [ref, JSON.stringify(j.stops)]);
       console.log("ops job created:", ref, j.account || "-", j.date, j.time);
       res.json({ ok: true, ref });
     } catch (err) {
@@ -657,7 +679,7 @@ module.exports = function installOps(ctx) {
           ref: l.ref, leg: l.leg, isReturn: l.isReturn, date: l.date, time: l.time, from: l.from, to: l.to,
           flight: l.flight, hours: l.hours, guest: l.guest, phone: l.phone, pax: l.pax,
           childSeats: l.childSeats, trailer: l.trailer, address: l.address, notes: l.notes,
-          vehicleClass: l.vehicleClass, vehicleLabel: l.vehicleLabel, officeNote: l.officeNote,
+          vehicleClass: l.vehicleClass, vehicleLabel: l.vehicleLabel, officeNote: l.officeNote, stops: l.stops || [],
           account: l.source === "web" ? null : l.account, pay: l.driverPay, status: l.status,
         })),
       });

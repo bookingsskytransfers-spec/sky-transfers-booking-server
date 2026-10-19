@@ -125,5 +125,5 @@ module.exports = function installKm(ctx) {
   }
 
   console.log("km fares: quote endpoint ready (to " + MAX_KM + " km)" + (roads.enabled ? "" : " (distance OFF - set GOOGLE_ROUTES_KEY)"));
-  return { on: true, fareFor };
+  return { on: true, fareFor, hubAddress: HUB_ADDRESS };
 };
