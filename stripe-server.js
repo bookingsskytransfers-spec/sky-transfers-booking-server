@@ -61,6 +61,20 @@ const mailer = process.env.GMAIL_USER
       auth: { user: process.env.GMAIL_USER, pass: process.env.GMAIL_APP_PASSWORD },
     })
   : null;
+/* Sign in to Gmail once at start-up and say so in the log - nothing is sent.
+   Every booking email depends on this connection, so a library upgrade or a
+   revoked app password shows up in the deploy log, not in a lost booking. */
+if (mailer && typeof mailer.verify === "function" && !process.env.SKIP_MAIL_VERIFY) {
+  /* A check, never a crash: anything odd here is logged and start-up goes on. */
+  try {
+    const check = mailer.verify();
+    if (check && typeof check.then === "function") {
+      check
+        .then(() => console.log("mail: Gmail sign-in OK (nodemailer " + require("nodemailer/package.json").version + ")"))
+        .catch((e) => console.error("mail: Gmail sign-in FAILED - booking emails will not send:", (e && e.code) || "", (e && e.message) || e));
+    }
+  } catch (e) { console.error("mail: could not run the Gmail sign-in check:", e && e.message); }
+}
 const BOOKINGS_EMAIL = process.env.BOOKINGS_EMAIL || "info@skytransfers.com.au";
 /* Filled in at the bottom of this file, where the agent portal is installed.
    The routes below run long after that, so reading it at request time is safe;
