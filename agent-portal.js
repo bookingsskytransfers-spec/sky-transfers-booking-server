@@ -1032,15 +1032,60 @@ module.exports = function installAgentPortal(ctx) {
   }
   const cleanRole = (r) => (r === "manager" ? "manager" : r === "staff" ? "staff" : null);
 
+  /* The same team rules for the agency's own "Your team" card and for the
+     office in admin.html: one place decides what a valid login is. */
+  async function listTeam(code) {
+    const { rows } = await pool.query(
+      `SELECT u.id, u.name, u.email, u.role, u.active, u.created_at, u.last_login_at, COUNT(b.ref) AS bookings
+         FROM agent_users u LEFT JOIN agent_bookings b ON b.booked_by_id = u.id
+        WHERE u.agent_code = $1
+        GROUP BY u.id, u.name, u.email, u.role, u.active, u.created_at, u.last_login_at
+        ORDER BY u.active DESC, u.name`, [code]);
+    return rows.map(userRow);
+  }
+  const activeCount = async (code) =>
+    Number((await pool.query("SELECT COUNT(*) AS n FROM agent_users WHERE agent_code = $1 AND active", [code])).rows[0].n);
+  async function addStaff(code, body) {
+    const name = String(body?.name || "").trim().replace(/\s+/g, " ").slice(0, 80);
+    const email = String(body?.email || "").trim().slice(0, 120);
+    const role = cleanRole(body?.role);
+    if (name.length < 2) return { error: "Enter the person's name." };
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return { error: "That email doesn't look right." };
+    if (!role) return { error: "Choose what they can see: bookings only, or everything." };
+    if (await activeCount(code) >= TEAM_MAX) return { error: `There are ${TEAM_MAX} logins already — switch one off first.` };
+    const pin = await freshStaffPin(code);
+    const { rows } = await pool.query(
+      `INSERT INTO agent_users (agent_code, name, email, pin_hash, role) VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, name, email, role, active, created_at, last_login_at`,
+      [code, name, email || null, makePinHash(pin), role]);
+    return { user: userRow(rows[0]), pin, name, email, role };
+  }
+  async function staffOf(code, id) {
+    const { rows } = await pool.query("SELECT * FROM agent_users WHERE id = $1 AND agent_code = $2", [parseInt(id, 10) || 0, code]);
+    return rows[0] || null;
+  }
+  async function updateStaff(code, u, body) {
+    const role = body?.role != null ? cleanRole(body.role) : (u.role === "manager" ? "manager" : "staff");
+    if (!role) return { error: "Choose bookings only, or everything." };
+    const active = body?.active != null ? body.active === true || body.active === "true" : u.active;
+    if (active && !u.active && await activeCount(code) >= TEAM_MAX) return { error: `There are ${TEAM_MAX} logins already — switch one off first.` };
+    /* switching a login back on gives it a new PIN: the old one may have
+       been reused by someone else since */
+    const pin = active && !u.active ? await freshStaffPin(code) : null;
+    await pool.query(
+      `UPDATE agent_users SET role = $2, active = $3${pin ? ", pin_hash = $4, pin_ver = pin_ver + 1" : ""} WHERE id = $1`,
+      pin ? [u.id, role, active, makePinHash(pin)] : [u.id, role, active]);
+    return { pin };
+  }
+  async function resetStaffPin(code, u) {
+    const pin = await freshStaffPin(code);
+    await pool.query("UPDATE agent_users SET pin_hash = $2, pin_ver = pin_ver + 1 WHERE id = $1", [u.id, makePinHash(pin)]);
+    return pin;
+  }
+
   app.get("/agent/team", requireManager, async (req, res) => {
     try {
-      const { rows } = await pool.query(
-        `SELECT u.id, u.name, u.email, u.role, u.active, u.created_at, u.last_login_at, COUNT(b.ref) AS bookings
-           FROM agent_users u LEFT JOIN agent_bookings b ON b.booked_by_id = u.id
-          WHERE u.agent_code = $1
-          GROUP BY u.id, u.name, u.email, u.role, u.active, u.created_at, u.last_login_at
-          ORDER BY u.active DESC, u.name`, [req.agent.code]);
-      res.json({ you: req.user.id, max: TEAM_MAX, team: rows.map(userRow) });
+      res.json({ you: req.user.id, max: TEAM_MAX, team: await listTeam(req.agent.code) });
     } catch (err) {
       console.error("agent team:", err);
       res.status(500).json({ error: "Could not load your team just now." });
@@ -1049,53 +1094,25 @@ module.exports = function installAgentPortal(ctx) {
 
   app.post("/agent/team/add", requireManager, async (req, res) => {
     try {
-      const name = String(req.body?.name || "").trim().replace(/\s+/g, " ").slice(0, 80);
-      const email = String(req.body?.email || "").trim().slice(0, 120);
-      const role = cleanRole(req.body?.role);
-      if (name.length < 2) return res.status(400).json({ error: "Enter the person's name." });
-      if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: "That email doesn't look right." });
-      if (!role) return res.status(400).json({ error: "Choose what they can see: bookings only, or everything." });
-      const { rows: n } = await pool.query("SELECT COUNT(*) AS n FROM agent_users WHERE agent_code = $1 AND active", [req.agent.code]);
-      if (Number(n[0].n) >= TEAM_MAX) return res.status(400).json({ error: `You have ${TEAM_MAX} logins already — switch one off first, or call us.` });
-      const pin = await freshStaffPin(req.agent.code);
-      const { rows } = await pool.query(
-        `INSERT INTO agent_users (agent_code, name, email, pin_hash, role) VALUES ($1, $2, $3, $4, $5)
-         RETURNING id, name, email, role, active, created_at, last_login_at`,
-        [req.agent.code, name, email || null, makePinHash(pin), role]);
-      notifyOffice(`AGENT TEAM (${req.agent.code}): ${name} added`,
-        `${whoDid(req)} added a login for ${name}${email ? " (" + email + ")" : ""}: ${role === "manager" ? "manager - everything" : "bookings only"}.\n`, req.agent);
-      res.json({ ok: true, user: userRow(rows[0]), pin });
+      const r = await addStaff(req.agent.code, req.body);
+      if (r.error) return res.status(400).json({ error: r.error });
+      notifyOffice(`AGENT TEAM (${req.agent.code}): ${r.name} added`,
+        `${whoDid(req)} added a login for ${r.name}${r.email ? " (" + r.email + ")" : ""}: ${r.role === "manager" ? "manager - everything" : "bookings only"}.\n`, req.agent);
+      res.json({ ok: true, user: r.user, pin: r.pin });
     } catch (err) {
       console.error("agent team add:", err);
       res.status(500).json({ error: "Could not add that login just now." });
     }
   });
 
-  async function ownUser(req, id) {
-    const { rows } = await pool.query("SELECT * FROM agent_users WHERE id = $1 AND agent_code = $2", [parseInt(id, 10) || 0, req.agent.code]);
-    return rows[0] || null;
-  }
-
   app.post("/agent/team/update", requireManager, async (req, res) => {
     try {
-      const u = await ownUser(req, req.body?.id);
+      const u = await staffOf(req.agent.code, req.body?.id);
       if (!u) return res.status(404).json({ error: "We can't find that login." });
       if (req.user.id && u.id === req.user.id) return res.status(400).json({ error: "You can't change your own login — ask your agency's main login or another manager." });
-      const role = req.body?.role != null ? cleanRole(req.body.role) : (u.role === "manager" ? "manager" : "staff");
-      if (!role) return res.status(400).json({ error: "Choose bookings only, or everything." });
-      const active = req.body?.active != null ? req.body.active === true || req.body.active === "true" : u.active;
-      if (active && !u.active) {
-        const { rows: n } = await pool.query("SELECT COUNT(*) AS n FROM agent_users WHERE agent_code = $1 AND active", [req.agent.code]);
-        if (Number(n[0].n) >= TEAM_MAX) return res.status(400).json({ error: `You have ${TEAM_MAX} logins already — switch one off first.` });
-      }
-      /* switching a login back on gives it a new PIN: the old one may have
-         been reused by someone else since */
-      let pin = null;
-      if (active && !u.active) pin = await freshStaffPin(req.agent.code);
-      await pool.query(
-        `UPDATE agent_users SET role = $2, active = $3${pin ? ", pin_hash = $4, pin_ver = pin_ver + 1" : ""} WHERE id = $1`,
-        pin ? [u.id, role, active, makePinHash(pin)] : [u.id, role, active]);
-      res.json({ ok: true, pin });
+      const r = await updateStaff(req.agent.code, u, req.body);
+      if (r.error) return res.status(400).json({ error: r.error });
+      res.json({ ok: true, pin: r.pin });
     } catch (err) {
       console.error("agent team update:", err);
       res.status(500).json({ error: "Could not save that just now." });
@@ -1104,14 +1121,68 @@ module.exports = function installAgentPortal(ctx) {
 
   app.post("/agent/team/pin", requireManager, async (req, res) => {
     try {
-      const u = await ownUser(req, req.body?.id);
+      const u = await staffOf(req.agent.code, req.body?.id);
       if (!u || !u.active) return res.status(404).json({ error: "We can't find that login, or it is switched off." });
-      const pin = await freshStaffPin(req.agent.code);
-      await pool.query("UPDATE agent_users SET pin_hash = $2, pin_ver = pin_ver + 1 WHERE id = $1", [u.id, makePinHash(pin)]);
-      res.json({ ok: true, pin });
+      res.json({ ok: true, pin: await resetStaffPin(req.agent.code, u) });
     } catch (err) {
       console.error("agent team pin:", err);
       res.status(500).json({ error: "Could not reset that PIN just now." });
+    }
+  });
+
+  /* ---- the office's view of an agency's staff (admin.html) -------------
+     The same actions the agency has, for when the main login is away or a
+     staff member leaves on bad terms: see who has a login, switch one off,
+     change what they see, issue a new PIN or add someone. A PIN issued here
+     is shown once to the office, which passes it on. */
+  const adminCode = (v) => String(v || "").trim().toUpperCase();
+  async function agentExists(code) {
+    return (await pool.query("SELECT code FROM agents WHERE code = $1", [code])).rows.length > 0;
+  }
+  app.get("/admin/agent/staff", requireAdmin, async (req, res) => {
+    try {
+      const code = adminCode(req.query.code);
+      if (!await agentExists(code)) return res.status(404).json({ error: "No such agent." });
+      res.json({ code, max: TEAM_MAX, team: await listTeam(code) });
+    } catch (err) {
+      console.error("admin staff:", err);
+      res.status(500).json({ error: "Could not load that agency's staff." });
+    }
+  });
+  app.post("/admin/agent/staff/add", requireAdmin, async (req, res) => {
+    try {
+      const code = adminCode(req.body?.code);
+      if (!await agentExists(code)) return res.status(404).json({ error: "No such agent." });
+      const r = await addStaff(code, req.body);
+      if (r.error) return res.status(400).json({ error: r.error });
+      res.json({ ok: true, user: r.user, pin: r.pin });
+    } catch (err) {
+      console.error("admin staff add:", err);
+      res.status(500).json({ error: "Could not add that login." });
+    }
+  });
+  app.post("/admin/agent/staff/update", requireAdmin, async (req, res) => {
+    try {
+      const code = adminCode(req.body?.code);
+      const u = await staffOf(code, req.body?.id);
+      if (!u) return res.status(404).json({ error: "We can't find that login." });
+      const r = await updateStaff(code, u, req.body);
+      if (r.error) return res.status(400).json({ error: r.error });
+      res.json({ ok: true, pin: r.pin });
+    } catch (err) {
+      console.error("admin staff update:", err);
+      res.status(500).json({ error: "Could not save that." });
+    }
+  });
+  app.post("/admin/agent/staff/pin", requireAdmin, async (req, res) => {
+    try {
+      const code = adminCode(req.body?.code);
+      const u = await staffOf(code, req.body?.id);
+      if (!u || !u.active) return res.status(404).json({ error: "We can't find that login, or it is switched off." });
+      res.json({ ok: true, pin: await resetStaffPin(code, u) });
+    } catch (err) {
+      console.error("admin staff pin:", err);
+      res.status(500).json({ error: "Could not reset that PIN." });
     }
   });
 
@@ -1213,10 +1284,16 @@ module.exports = function installAgentPortal(ctx) {
           LEFT JOIN agent_bookings b ON b.agent_code = a.code
          GROUP BY a.code
          ORDER BY a.name`);
+      /* staff logins per agency, counted apart so the bookings join above
+         isn't multiplied by them */
+      const staff = {};
+      (await pool.query("SELECT agent_code, COUNT(*) AS n FROM agent_users WHERE active GROUP BY agent_code")).rows
+        .forEach((s) => { staff[s.agent_code] = Number(s.n); });
       res.json({
         agents: rows.map((r) => ({
           code: r.code, name: r.name, email: r.email,
           commissionPct: Number(r.commission_pct), active: r.active,
+          staff: staff[r.code] || 0,
           trips: Number(r.trips),
           gross: Number(r.gross_cents) / 100,
           earned: Number(r.earned_cents) / 100,
