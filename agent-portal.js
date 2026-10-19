@@ -514,8 +514,10 @@ module.exports = function installAgentPortal(ctx) {
       notifyOffice(
         `AGENT booking (${req.agent.code}): ${b.pickup} -> ${b.dropoff} (${b.date} ${b.time}) [${b.ref}]`,
         `AGENT BOOKING — ${req.agent.name} (${req.agent.code})\n` + (p.clientRef ? `Agent reference: ${p.clientRef}\n` : "") + `\n${p.summary.text}\n\n` +
-        `Agent commission: ${pct}% = ${money(p.commissionCents)}\n` +
-        `Net to invoice the agent: ${money(p.totalCents - p.commissionCents)}\n`,
+        /* Agencies are invoiced the FULL fare; commission sits in their wallet
+           and is paid out separately (Aman, 19 Oct 2026). */
+        `Invoice the agent the full fare: ${money(p.totalCents)}\n` +
+        `Agent commission: ${pct}% = ${money(p.commissionCents)}, to their wallet - paid out separately\n`,
         req.agent
       );
       if (mailer && req.agent.email) {
@@ -527,8 +529,8 @@ module.exports = function installAgentPortal(ctx) {
           text:
             `Hi ${req.agent.name},\n\nYour booking is in and we'll confirm the chauffeur shortly.\n\n` +
             (p.clientRef ? `Your reference: ${p.clientRef}\n` : "") + `${p.summary.text}\n\n` +
-            `Your commission on this booking: ${money(p.commissionCents)} (${pct}%)\n` +
-            `This booking will appear on your monthly invoice at ${money(p.totalCents - p.commissionCents)}.\n\n` +
+            `Your commission on this booking: ${money(p.commissionCents)} (${pct}%), added to your wallet and paid out to you separately.\n` +
+            `This booking will appear on your monthly invoice at the full fare, ${money(p.totalCents)}.\n\n` +
             `You can download a passenger voucher, change or cancel this booking in the portal up to ` +
             `${CHANGE_CUTOFF_HOURS} hours before pick-up.\n\nSky Transfers`,
         }).catch((e) => console.error("agent copy email:", e.message));
@@ -613,8 +615,8 @@ module.exports = function installAgentPortal(ctx) {
         `WAS: ${old.pickup} -> ${old.dropoff}, ${old.vehicle}, ${wasDate} ${old.pickup_time}, ` +
         `${old.passenger_name}, total ${money(old.total_cents)}\n\n` +
         `NOW:\n${p.summary.text}\n\n` +
-        `Commission now: ${pct}% = ${money(p.commissionCents)} (was ${money(old.commission_cents)})\n` +
-        `Net to invoice: ${money(p.totalCents - p.commissionCents)}\n`,
+        `Invoice the agent the full fare: ${money(p.totalCents)} (was ${money(old.total_cents)})\n` +
+        `Commission now: ${pct}% = ${money(p.commissionCents)} (was ${money(old.commission_cents)}), to their wallet - paid out separately\n`,
         req.agent
       );
       res.json({ ok: true, ref: old.ref, total: p.summary.total, commission: p.commissionCents / 100 });
@@ -2115,5 +2117,5 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
      is handed out so other modules can sit behind the same admin login rather
      than growing a second path that accepts the PIN. */
   /* pool goes to ops.js (the dispatch board), which reads these same tables. */
-  return { saveWebBooking, actionLinks, findOpenWebBooking, requireAdmin, getWebBooking, rowToBooking, summaryForRow, settleBalance, pool, setTripStatus };
+  return { saveWebBooking, actionLinks, findOpenWebBooking, requireAdmin, getWebBooking, rowToBooking, summaryForRow, settleBalance, pool, setTripStatus, requireAgent };
 };
