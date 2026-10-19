@@ -258,5 +258,40 @@ module.exports = function installGuestUpdates(ctx) {
     setInterval(() => tick(), 5 * 60e3).unref();
   }
   console.log("Guest updates ready (" + (wa.enabled ? "email + WhatsApp" : "email; WhatsApp not connected") + "; off until switched on)");
-  return { on: true, tick, noticePass, token, fromToken, compose };
+  /* ---- trip status for the agent portal ---------------------------------------
+     The same facts, by the same rule, as the tracking page: the driver is named
+     only once the office has sent them the job. Plus the tracking link itself,
+     while it still works, so the agent can pass it to their client. Takes
+     [{ref, date, returnDate}] and returns { ref: [{leg, step, label, driver, car, trackUrl}] }. */
+  const AGENT_WORDS = { booked: "Booked", confirmed: "Driver confirmed", on_way: "On the way", arrived: "Driver has arrived",
+                        on_board: "Passenger on board", done: "Completed" };
+  async function tripStatus(bookings) {
+    const list = (bookings || []).filter((b) => b && b.ref && b.date);
+    if (!list.length) return {};
+    const refs = list.map((b) => String(b.ref));
+    const rows = (await pool.query(
+      `SELECT d.ref, d.leg, d.status, d.sent_at, d.driver_id, r.name AS driver_name, v.label AS vehicle_label
+         FROM ops_dispatch d LEFT JOIN ops_drivers r ON r.id = d.driver_id LEFT JOIN ops_vehicles v ON v.id = d.vehicle_id
+        WHERE d.ref IN (${refs.map((_, i) => "$" + (i + 1)).join(", ")})`, refs)).rows;
+    const out = {};
+    for (const b of list) {
+      const legs = [{ leg: "out", date: b.date }].concat(b.returnDate ? [{ leg: "ret", date: b.returnDate }] : []);
+      out[b.ref] = legs.map((g) => {
+        const d = rows.find((x) => x.ref === b.ref && x.leg === g.leg) || null;
+        const status = d ? d.status : "unassigned";
+        const told = !!(d && d.driver_id && (d.sent_at || ["accepted", "on_way", "on_location", "pob", "done"].includes(status)));
+        const step = told ? (WORDS[status] || WORDS.assigned)[0] : "booked";
+        /* the link is good to three days after that leg's pick-up */
+        const live = Date.parse(g.date + "T00:00:00Z") + 4 * 864e5 - 10 * 3600e3 > nowMs();
+        return {
+          leg: g.leg, step, label: AGENT_WORDS[step] || "Booked",
+          driver: told ? first(d.driver_name) : null, car: told ? (d.vehicle_label || null) : null,
+          trackUrl: live ? trackUrl({ ref: b.ref, leg: g.leg, date: g.date }) : null,
+        };
+      });
+    }
+    return out;
+  }
+
+  return { on: true, tick, noticePass, token, fromToken, compose, tripStatus };
 };

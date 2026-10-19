@@ -1280,10 +1280,13 @@ try {
    and later WhatsApp, plus the track-your-driver page's data. Off until
    switched on in the Autopilot tab. Wrapped like everything above. */
 try {
-  require("./guest-updates")({
+  const guest = require("./guest-updates")({
     app, pool: portal && portal.pool, requireAdmin: portal && portal.requireAdmin,
     ops, autopilot, mailer, BOOKINGS_EMAIL, HUBS: [OOL, BNE, CRUISE],
   });
+  /* The agent portal shows each booking's trip status and tracking link -
+     the same facts as the guest's own tracking page. */
+  if (guest && guest.on && portal && typeof portal.setTripStatus === "function") portal.setTripStatus(guest.tripStatus);
 } catch (err) {
   console.error("Guest updates not mounted (bookings unaffected):", err.message);
 }
