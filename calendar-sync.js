@@ -212,10 +212,18 @@ module.exports = function calendarSync(ctx) {
     const priceTxt = first(L.price, (v) => /\d/.test(v)) || (/\(\s*\$\s?([\d,]+(?:\.\d{1,2})?)\s*\)/.exec(s) || [])[1] || "";
     const pm = /([\d,]+(?:\.\d{1,2})?)/.exec(String(priceTxt).replace(/^[^\d]*/, ""));
     j.priceCents = pm ? Math.round(+pm[1].replace(/,/g, "") * 100) : null;
+    /* "$895.50 per run", even inside "($895.50 per run)" after a total, is
+       the price of this one */
+    const per = /\$\s?([\d,]+(?:\.\d{1,2})?)\s*(?:aud\s*)?(?:per|a|each)\s+(run|trip|day|leg|transfer|way|movement)\b/i.exec(String(priceTxt));
+    const MANY = /\b(runs|trips|legs|days|nights|transfers|movements|assignment)\b/i;
     if (j.priceCents == null) checks.push("no price");
-    /* "$10,746 total for 12 runs" is a total; "$895.50 ($7,164 total for 8
-       runs)" is the price of one, with the total in brackets */
-    else if (/\btotal\b|\bruns?\b|\btrips\b/i.test(String(priceTxt).split("(")[0])) checks.push("the price may be a total for several trips - check it's this one's");
+    else if (per) {
+      const one = Math.round(+per[1].replace(/,/g, "") * 100);
+      if (one !== j.priceCents) checks.push(`the calendar gives a total and $${(one / 100).toFixed(2)} per ${per[2].toLowerCase()} - the per-${per[2].toLowerCase()} price is used`);
+      j.priceCents = one;
+    } else if (/\btotal\b/i.test(String(priceTxt).split("(")[0]) && MANY.test(String(priceTxt))) {
+      checks.push("the price may be a total for several trips - check it's this one's");
+    }
     const fl = first(L.flight) || (/\(([A-Z0-9]{2})-?\s?(\d{1,4})\b[^)]*\)/.exec(s) || []).slice(1, 3).join("");
     j.flight = (/\b([A-Z0-9]{2})-?\s?(\d{1,4})\b/.exec(String(fl).toUpperCase()) || []).slice(1, 3).join("") || null;
     const seatM = /(\d+)\s*x?\s*(baby|child|booster|infant)\s*seats?/i.exec(d) || /(baby|child|booster)\s*seats?\s*:?\s*(\d+)/i.exec(d);
