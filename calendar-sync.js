@@ -450,9 +450,49 @@ module.exports = function calendarSync(ctx) {
     rows.sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time));
     return { events: all.length, rows };
   }
+  /* Read the calendar's jobs again with the current reading, for jobs that
+     nobody has touched since they were put on the board: never saved by the
+     office, never flagged for a change, no driver or dispatch row. Each is
+     updated in place - same reference - so nothing is lost or doubled. */
+  async function reread() {
+    const r0 = ready();
+    if (!r0.ok) return { skipped: r0.why };
+    const byUid = new Map(parseIcs(await fetchIcs()).map((e) => [e.uid, e]));
+    const known = await knownAccounts();
+    const rows = (await pool.query(
+      `SELECT c.uid, c.ref FROM ops_cal c JOIN ops_jobs j ON j.ref = c.ref
+        WHERE c.status = 'created' AND c.pending IS NULL AND c.removed_at IS NULL AND j.updated_at IS NULL AND j.status <> 'cancelled'`)).rows;
+    let updated = 0, left = 0;
+    for (const r of rows) {
+      const ev = byUid.get(r.uid);
+      const busy = (await pool.query(`SELECT 1 FROM ops_dispatch WHERE ref = $1`, [r.ref])).rows.length > 0;
+      if (!ev || busy || ev.start.allDay) { left++; continue; }
+      const m = mapEvent(ev, known), j = m.job;
+      if (!j.pickup || !j.dropoff) { left++; continue; }
+      const title = ev.summary.slice(0, 90) || "(no title)";
+      if (j.stRef) m.checks.unshift(`the event names ${j.stRef}, which isn't in the system`);
+      if (j.web) m.checks.unshift("marked WEB in the calendar but no matching website booking was found");
+      const note = `From the Google Calendar: "${title}".` + (m.checks.length ? " Check: " + m.checks.join("; ") + "." : "") +
+        (ev.description ? "\n\n" + ev.description.slice(0, 1500) : "");
+      await pool.query(
+        `UPDATE ops_jobs SET account = $2, account_ref = $3, pickup = $4, dropoff = $5, vehicle = $6, pickup_date = $7, pickup_time = $8,
+           hire_hours = $9, passenger_name = $10, passenger_phone = $11, passenger_email = $12, flight = $13, pax = $14, child_seats = $15,
+           trailer = $16, price_cents = $17, needs_review = $18, source_note = $19
+         WHERE ref = $1 AND updated_at IS NULL`,
+        [r.ref, j.account, j.accountRef, j.pickup, j.dropoff, j.vehicle || "", j.date, j.time, j.hours, j.name || "", j.phone || "", j.email,
+         j.flight, j.pax, j.childSeats, j.trailer, j.priceCents || 0, m.checks.length > 0, note]);
+      await pool.query(`UPDATE ops_cal SET fields = $2 WHERE uid = $1`, [r.uid, JSON.stringify(pickFields(j))]);
+      updated++;
+    }
+    await logEvent("calendar", `Re-read ${updated} calendar job${updated === 1 ? "" : "s"} nobody had touched` + (left ? `; ${left} left as they were` : "") + ".");
+    return { updated, left };
+  }
   if (app && requireAdmin) {
     app.get("/ops/cal/preview", requireAdmin, async (req, res) => {
       try { res.json(await preview()); } catch (err) { console.error("cal preview:", err); res.status(500).json({ error: "Could not read the calendar: " + (err.message || err) }); }
+    });
+    app.post("/ops/cal/reread", requireAdmin, async (req, res) => {
+      try { res.json(await reread()); } catch (err) { console.error("cal reread:", err); res.status(500).json({ error: "Could not re-read the calendar: " + (err.message || err) }); }
     });
   }
 
@@ -498,5 +538,5 @@ module.exports = function calendarSync(ctx) {
     });
   }
 
-  return { ready, initSchema, pass, preview, parseIcs, mapEvent, pendingFor };
+  return { ready, initSchema, pass, preview, reread, parseIcs, mapEvent, pendingFor };
 };
