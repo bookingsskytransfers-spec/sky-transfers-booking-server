@@ -125,6 +125,8 @@ module.exports = function installAutopilot(ctx) {
     invoicesOn: false, invoiceAt: "07:00",
     digestOn: false, digestAt: "06:30",
     intakeOn: false, intakeSince: null,
+    /* the Google Calendar -> the board (calendar-sync.js) */
+    calOn: false,
     alertTo: "",
     /* Phase 3, guest-updates.js: emails (and later WhatsApp) to the guest -
        driver assigned the evening before, on the way, arrived. */
@@ -139,7 +141,7 @@ module.exports = function installAutopilot(ctx) {
     const cur = await getSettings();
     const b = patch || {}, next = Object.assign({}, cur);
     const bool = (k) => { if (k in b) next[k] = b[k] === true || b[k] === "true"; };
-    ["dispatchOn", "closeOn", "autoCloseStarted", "invoicesOn", "digestOn", "intakeOn",
+    ["dispatchOn", "closeOn", "autoCloseStarted", "invoicesOn", "digestOn", "intakeOn", "calOn",
      "guestOn", "guestAgentAccount", "guestWhatsApp"].forEach(bool);
     for (const k of ["dispatchAt", "invoiceAt", "digestAt", "guestNoticeAt"]) if (k in b) { const t = hhmm(b[k]); if (!t) throw { code: 400, message: "Times are 24-hour, like 18:00." }; next[k] = t; }
     if ("closeAfterHours" in b) {
@@ -190,6 +192,9 @@ module.exports = function installAutopilot(ctx) {
     });
     return true;
   }
+
+  /* The Google Calendar, read on every pass when it is switched on. */
+  const cal = require("./calendar-sync")({ app, pool, requireAdmin, makeRef, VEHICLES, logEvent, alert, nowMs, BOARD, fetchIcs: ctx.fetchIcs });
 
   /* ---- choosing a driver ---------------------------------------------------------
      Eligible: active, has not turned this leg down, licence and driver
@@ -653,6 +658,8 @@ module.exports = function installAutopilot(ctx) {
         try { ran[name] = await fn(); } catch (e) { ran[name] = { error: e.message || String(e) }; await logEvent("error", `${name}: ${e.message || e}`); }
       };
       await step("intake", s.intakeOn, () => intakePass(s));
+      /* before dispatch, so a job that has just arrived can be given a driver */
+      await step("calendar", s.calOn, () => cal.pass(s));
       await step("dispatch", s.dispatchOn, () => dispatchPass(s));
       await step("close", s.closeOn, () => closePass(s));
       await step("invoices", s.invoicesOn, () => invoicePass(s));
@@ -686,7 +693,7 @@ module.exports = function installAutopilot(ctx) {
         .concat(agents.map((g) => ({ type: "agent", key: g.code, name: g.name, email: g.email, schedule: sOf("agent", g.code) })));
       const events = (await pool.query(`SELECT id, at, kind, ref, leg, message FROM ops_events ORDER BY id DESC LIMIT 100`)).rows;
       const n = bne();
-      res.json({ settings: s, parties, events, now: { date: n.date, time: n.hm }, intake: intakeReady(), mailer: !!mailer,
+      res.json({ settings: s, parties, events, now: { date: n.date, time: n.hm }, intake: intakeReady(), calendar: cal.ready(), mailer: !!mailer,
         alertDefault: BOOKINGS_EMAIL });
     } catch (err) { fail(res, err, "load the autopilot"); }
   });
@@ -725,7 +732,8 @@ module.exports = function installAutopilot(ctx) {
       const what = String((req.body || {}).what || "");
       const s = await getSettings();
       const fns = { dispatch: () => dispatchPass(s, { force: true }), close: () => closePass(s), invoices: () => invoicePass(s, { force: true }),
-                    digest: () => digestPass(s, { force: true }), intake: () => intakePass(s, { force: true }) };
+                    digest: () => digestPass(s, { force: true }), intake: () => intakePass(s, { force: true }),
+                    calendar: () => cal.pass(s, { force: true }) };
       if (!fns[what]) throw { code: 400, message: "Unknown job." };
       const r = await fns[what]();
       await logEvent("run", `"${what}" run from the office.`);
@@ -803,6 +811,7 @@ button{margin-top:12px;font:inherit;font-weight:700;background:#141D30;color:#ff
 
   let timer = null;
   initSchema()
+    .then(() => cal.initSchema())
     .then(() => {
       console.log("Autopilot ready (checks every 5 minutes; each job is off until switched on)");
       if (!ctx.noTimer) {
@@ -814,5 +823,5 @@ button{margin-top:12px;font:inherit;font-weight:700;background:#141D30;color:#ff
     .catch((e) => console.error("Autopilot setup failed:", e.message));
 
   return { on: true, tick, dispatchPass, closePass, invoicePass, digestPass, intakePass, getSettings, saveSettings,
-           pickDriver, periodFor, approveToken, approvedId, initSchema, stop: () => timer && clearInterval(timer) };
+           pickDriver, periodFor, approveToken, approvedId, initSchema, cal, stop: () => timer && clearInterval(timer) };
 };
