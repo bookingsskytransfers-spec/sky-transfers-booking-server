@@ -301,292 +301,381 @@ function extrasLabel(b) {
   return [b.childSeats > 0 ? `${b.childSeats} child seat${b.childSeats > 1 ? "s" : ""}` : "", b.trailer ? "Luggage trailer" : ""].filter(Boolean).join(", ") || "None";
 }
 
-// ---- Printable PDF confirmation (A4, Midnight & Champagne) ----
+// ---- The two street addresses --------------------------------------------
+/* From 20 Oct 2026 the booking forms ask for a pick-up address and a drop-off
+   address separately (pickupAddress / dropoffAddress). Older pages, stored
+   rows and payment links only have `address`: the street address of
+   whichever end is not an airport, or both run together on a point-to-point
+   trip. `address` is still sent and still printed in the dispatch text, so
+   that text keeps its shape for the automation that reads it. */
+const isHubPlace = (p) => p === OOL || p === BNE || p === CRUISE;
+const cleanAddr = (v) => String(v == null ? "" : v).replace(/\s+/g, " ").trim().slice(0, 300);
+function tripAddresses(b) {
+  let pu = cleanAddr(b && b.pickupAddress), dro = cleanAddr(b && b.dropoffAddress);
+  const legacy = cleanAddr(b && b.address);
+  if (!pu && !dro && legacy) {
+    if (hourlyHours(b)) pu = legacy;
+    else if (isHubPlace(b.pickup) && !isHubPlace(b.dropoff)) dro = legacy;
+    else if (isHubPlace(b.dropoff) && !isHubPlace(b.pickup)) pu = legacy;
+    else return { pu: "", dro: "", either: legacy };
+  }
+  return { pu, dro, either: "" };
+}
+/* The single line the dispatch text and older readers expect. */
+function combinedAddress(b) {
+  const a = tripAddresses(b);
+  if (a.either) return a.either;
+  return [a.pu && !isHubPlace(b.pickup) ? a.pu : "",
+          a.dro && !hourlyHours(b) && !isHubPlace(b.dropoff) ? a.dro : ""].filter(Boolean).join(" to ");
+}
+/* Called on every way a booking comes in: tidies the two new fields and
+   keeps `address` in step with them. */
+function normaliseAddresses(b) {
+  if (!b || typeof b !== "object") return b;
+  if (b.pickupAddress != null || b.dropoffAddress != null) {
+    b.pickupAddress = cleanAddr(b.pickupAddress);
+    b.dropoffAddress = hourlyHours(b) ? "" : cleanAddr(b.dropoffAddress);
+    const c = combinedAddress(b);
+    if (c) b.address = c;
+  }
+  return b;
+}
+
+/* A charter's itinerary, typed into Notes as "2:30 pm Collect ... approx
+   3:15 pm Arrive ...", as one line per time. Only splits where a time is
+   followed by a capitalised word, and never after "approx" or inside a
+   "9:15 - 9:30 pm" range, so a time mentioned mid-sentence stays put. */
+function itineraryLines(text) {
+  const t = String(text || "").replace(/\s+/g, " ").trim();
+  if (!t) return [];
+  const parts = t.split(/(?<!approx\.?|[-–])\s(?=(?:approx\.?\s)?\d{1,2}(?::\d{2})?\s?(?:[-–]\s?\d{1,2}(?::\d{2})?\s?)?[ap]m\s[A-Z])/i);
+  return parts.map((p) => {
+    const m = /^((?:approx\.?\s)?\d{1,2}(?::\d{2})?\s?(?:[-–]\s?\d{1,2}(?::\d{2})?\s?)?[ap]m)\s(.*)$/i.exec(p);
+    return m ? { when: m[1], what: m[2] } : { when: "", what: p };
+  });
+}
+
+const COMPANY = {
+  name: "Australia Wide Car Services Pty Ltd T/A Sky Transfers",
+  ids: "ABN 22 680 932 003  ·  Operator accreditation OA 900595993  ·  BEA 279338",
+};
+
+/* Everything the PDF and the email both say, worked out once so the two can
+   never disagree. */
+function confirmationContent(b, s) {
+  const ret = returnLeg(b);
+  const hrs = hourlyHours(b);
+  const charter = isCharterHire(b);
+  const addr = tripAddresses(b);
+  const seats = Math.max(0, parseInt(b.childSeats, 10) || 0);
+  const trailer = b.trailer === true || b.trailer === "true";
+  const legs = ret ? 2 : 1;
+  const stops = Array.isArray(b.stops) ? b.stops.filter((x) => x && (x.address || x.suburb)) : [];
+  const state = b.paid && s.balance ? "balance" : b.paid ? "paid" : b.confirmed ? "confirmed" : "request";
+  const pill = { balance: "PAID  ·  BALANCE DUE", paid: "CONFIRMED  ·  PAID", confirmed: "CONFIRMED  ·  PAYMENT DUE", request: "REQUEST RECEIVED" }[state];
+  const intro = {
+    balance: "Your booking has been updated. A balance is due - see below.",
+    paid: "Thank you for booking with Sky Transfers. Your booking is confirmed and paid.",
+    confirmed: "Thank you for booking with Sky Transfers. Your booking is confirmed.",
+    request: "Thank you for booking with Sky Transfers. We'll confirm your chauffeur shortly, usually within the hour.",
+  }[state];
+
+  const service = hrs ? hireLabel(b)
+    : ret ? "Return transfer - both legs on one booking"
+    : (isHubPlace(b.pickup) || isHubPlace(b.dropoff)) ? "One-way airport transfer" : "One-way private transfer";
+  const when = (d, t) => `${niceDate(d)} at ${t}`;
+  const booking = [
+    ["Service", service],
+    ret ? ["Outbound", when(b.date, b.time)] : ["Date", niceDate(b.date)],
+    ret ? ["Return", when(ret.date, ret.time)] : [hrs ? "Start time" : "Pick-up time", b.time],
+    hrs ? ["Duration", `${hrs} hours, as directed`] : null,
+    ["Vehicle", b.vehicle],
+    ["Passengers", String(b.pax || "-")],
+    b.flight ? [ret ? "Outbound flight" : "Flight", b.flight] : null,
+    ret && ret.flight ? ["Return flight", ret.flight] : null,
+  ].filter(Boolean);
+  const passenger = [
+    ["Lead passenger", b.name],
+    ["Contact number", b.phone],
+    b.email ? ["Email", b.email] : null,
+  ].filter(Boolean);
+
+  const endLine = (place, street) => street ? (isHubPlace(place) && street.indexOf(place) === -1 ? `${place} - ${street}` : street) : place;
+  const trip = [
+    ["Pick-up", endLine(b.pickup, addr.pu)],
+    ...stops.map((x, i) => [`Stop ${i + 1}${ret ? " (outbound)" : ""}`, x.address || x.suburb]),
+    hrs ? ["Finishes", addr.dro || "As directed"] : ["Drop-off", endLine(b.dropoff, addr.dro)],
+    ret ? ["Return journey", `${addr.dro || b.dropoff} back to ${b.pickup}`] : null,
+    addr.either ? ["Address", addr.either] : null,
+    hrs && b.notes ? ["Plan for the day", { timeline: itineraryLines(b.notes) }] : null,
+    !hrs && b.notes ? ["Notes", String(b.notes)] : null,
+  ].filter(Boolean);
+
+  /* The breakdown only when the figures are ours to state. On the paid path
+     the total is what Stripe charged (a promotion code may be in it) and the
+     fare is not passed in, so it is described in words instead. */
+  const pay = [];
+  const known = (s.transfer || 0) > 0;
+  if (known) {
+    if (hrs) pay.push([charter ? `Charter, ${hrs} hours` : `Hourly hire, ${hrs} hours`, `$${s.transfer}`]);
+    else if (ret) pay.push(["Return transfer", `$${s.transfer}  (2 x $${Math.round((s.transfer + (s.saved || 0)) / 2)}, less ${Math.round(RETURN_DISCOUNT * 100)}% for the return)`]);
+    else pay.push(["Transfer", `$${s.transfer}`]);
+    if (s.stopsExtra > 0) pay.push(["Stops on the way", `$${s.stopsExtra}`]);
+    if (seats) pay.push([`Child seat${seats > 1 ? "s" : ""} x ${seats}`, `$${seats * CHILD_SEAT_PRICE * legs}` +
+      (seats > 1 || ret ? `  ($${CHILD_SEAT_PRICE} each${ret ? ", each leg" : ""})` : "")]);
+    if (trailer) pay.push(["Luggage trailer", `$${TRAILER_PRICE * legs}${ret ? "  (each leg)" : ""}`]);
+  } else {
+    if (hrs) pay.push([charter ? `Charter, ${hrs} hours` : `Hourly hire, ${hrs} hours`, "Agreed price"]);
+    else if (ret) pay.push(["Return transfer", `Both legs${seats || trailer ? ", extras each leg" : ""}, ${Math.round(RETURN_DISCOUNT * 100)}% return discount included`]);
+    const ex = extrasLabel(b);
+    if (!hrs && ex !== "None") pay.push(["Extras", ex + (ret ? " (each leg)" : "")]);
+  }
+  const status = state === "balance" ? `Paid $${s.total - s.balance} by card. $${s.balance} balance to pay with the link in your email.`
+    : state === "paid" && s.refund ? `Paid by card. $${s.refund} refunded to your card.`
+    : state === "paid" ? "Paid in full. Nothing to pay the chauffeur."
+    : state === "confirmed" ? "Payment due. Pay securely with the link in your confirmation email."
+    : "No payment taken yet. We confirm your chauffeur first.";
+
+  const good = hrs ? [
+    `Your own chauffeur and vehicle for the ${hrs} hours booked - never shared.`,
+    "Your chauffeur stays with the vehicle and follows your plan; changes on the day are fine.",
+    "Free changes and cancellation up to 24 hours before the start time.",
+  ] : (isHubPlace(b.pickup) || isHubPlace(b.dropoff)) ? [
+    "Meet & greet: at the airport your chauffeur waits in arrivals with a name board.",
+    "We track your flight. 30 minutes' free waiting after landing (60 minutes international at BNE).",
+    "Free changes and cancellation up to 24 hours before pick-up.",
+  ] : [
+    "A private car and chauffeur - never shared, never a shuttle.",
+    "A fixed fare: no surge pricing, the same price at any hour.",
+    "Free changes and cancellation up to 24 hours before pick-up.",
+  ];
+  return { state, pill, intro, booking, passenger, trip, tripTitle: hrs ? "Itinerary" : "Trip details", pay, status, good, total: s.total };
+}
+
+// ---- Printable PDF confirmation (A4) ----
+/* Redesigned 20 Oct 2026 after Aman compared ours with the Hughes (Equity
+   Transport Group) confirmation: the guest's name first, labelled sections
+   with a navy bar, label on the left and the detail on the right, pick-up
+   and drop-off on their own lines, and the company's legal details in the
+   footer. Base-14 Helvetica only - it covers WinAnsi, so no arrows. */
 function bookingPdf(b, s) {
   return new Promise((resolve, reject) => {
-    const doc = new PDFDocument({ size: "A4", margin: 0 });
+    const doc = new PDFDocument({ size: "A4", margin: 0, bufferPages: true });
     const chunks = [];
     doc.on("data", (c) => chunks.push(c));
     doc.on("end", () => resolve(Buffer.concat(chunks)));
     doc.on("error", reject);
+    try {
+      const c = confirmationContent(b, s);
+      const W = 595.28, H = 841.89, L = 40, R = W - 40, CW = R - L, LABEL_W = 150, FY = H - 66;
+      const NAVY = "#101828", INK = "#141D30", TEXT = "#333B4C", MUTED = "#68707F", GOLD = "#C9A227", GOLD_D = "#8E701C",
+            GOLD_LT = "#D9B44A", LINE = "#E9DFC6", SOFT = "#F6EED9", CREAM = "#F6F2E8", OK = "#1E7F4F", WARN = "#9C6A0E";
+      const pillColour = { paid: OK, balance: WARN, confirmed: WARN, request: GOLD_D }[c.state];
 
-    const W = 595.28, L = 48, R = W - 48, CW = R - L;
-    const NAVY = "#101828", INK = "#141D30", GOLD = "#C9A227", GOLD_D = "#8E701C",
-          GOLD_LT = "#D9B44A", MUTED = "#68707F", LINE = "#E5E0D2", SOFT = "#F6EED9", CREAM = "#F6F2E8";
+      const header = (first) => {
+        doc.rect(0, 0, W, first ? 92 : 56).fill(NAVY);
+        if (HAS_LOGO) { try { doc.image(LOGO_PATH, L, first ? 14 : 8, { fit: first ? [92, 64] : [60, 40] }); } catch (e) {} }
+        doc.font("Helvetica-Bold").fontSize(9).fillColor(GOLD_LT)
+          .text(c.state === "request" ? "BOOKING REQUEST" : "BOOKING CONFIRMATION", L, first ? 30 : 14, { width: CW, align: "right", characterSpacing: 2.2, lineBreak: false });
+        doc.font("Helvetica-Bold").fontSize(first ? 18 : 12).fillColor("#FFFFFF").text(b.ref || "-", L, first ? 44 : 28, { width: CW, align: "right", lineBreak: false });
+        doc.rect(0, first ? 92 : 56, W, 3).fill(GOLD);
+      };
+      header(true);
+      let y = 112;
+      doc.font("Helvetica-Bold").fontSize(19).fillColor(INK).text(b.name || "", L, y, { width: CW - 190 });
+      doc.font("Helvetica").fontSize(9.5).fillColor(MUTED).text(c.intro, L, doc.y + 2, { width: CW - 190 });
+      const introEnd = doc.y;
+      doc.font("Helvetica-Bold").fontSize(8.5);
+      const pw = doc.widthOfString(c.pill, { characterSpacing: 1 }) + 26;
+      doc.roundedRect(R - pw, y + 4, pw, 22, 11).fill(pillColour);
+      doc.fillColor("#FFFFFF").text(c.pill, R - pw, y + 11, { width: pw, align: "center", characterSpacing: 1, lineBreak: false });
+      y = Math.max(introEnd, y + 30) + 14;
 
-    // ---------- Header band ----------
-    doc.rect(0, 0, W, 118).fill(NAVY);
-    if (HAS_LOGO) { try { doc.image(LOGO_PATH, R - 96, 22, { fit: [96, 74] }); } catch (e) {} }
-    doc.font("Times-Roman").fontSize(26).fillColor(CREAM).text("SKY TRANSFERS", L, 34, { characterSpacing: 4 });
-    doc.font("Helvetica-Bold").fontSize(9).fillColor(GOLD_LT)
-      .text(b.paid ? "BOOKING CONFIRMED — PAID" : b.confirmed ? "BOOKING CONFIRMED" : "BOOKING CONFIRMATION", L, 70, { characterSpacing: 2.5 });
-    doc.font("Helvetica").fontSize(8.5).fillColor("#98A0B0")
-      .text("Gold Coast & Brisbane private airport transfers", L, 86);
-    doc.rect(0, 118, W, 3).fill(GOLD);
+      /* a section that does not fit starts on a new page, under a short header */
+      const fit = (h) => { if (y + h > FY - 12) { doc.addPage({ size: "A4", margin: 0 }); header(false); y = 76; } };
+      const vw = CW - LABEL_W - 24;
+      const rowHeight = (r) => {
+        if (r.timeline) {
+          doc.font("Helvetica").fontSize(9.5);
+          return r.timeline.reduce((a, l) => a + doc.heightOfString(l.what, { width: vw - 92 }) + 4, 0) + 9;
+        }
+        doc.font(r.bold ? "Helvetica-Bold" : "Helvetica").fontSize(r.big ? 15 : 9.5);
+        return Math.max(19, doc.heightOfString(String(r.value), { width: vw }) + 9);
+      };
+      const section = (title, rows) => {
+        rows = rows.map((r) => (Array.isArray(r) ? (r[1] && r[1].timeline ? { label: r[0], timeline: r[1].timeline } : { label: r[0], value: r[1] }) : r))
+          .filter((r) => r && (r.timeline ? r.timeline.length : r.value != null && String(r.value) !== ""));
+        if (!rows.length) return;
+        const hs = rows.map(rowHeight);
+        fit(20 + hs.reduce((a, h) => a + h, 0) + 11);
+        doc.roundedRect(L, y, CW, 20, 5).fill(NAVY);
+        doc.rect(L + 12, y + 7, 6, 6).fill(GOLD);
+        doc.font("Helvetica-Bold").fontSize(9.5).fillColor("#FFFFFF").text(title, L + 26, y + 5.5, { characterSpacing: 0.4, lineBreak: false });
+        y += 20;
+        rows.forEach((r, i) => {
+          const h = hs[i];
+          if (r.shade) doc.rect(L, y, CW, h).fill(SOFT);
+          doc.font("Helvetica-Bold").fontSize(8.5).fillColor(INK).text(r.label, L + 12, y + (r.big ? 9 : 6), { width: LABEL_W - 12 });
+          if (r.timeline) {
+            let ty = y + 5;
+            r.timeline.forEach((l) => {
+              doc.font("Helvetica-Bold").fontSize(9.5).fillColor(GOLD_D).text(l.when, L + LABEL_W, ty, { width: 88 });
+              doc.font("Helvetica").fontSize(9.5).fillColor(TEXT).text(l.what, L + LABEL_W + 92, ty, { width: vw - 92 });
+              ty = Math.max(doc.y, ty + 11) + 4;
+            });
+          } else {
+            doc.font(r.bold ? "Helvetica-Bold" : "Helvetica").fontSize(r.big ? 15 : 9.5).fillColor(r.color || TEXT)
+              .text(String(r.value), L + LABEL_W, y + (r.big ? 4 : 5), { width: vw });
+          }
+          y += h;
+          if (i < rows.length - 1) doc.moveTo(L, y).lineTo(R, y).lineWidth(0.7).strokeColor(LINE).stroke();
+        });
+        doc.roundedRect(L, y - 2, CW, 2, 1).fill(GOLD);
+        y += 9;
+      };
 
-    // ---------- Reference / status ----------
-    let y = 146;
-    doc.font("Helvetica-Bold").fontSize(8).fillColor(MUTED).text("BOOKING REFERENCE", L, y, { characterSpacing: 1.5 });
-    doc.font("Helvetica-Bold").fontSize(17).fillColor(INK).text(b.ref || "—", L, y + 12);
-    /* Three states, not two: a booking the office confirmed and sent a payment
-       link for is neither a request nor paid. */
-    const pill = (b.paid && s.balance) ? "PAID · BALANCE DUE" : b.paid ? "PAID IN FULL" : b.confirmed ? "CONFIRMED" : "AWAITING CONFIRMATION";
-    doc.font("Helvetica-Bold").fontSize(8);
-    const pillW = doc.widthOfString(pill) + 24;
-    const green = b.paid && !s.balance;
-    doc.roundedRect(R - pillW, y + 8, pillW, 20, 10).fill(green ? "#1E7F4F" : SOFT);
-    doc.font("Helvetica-Bold").fontSize(8).fillColor(green ? "#FFFFFF" : GOLD_D)
-      .text(pill, R - pillW, y + 14, { width: pillW, align: "center", characterSpacing: 1 });
+      section("Booking details", c.booking);
+      section("Passenger details", c.passenger);
+      section(c.tripTitle, c.trip);
+      section("Payment", [
+        ...c.pay,
+        { label: "Total (AUD, GST incl.)", value: `$${c.total}`, big: true, bold: true, color: INK, shade: true },
+        { label: "Status", value: c.status, bold: true, color: c.state === "paid" ? OK : c.state === "request" ? MUTED : WARN },
+      ]);
 
-    // ---------- Trip card ----------
-    y += 48;
-    /* The route is written as "A to B", not with an arrow. The built-in PDF
-       fonts only cover WinAnsi, so "→" came out as "!'" on every confirmation. */
-    const ret = returnLeg(b);
-    const extras = extrasLabel(b);
-    const rows = (ret ? [
-      /* A return is two transfers, and the customer has to see both legs with
-         their own date and time - a single ROUTE and DATE row hid the return
-         leg entirely, which is what prompted this layout. */
-      ["TRIP", "Return — two transfers on one booking"],
-      ["OUTBOUND", `${b.pickup}  to  ${b.dropoff}\n${niceDate(b.date)} at ${b.time}`],
-      ["RETURN", `${b.dropoff}  to  ${b.pickup}\n${niceDate(ret.date)} at ${ret.time}`],
-    ] : hourlyHours(b) ? [
-      [isCharterHire(b) ? "CHARTER" : "HIRE", hireLabel(b)],
-      ["STARTS", `${b.pickup}\n${niceDate(b.date)} at ${b.time}`],
-    ] : [
-      ["ROUTE", `${b.pickup}  to  ${b.dropoff}`],
-      ["DATE", `${niceDate(b.date)} at ${b.time}`],
-    ]).concat([
-      stopsText(b, "\n") ? [ret ? "STOPS (OUTBOUND)" : "STOPS ON THE WAY", stopsText(b, "\n")] : null,
-      ["VEHICLE", b.vehicle],
-      ["PASSENGERS", String(b.pax || "—")],
-      b.flight ? [ret ? "OUTBOUND FLIGHT" : "FLIGHT", b.flight] : null,
-      ret && ret.flight ? ["RETURN FLIGHT", ret.flight] : null,
-      b.address ? ["PICK-UP / DROP-OFF ADDRESS", b.address] : null,
-      /* on a hire the notes are the itinerary, which the guest should see */
-      hourlyHours(b) && b.notes ? ["ITINERARY", String(b.notes)] : null,
-      ["LEAD PASSENGER", `${b.name}   ·   ${b.phone}`],
-      ["EXTRAS", extras + (ret && extras !== "None" ? "  (each leg)" : "")],
-    ]).filter(Boolean);
+      doc.font("Helvetica").fontSize(8.8);
+      fit(16 + c.good.reduce((a, t) => a + doc.heightOfString(t, { width: CW - 11 }) + 3, 0));
+      doc.font("Helvetica-Bold").fontSize(8).fillColor(MUTED).text("GOOD TO KNOW", L, y, { characterSpacing: 1.5 });
+      y += 13;
+      c.good.forEach((t) => {
+        doc.circle(L + 3, y + 4.5, 1.7).fill(GOLD);
+        doc.font("Helvetica").fontSize(8.8).fillColor(TEXT).text(t, L + 11, y, { width: CW - 11 });
+        y = doc.y + 3;
+      });
 
-    doc.font("Helvetica").fontSize(10.5);
-    const rowH = [];
-    rows.forEach(([lab, val]) => {
-      const h = doc.heightOfString(val, { width: CW - 190 });
-      rowH.push(Math.max(30, h + 18));
-    });
-    const cardH = rowH.reduce((a, c) => a + c, 0) + 8;
-    doc.roundedRect(L, y, CW, cardH, 8).lineWidth(1).strokeColor(LINE).stroke();
-    let ry = y + 4;
-    rows.forEach(([lab, val], i) => {
-      doc.font("Helvetica-Bold").fontSize(7.5).fillColor(MUTED).text(lab, L + 18, ry + 10, { characterSpacing: 1.2, width: 150 });
-      doc.font("Helvetica").fontSize(10.5).fillColor(INK).text(val, L + 172, ry + 8, { width: CW - 190 });
-      ry += rowH[i];
-      if (i < rows.length - 1) doc.moveTo(L + 18, ry).lineTo(R - 18, ry).lineWidth(0.5).strokeColor(LINE).stroke();
-    });
-
-    // ---------- Total band ----------
-    y += cardH + 16;
-    doc.roundedRect(L, y, CW, 46, 8).fill(SOFT);
-    doc.rect(L, y + 4, 3, 38).fill(GOLD);
-    doc.font("Helvetica-Bold").fontSize(9).fillColor(GOLD_D).text("TOTAL · AUD, GST INCLUSIVE", L + 20, y + (ret || hourlyHours(b) ? 12 : 18), { characterSpacing: 1.2 });
-    /* On a return the figure is nearly double the fare the customer saw on the
-       page, so say in words what it covers. No numbers here: on the paid path
-       the total is whatever Stripe charged, promotion code and all, and a
-       per-leg figure could contradict it. */
-    if (ret) {
-      doc.font("Helvetica").fontSize(8).fillColor(MUTED)
-        .text(`Both legs${extras !== "None" ? ", extras each leg" : ""} · ${Math.round(RETURN_DISCOUNT * 100)}% return discount included`, L + 20, y + 26);
-    } else if (hourlyHours(b)) {
-      doc.font("Helvetica").fontSize(8).fillColor(MUTED)
-        .text(`${hourlyHours(b)} hours, chauffeur and vehicle at your disposal` + (isCharterHire(b) ? " · the agreed price" : " · the same rate at any hour"), L + 20, y + 26);
-    }
-    doc.font("Times-Roman").fontSize(24).fillColor(INK)
-      .text(`$${s.total}`, L, y + 10, { width: CW - 20, align: "right" });
-    doc.font("Helvetica").fontSize(8).fillColor(MUTED)
-      .text(b.paid && s.balance ? `Paid $${s.total - s.balance} by card · balance $${s.balance} due, see the link in your email`
-          : b.paid && s.refund ? `Paid by card via Stripe · $${s.refund} refunded to your card`
-          : b.paid ? "Paid by card via Stripe" : b.confirmed ? "Payment details sent by email" : "Payment taken on confirmation", L, y + 34, { width: CW - 20, align: "right" });
-
-    // ---------- Included ----------
-    y += 66;
-    doc.font("Helvetica-Bold").fontSize(8).fillColor(MUTED).text(hourlyHours(b) ? "INCLUDED" : "INCLUDED WITH EVERY TRANSFER", L, y, { characterSpacing: 1.5 });
-    y += 14;
-    const inc = hourlyHours(b) ? includedForHire(b).map((t) => t.replace(/&amp;/g, "&")) : [
-      "Meet & greet — your chauffeur waits at arrivals with a name board",
-      "Flight tracking with 30 minutes' free airport waiting (60 min international at BNE)",
-      "Free changes and cancellation up to 24 hours before pick-up",
-      "No surge pricing — the fare above is final",
-    ];
-    inc.forEach((t) => {
-      doc.circle(L + 4, y + 5, 1.8).fill(GOLD);
-      doc.font("Helvetica").fontSize(9.5).fillColor(INK).text(t, L + 14, y, { width: CW - 14 });
-      y += 16;
-    });
-
-    // ---------- Note ----------
-    y += 8;
-    if (!b.paid && !b.confirmed) {
-      doc.font("Helvetica-Oblique").fontSize(9).fillColor(MUTED)
-        .text("This is a booking request. We confirm your chauffeur by email, usually within the hour, and send driver details before pick-up.", L, y, { width: CW });
-      y += 28;
-    } else if (!b.paid) {
-      doc.font("Helvetica-Oblique").fontSize(9).fillColor(MUTED)
-        .text("Your chauffeur is booked. Driver details follow before pick-up; payment details are in the email this came with.", L, y, { width: CW });
-      y += 28;
-    }
-
-    // ---------- Footer band ----------
-    const FY = 841.89 - 74;
-    doc.rect(0, FY, W, 74).fill(NAVY);
-    doc.rect(0, FY, W, 2).fill(GOLD);
-    doc.font("Times-Roman").fontSize(13).fillColor(CREAM).text("SKY TRANSFERS", L, FY + 16, { characterSpacing: 3 });
-    doc.font("Helvetica").fontSize(8.5).fillColor("#98A0B0")
-      .text("24/7  ·  +61 481 437 772  ·  info@skytransfers.com.au  ·  www.skytransfers.com.au", L, FY + 36);
-    doc.font("Helvetica").fontSize(8.5).fillColor(GOLD_LT)
-      .text(`Ref ${b.ref || ""}`, L, FY + 16, { width: CW, align: "right" });
-
-    doc.end();
+      /* the footer on every page: who we are */
+      const range = doc.bufferedPageRange();
+      for (let i = 0; i < range.count; i++) {
+        doc.switchToPage(range.start + i);
+        doc.rect(0, FY, W, 66).fill(NAVY);
+        doc.rect(0, FY, W, 2).fill(GOLD);
+        doc.font("Helvetica-Bold").fontSize(8.5).fillColor(CREAM).text(COMPANY.name, L, FY + 14, { lineBreak: false });
+        doc.font("Helvetica").fontSize(7.8).fillColor("#A9B0BE").text(COMPANY.ids, L, FY + 27, { lineBreak: false });
+        doc.text("Changes, cancellations and full terms: www.skytransfers.com.au/terms.html", L, FY + 39, { lineBreak: false });
+        doc.font("Helvetica-Bold").fontSize(8.5).fillColor(GOLD_LT).text("24/7  +61 481 437 772", L, FY + 14, { width: CW, align: "right", lineBreak: false });
+        doc.font("Helvetica").fontSize(7.8).fillColor("#A9B0BE").text("info@skytransfers.com.au", L, FY + 27, { width: CW, align: "right", lineBreak: false });
+        doc.text(range.count > 1 ? `www.skytransfers.com.au  ·  page ${i + 1} of ${range.count}` : "www.skytransfers.com.au", L, FY + 39, { width: CW, align: "right", lineBreak: false });
+      }
+      doc.end();
+    } catch (e) { reject(e); }
   });
 }
 
 // ---- Branded HTML email (guest-facing) ----
 function esc(t) { return String(t == null ? "" : t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
 
+/* The same sections as the PDF (20 Oct 2026), built from the same
+   confirmationContent so the two always agree. Tables and inline styles only,
+   for Outlook and Gmail. */
 function bookingEmailHtml(b, s) {
-  const row = (label, value) => value ? `
-    <tr>
-      <td style="padding:10px 0 2px;font:700 10px/1.4 Arial,sans-serif;letter-spacing:1.5px;color:#68707F;">${label}</td>
-    </tr>
-    <tr>
-      <td style="padding:0 0 10px;font:400 15px/1.5 Georgia,serif;color:#141D30;border-bottom:1px solid #EDE8DA;">${esc(value)}</td>
-    </tr>` : "";
+  const c = confirmationContent(b, s);
   const paid = !!b.paid;
   const confirmed = !paid && !!b.confirmed;
-  const ret = returnLeg(b);
-  const hrs = hourlyHours(b);
-  const extras = extrasLabel(b);
+  const pillBg = { paid: "#1E7F4F", balance: "#9C6A0E", confirmed: "#9C6A0E", request: "#8E701C" }[c.state];
+  const cellL = "padding:9px 14px;font:700 12px/1.45 Arial,sans-serif;color:#141D30;vertical-align:top;width:34%;border-bottom:1px solid #EFE6D0;";
+  const cellR = "padding:9px 14px;font:400 14px/1.45 Arial,sans-serif;color:#333B4C;vertical-align:top;border-bottom:1px solid #EFE6D0;";
+  const value = (v) => (v && v.timeline)
+    ? v.timeline.map((l) => `<div style="padding:0 0 6px;"><span style="font-weight:700;color:#8E701C;">${esc(l.when)}</span>${l.when ? " &nbsp;" : ""}${esc(l.what)}</div>`).join("")
+    : esc(v).replace(/\n/g, "<br>");
+  const section = (title, rows, extra) => {
+    rows = rows.filter((r) => r && r[1] != null && (r[1].timeline ? r[1].timeline.length : String(r[1]) !== ""));
+    if (!rows.length && !extra) return "";
+    return `
+    <tr><td style="padding:14px 28px 0;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;border-bottom:2px solid #C9A227;">
+        <tr><td colspan="2" style="background:#101828;border-radius:5px 5px 0 0;padding:8px 14px;font:700 13px Arial,sans-serif;color:#FFFFFF;">
+          <span style="display:inline-block;width:7px;height:7px;background:#C9A227;margin-right:8px;vertical-align:middle;"></span>${title}</td></tr>
+        ${rows.map((r) => `<tr><td style="${cellL}">${esc(r[0])}</td><td style="${cellR}">${value(r[1])}</td></tr>`).join("")}
+        ${extra || ""}
+      </table>
+    </td></tr>`;
+  };
+  const totalRows = `
+        <tr><td style="${cellL}background:#F6EED9;padding-top:12px;padding-bottom:12px;">Total (AUD, GST incl.)</td>
+            <td style="${cellR}background:#F6EED9;font:700 22px Arial,sans-serif;color:#141D30;">$${c.total}</td></tr>
+        <tr><td style="${cellL}">Status</td><td style="${cellR}font-weight:700;color:${c.state === "paid" ? "#1E7F4F" : c.state === "request" ? "#68707F" : "#9C6A0E"};">${esc(c.status)}</td></tr>`;
+  const greeting = paid && s.balance
+    ? `Your booking has been updated. Your earlier payment of $${s.total - s.balance} is held against it — the $${s.balance} difference can be paid below. Your updated confirmation is attached.`
+    : paid && s.refund
+    ? `Your booking has been updated, and $${s.refund} has been refunded to the card you paid with — it usually shows within 5 to 10 business days. Your updated confirmation is attached.`
+    : paid
+    ? "Payment received — your booking is confirmed. Your printable confirmation is attached, and we'll send your chauffeur's name and mobile number before pick-up."
+    : confirmed
+      ? "Your booking is confirmed and your chauffeur is booked. Your printable confirmation is attached" + (s.payUrl ? " — pay below to secure it, and we'll send your chauffeur's details before pick-up." : ", and we'll send your chauffeur's details before pick-up.")
+      : "Thank you for booking with Sky Transfers. Here are your trip details — we'll confirm your chauffeur by email, usually within the hour.";
   return `<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="margin:0;padding:0;background:#F7F4ED;">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F7F4ED;padding:0;">
-<tr><td align="center" style="padding:28px 12px;">
+<tr><td align="center" style="padding:24px 10px;">
   <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:#FFFFFF;border-radius:10px;overflow:hidden;border:1px solid #E5E0D2;">
 
-    <!-- Header -->
-    <tr><td style="background:#101828;padding:30px 36px 24px;border-bottom:3px solid #C9A227;" align="center">
-      <img src="cid:stlogo" alt="SKY TRANSFERS" height="76" style="height:76px;display:block;margin:0 auto 4px;font:400 22px Georgia,serif;letter-spacing:5px;color:#F6F2E8;">
-      <div style="font:700 10px Arial,sans-serif;letter-spacing:3px;color:#D9B44A;padding-top:10px;">
-        ${paid ? "BOOKING CONFIRMED &amp; PAID" : confirmed ? "BOOKING CONFIRMED" : "BOOKING REQUEST RECEIVED"}</div>
-    </td></tr>
-
-    <!-- Reference -->
-    <tr><td style="padding:26px 36px 0;">
+    <!-- Header: logo, and the reference -->
+    <tr><td style="background:#101828;padding:18px 28px;border-bottom:3px solid #C9A227;">
       <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
-        <td>
-          <div style="font:700 10px Arial,sans-serif;letter-spacing:1.5px;color:#68707F;">BOOKING REFERENCE</div>
-          <div style="font:700 20px Arial,sans-serif;color:#141D30;padding-top:2px;">${esc(b.ref)}</div>
-        </td>
+        <td style="vertical-align:middle;"><img src="cid:stlogo" alt="SKY TRANSFERS" height="58" style="height:58px;display:block;font:400 20px Georgia,serif;letter-spacing:4px;color:#F6F2E8;"></td>
         <td align="right" style="vertical-align:middle;">
-          <span style="display:inline-block;padding:6px 14px;border-radius:12px;font:700 10px Arial,sans-serif;letter-spacing:1px;${paid && !s.balance ? "background:#1E7F4F;color:#FFFFFF;" : "background:#F6EED9;color:#8E701C;"}">${paid && s.balance ? "PAID &middot; BALANCE DUE" : paid ? "PAID IN FULL" : confirmed ? "CONFIRMED" : "AWAITING CONFIRMATION"}</span>
+          <div style="font:700 10px Arial,sans-serif;letter-spacing:2.5px;color:#D9B44A;">${c.state === "request" ? "BOOKING REQUEST" : "BOOKING CONFIRMATION"}</div>
+          <div style="font:700 20px Arial,sans-serif;color:#FFFFFF;padding-top:3px;">${esc(b.ref)}</div>
         </td>
       </tr></table>
     </td></tr>
 
-    <!-- Greeting -->
-    <tr><td style="padding:18px 36px 6px;font:400 15px/1.6 Georgia,serif;color:#333B4C;">
-      Hi ${esc(b.name)},<br><br>
-      ${paid && s.balance
-        ? `Your booking has been updated. Your earlier payment of $${s.total - s.balance} is held against it — the $${s.balance} difference can be paid below. Your updated confirmation is attached.`
-        : paid && s.refund
-        ? `Your booking has been updated, and $${s.refund} has been refunded to the card you paid with — it usually shows within 5 to 10 business days. Your updated confirmation is attached.`
-        : paid
-        ? "Payment received — your transfer is confirmed. Your printable confirmation is attached, and we'll send your chauffeur's name and mobile number before pick-up."
-        : confirmed
-          ? "Your transfer is confirmed and your chauffeur is booked. Your printable confirmation is attached" + (s.payUrl ? " — pay below to secure it, and we'll send your chauffeur's details before pick-up." : ", and we'll send your chauffeur's details before pick-up.")
-          : "Thank you for booking with Sky Transfers. Here are your trip details — we'll confirm your chauffeur by email, usually within the hour."}
-    </td></tr>
-
-    <!-- Details -->
-    <tr><td style="padding:10px 36px 4px;">
-      <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
-        ${ret ? row("TRIP", "Return — two transfers on one booking") : ""}
-        ${hrs ? row(isCharterHire(b) ? "CHARTER" : "HIRE", hireLabel(b)) : ""}
-        ${ret
-          ? row("OUTBOUND", `${b.pickup}  →  ${b.dropoff}  ·  ${niceDate(b.date)} at ${b.time}`)
-          : hrs ? row("STARTS", `${b.pickup}  ·  ${niceDate(b.date)} at ${b.time}`)
-          : row("ROUTE", `${b.pickup}  →  ${b.dropoff}`)}
-        ${ret
-          ? row("RETURN", `${b.dropoff}  →  ${b.pickup}  ·  ${niceDate(ret.date)} at ${ret.time}`)
-          : hrs ? ""
-          : row("DATE &amp; TIME", `${niceDate(b.date)} at ${b.time}`)}
-        ${row(ret ? "STOPS (OUTBOUND)" : "STOPS ON THE WAY", stopsText(b, "  ·  "))}
-        ${row("VEHICLE", b.vehicle)}
-        ${row("PASSENGERS", b.pax)}
-        ${row(ret ? "OUTBOUND FLIGHT" : "FLIGHT", b.flight)}
-        ${ret ? row("RETURN FLIGHT", ret.flight) : ""}
-        ${row("PICK-UP / DROP-OFF ADDRESS", b.address)}
-        ${hrs ? row("ITINERARY", b.notes) : ""}
-        ${row("EXTRAS", extras + (ret && extras !== "None" ? " (each leg)" : ""))}
-      </table>
+    <!-- Who it is for, and where it stands -->
+    <tr><td style="padding:22px 28px 4px;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+        <td style="vertical-align:top;font:700 22px Arial,sans-serif;color:#141D30;">${esc(b.name)}</td>
+        <td align="right" style="vertical-align:top;"><span style="display:inline-block;padding:6px 14px;border-radius:12px;font:700 10px Arial,sans-serif;letter-spacing:1px;background:${pillBg};color:#FFFFFF;">${c.pill.replace(/  ·  /g, " &middot; ")}</span></td>
+      </tr></table>
+      <div style="font:400 14.5px/1.6 Arial,sans-serif;color:#333B4C;padding-top:10px;">Hi ${esc(String(b.name || "").split(" ")[0])}, ${greeting}</div>
     </td></tr>
 
     ${s.payUrl ? `<!-- Pay button: only a confirmation the office sent with a payment link -->
-    <tr><td align="center" style="padding:6px 36px 4px;">
+    <tr><td align="center" style="padding:16px 28px 2px;">
       <a href="${esc(s.payUrl)}" style="display:inline-block;background:#C9A227;color:#141D30;font:700 15px Arial,sans-serif;padding:14px 30px;border-radius:9px;text-decoration:none;">${s.balance ? `Pay the $${s.balance} balance now` : `Pay $${s.total} now to secure your booking`}</a>
       <div style="font:400 12.5px Arial,sans-serif;color:#68707F;padding-top:8px;">Secure card payment by Stripe &mdash; card details never touch our website.</div>
     </td></tr>` : ""}
-    <!-- Total -->
-    <tr><td style="padding:18px 36px 6px;">
-      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F6EED9;border-radius:8px;border-left:4px solid #C9A227;">
-        <tr>
-          <td style="padding:16px 20px;font:700 11px Arial,sans-serif;letter-spacing:1.5px;color:#8E701C;">TOTAL &middot; AUD, GST INCL.</td>
-          <td align="right" style="padding:16px 20px;font:400 26px Georgia,serif;color:#141D30;">$${s.total}</td>
-        </tr>
-      </table>
-      ${ret ? `<div style="font:400 12px Arial,sans-serif;color:#68707F;padding-top:8px;text-align:right;">
-        Covers both legs${extras !== "None" ? ", with extras charged each leg" : ""} &middot; includes the ${Math.round(RETURN_DISCOUNT * 100)}% return discount.</div>`
-        : hrs ? `<div style="font:400 12px Arial,sans-serif;color:#68707F;padding-top:8px;text-align:right;">
-        ${hrs} hours with the chauffeur and vehicle at your disposal &middot; ${isCharterHire(b) ? "the agreed price" : "the same rate at any hour"}.</div>` : ""}
-      <div style="font:400 12px Arial,sans-serif;color:#68707F;padding-top:${ret ? 2 : 8}px;text-align:right;">
-        ${paid && s.balance ? `Paid $${s.total - s.balance} by card &middot; $${s.balance} balance to pay with the button above.`
-          : paid && s.refund ? `Paid securely by card via Stripe &middot; $${s.refund} refunded to your card.`
-          : paid ? "Paid securely by card via Stripe."
-          : confirmed ? (s.payUrl ? "Pay with the button above to secure your booking." : "Payment as arranged with our office.")
-          : "No payment taken yet — we take payment when your booking is confirmed."}</div>
-    </td></tr>
+    ${section("Booking details", c.booking)}
+    ${section("Passenger details", c.passenger)}
+    ${section(c.tripTitle, c.trip)}
+    ${section("Payment", c.pay, totalRows)}
 
-    <!-- What's included -->
-    <tr><td style="padding:14px 36px 4px;">
-      <div style="font:700 10px Arial,sans-serif;letter-spacing:1.5px;color:#68707F;padding-bottom:8px;">${hrs ? "INCLUDED" : "INCLUDED WITH EVERY TRANSFER"}</div>
-      <div style="font:400 13.5px/1.9 Arial,sans-serif;color:#333B4C;">
-        ${(hrs ? includedForHire(b) : [
-          "Meet &amp; greet with a name board at arrivals",
-          "Flight tracking &middot; 30 min free waiting (60 min international at BNE)",
-          "Free changes &amp; cancellation to 24 hours before pick-up",
-          "Fixed fare — no surge pricing, ever",
-        ]).map((t) => `<span style="color:#C9A227;">&#9679;</span>&nbsp; ${t}`).join("<br>\n        ")}
+    <!-- Good to know -->
+    <tr><td style="padding:16px 28px 4px;">
+      <div style="font:700 10px Arial,sans-serif;letter-spacing:1.5px;color:#68707F;padding-bottom:6px;">GOOD TO KNOW</div>
+      <div style="font:400 13.5px/1.8 Arial,sans-serif;color:#333B4C;">
+        ${c.good.map((t) => `<span style="color:#C9A227;">&#9679;</span>&nbsp; ${esc(t)}`).join("<br>\n        ")}
       </div>
     </td></tr>
 
     <!-- Contact -->
-    <tr><td style="padding:20px 36px 8px;font:400 13.5px/1.7 Arial,sans-serif;color:#333B4C;">
+    <tr><td style="padding:16px 28px 6px;font:400 13.5px/1.7 Arial,sans-serif;color:#333B4C;">
       Questions or changes? Reply to this email or call/text us any time on
       <a href="tel:+61481437772" style="color:#8E701C;font-weight:700;text-decoration:none;">+61&nbsp;481&nbsp;437&nbsp;772</a> — we're on 24/7.
     </td></tr>
 
     <!-- Review CTA -->
-    <tr><td align="center" style="padding:16px 36px 28px;">
+    <tr><td align="center" style="padding:14px 28px 26px;">
       <a href="${REVIEW_URL}" style="display:inline-block;background:#C9A227;color:#141D30;font:700 14px Arial,sans-serif;padding:12px 26px;border-radius:8px;text-decoration:none;">&#9733; Enjoyed the ride? Leave us a Google review</a>
     </td></tr>
 
-    <!-- Footer -->
-    <tr><td style="background:#101828;padding:22px 36px;border-top:2px solid #C9A227;" align="center">
-      <div style="font:400 15px Georgia,serif;letter-spacing:3px;color:#F6F2E8;">SKY TRANSFERS</div>
-      <div style="font:400 11.5px/1.8 Arial,sans-serif;color:#98A0B0;padding-top:6px;">
-        Gold Coast &amp; Brisbane private airport transfers<br>
-        24/7 &middot; +61 481 437 772 &middot; <a href="mailto:info@skytransfers.com.au" style="color:#D9B44A;text-decoration:none;">info@skytransfers.com.au</a> &middot; <a href="https://www.skytransfers.com.au" style="color:#D9B44A;text-decoration:none;">skytransfers.com.au</a>
+    <!-- Footer: who we are -->
+    <tr><td style="background:#101828;padding:20px 28px;border-top:2px solid #C9A227;">
+      <div style="font:700 12.5px Arial,sans-serif;color:#F6F2E8;">${esc(COMPANY.name)}</div>
+      <div style="font:400 11.5px/1.8 Arial,sans-serif;color:#A9B0BE;padding-top:4px;">
+        ${esc(COMPANY.ids).replace(/  ·  /g, " &middot; ")}<br>
+        24/7 &middot; +61 481 437 772 &middot; <a href="mailto:info@skytransfers.com.au" style="color:#D9B44A;text-decoration:none;">info@skytransfers.com.au</a> &middot; <a href="https://www.skytransfers.com.au" style="color:#D9B44A;text-decoration:none;">skytransfers.com.au</a><br>
+        <a href="https://www.skytransfers.com.au/terms.html" style="color:#A9B0BE;">Changes, cancellations and full terms</a>
       </div>
     </td></tr>
 
@@ -771,7 +860,7 @@ function quoteCheck(b, total) {
 app.post("/request-booking", async (req, res) => {
   try {
     if (!mailer) return res.status(500).json({ error: "Email is not configured on the server" });
-    const b = req.body || {};
+    const b = normaliseAddresses(req.body || {});
     if (!b.pickup || !b.dropoff || !b.vehicle || !b.date || !b.name || !b.phone || !b.email) {
       return res.status(400).json({ error: "Missing booking details" });
     }
@@ -907,7 +996,7 @@ app.post("/charter-enquiry", async (req, res) => {
 app.post("/create-checkout", async (req, res) => {
   try {
     if (!stripe) return res.status(500).json({ error: "Payments are not configured on the server" });
-    const b = req.body || {};
+    const b = normaliseAddresses(req.body || {});
     const fare = await fareForBooking(b);
     if (fare == null) {
       return res.status(400).json({ error: "This route or vehicle needs a manual quote — please email or call us." });
@@ -1049,6 +1138,9 @@ app.post("/create-checkout", async (req, res) => {
         return_flight: ret ? ret.flight : "",
         passenger_name: String(b.name || ""), phone: String(b.phone || ""),
         pickup_address: String(b.address || ""),
+        /* the two ends' street addresses on their own (20 Oct 2026) */
+        pu_address: String(b.pickupAddress || "").slice(0, 300),
+        do_address: String(b.dropoffAddress || "").slice(0, 300),
         notes: String(b.notes || "").slice(0, 450),
       },
       success_url: process.env.SUCCESS_URL || "https://www.skytransfers.com.au/?booking=confirmed",
@@ -1076,6 +1168,7 @@ app.post("/stripe-webhook", async (req, res) => {
         pax: m.pax, flight: m.flight, childSeats: parseInt(m.child_seats, 10) || 0,
         trailer: m.trailer === "yes", name: m.passenger_name, phone: m.phone,
         email: sess.customer_email || sess.customer_details?.email || "", address: m.pickup_address,
+        pickupAddress: m.pu_address || "", dropoffAddress: m.do_address || "",
         notes: m.notes, paid: true,
         returnDate: m.return_date || "", returnTime: m.return_time || "",
         returnFlight: m.return_flight || "",
@@ -1129,6 +1222,12 @@ app.post("/stripe-webhook", async (req, res) => {
           b.returnDate = row.return_date_text;
           b.returnTime = row.return_time || "";
           b.returnFlight = row.return_flight || "";
+        }
+        /* the same for the two street addresses on links made before they
+           were carried in the metadata */
+        if (row && !b.pickupAddress && !b.dropoffAddress) {
+          b.pickupAddress = row.pu_address || "";
+          b.dropoffAddress = row.do_address || "";
         }
       }
       /* Stripe's amount_total is the figure actually charged, so it already has
@@ -1188,7 +1287,7 @@ portal = require("./agent-portal")({
      the same branded email and PDF the website sends - not a second version
      that drifts. fareForBooking is read at call time, so it sees the
      point-to-point module mounted further down. */
-  bookingPdf, bookingEmailHtml, guestAttachments, fareForBooking, returnLeg, hourlyHours,
+  bookingPdf, bookingEmailHtml, guestAttachments, fareForBooking, returnLeg, hourlyHours, normaliseAddresses,
   HUB_NAMES: [OOL, BNE, CRUISE],
   PLACES_FOR_AGENTS: [OOL, BNE, CRUISE]
     .concat(Object.keys(SUBURBS).sort())
