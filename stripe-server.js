@@ -1186,6 +1186,14 @@ app.post("/stripe-webhook", async (req, res) => {
           .catch((e) => console.error("invoice payment:", e.message));
         return res.json({ received: true });
       }
+      /* An agent booking paid by card on its own (the portal's Pay by card).
+         Not a website booking either: settle it and stop. */
+      if (m.agent_booking_for && portal && typeof portal.settleAgentCard === "function") {
+        const row = await portal.settleAgentCard(String(m.agent_booking_for), sess.amount_total || 0, b.paymentIntent || "")
+          .catch((e) => { console.error("agent card payment:", e.message); return null; });
+        console.log("agent booking paid by card:", m.agent_booking_for, "$" + Math.round((sess.amount_total || 0) / 100), row ? "settled" : "row missing");
+        return res.json({ received: true });
+      }
       /* A balance link - the difference after a paid booking was amended
          upwards. Not a new booking: settle it and tell both sides. */
       if (m.balance_for && portal && typeof portal.settleBalance === "function") {
