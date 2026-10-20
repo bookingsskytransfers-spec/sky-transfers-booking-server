@@ -1295,7 +1295,7 @@ portal = require("./agent-portal")({
      the same branded email and PDF the website sends - not a second version
      that drifts. fareForBooking is read at call time, so it sees the
      point-to-point module mounted further down. */
-  bookingPdf, bookingEmailHtml, guestAttachments, fareForBooking, returnLeg, hourlyHours, normaliseAddresses,
+  bookingPdf, bookingEmailHtml, guestAttachments, fareForBooking, returnLeg, hourlyHours, normaliseAddresses, COMPANY,
   HUB_NAMES: [OOL, BNE, CRUISE],
   PLACES_FOR_AGENTS: [OOL, BNE, CRUISE]
     .concat(Object.keys(SUBURBS).sort())
