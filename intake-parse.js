@@ -55,8 +55,8 @@ function parseTime(s) {
 
 function parseVehicle(s, classes) {
   const t = String(s || "").toLowerCase();
-  const map = [[/sprinter.*18|18.?seat|mini ?coach/, "Mercedes Sprinter 18-Seater"], [/sprinter.*14|14.?seat|1[2-4] ?seat/, "Mercedes Sprinter 14-Seater"],
-    [/sprinter.*10|10.?seat|1[01] ?seat/, "Mercedes Sprinter 10-Seater"], [/v.?class|luxury (mini)?van|lux(ury)? people/, "Luxury Minivan"],
+  const map = [[/sprinter.*18|18.?seat|mini ?coach/, "Mercedes Sprinter 18-Seater"], [/sprinter.*14|14.?seat|1[2-4][ -]?seat/, "Mercedes Sprinter 14-Seater"],
+    [/sprinter.*10|10.?seat|1[01][ -]?seat/, "Mercedes Sprinter 10-Seater"], [/v.?class|luxury (mini)?van|lux(ury)? people/, "Luxury Minivan"],
     [/lux(ury)? sedan|lexus|executive|prestige/, "Luxury Sedan"], [/people ?mover|minivan|carnival|van|7 ?seat/, "People Mover"],
     [/suv/, "SUV"], [/sedan|car\b|standard/, "Sedan"]];
   for (const [re, cls] of map) if (re.test(t) && (!classes || classes.includes(cls))) return cls;
