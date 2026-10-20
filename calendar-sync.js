@@ -235,7 +235,10 @@ module.exports = function calendarSync(ctx) {
 
     if (/\b(time )?tbc\b|\bto be confirmed\b/i.test(s)) checks.push("the calendar says something is still TBC");
     if (!j.name) checks.push("no passenger name");
-    if (!j.phone) checks.push("no passenger phone");
+    /* Agencies often don't pass on the guest's mobile, and the agency itself
+       is the contact (Aman, 21 Oct 2026) - so only a direct booking with no
+       phone is worth a Check. */
+    if (!j.phone && !j.account) checks.push("no passenger phone");
     const st = /\bST-\d{6}-[A-Z0-9]{4}\b/.exec(s + " " + d + " " + ev.location);
     j.stRef = st ? st[0] : null;
     return { job: j, checks };
