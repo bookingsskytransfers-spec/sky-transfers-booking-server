@@ -142,7 +142,11 @@ module.exports = function installBilling(ctx) {
   async function billedRefs() {
     const { rows } = await pool.query(
       `SELECT l.ref FROM ops_invoice_lines l JOIN ops_invoices i ON i.id = l.invoice_id WHERE i.status <> 'void'`);
-    return new Set(rows.map((r) => r.ref));
+    /* An agent booking paid by card on its own (20 Oct 2026) is settled
+       already, so it never goes on the monthly invoice. The column belongs
+       to agent-portal.js; before it exists there is simply nothing to skip. */
+    const card = await pool.query(`SELECT ref FROM agent_bookings WHERE card_paid_at IS NOT NULL`).catch(() => ({ rows: [] }));
+    return new Set(rows.map((r) => r.ref).concat(card.rows.map((r) => r.ref)));
   }
   async function getAccount(id) {
     const { rows } = await pool.query(`SELECT * FROM ops_accounts WHERE id = $1`, [id]);
