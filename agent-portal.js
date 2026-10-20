@@ -24,7 +24,7 @@ module.exports = function installAgentPortal(ctx) {
     /* The website's own confirmation pieces, so what the office sends a guest
        is byte-for-byte what the site would have sent. */
     bookingPdf, bookingEmailHtml, guestAttachments, fareForBooking, returnLeg, HUB_NAMES,
-    hourlyHours,
+    hourlyHours, normaliseAddresses,
   } = ctx;
   const hoursOf = (b) => (typeof hourlyHours === "function" ? hourlyHours(b) : null);
   const { Pool } = require("pg");
@@ -199,6 +199,10 @@ module.exports = function installAgentPortal(ctx) {
       ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS cancelled_at     TIMESTAMPTZ;
       ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS refunded_cents   INTEGER NOT NULL DEFAULT 0;
       ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS cancel_note      TEXT;
+      -- the two ends' street addresses on their own (20 Oct 2026); the address
+      -- column keeps the single combined line the dispatch text has always had
+      ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS pu_address       TEXT;
+      ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS do_address       TEXT;
       CREATE INDEX IF NOT EXISTS web_bookings_recent ON web_bookings (created_at DESC);
       CREATE INDEX IF NOT EXISTS web_bookings_status ON web_bookings (status, created_at DESC);
     `);
@@ -1336,6 +1340,7 @@ module.exports = function installAgentPortal(ctx) {
     pickup: r.pickup, dropoff: r.dropoff, vehicle: r.vehicle,
     name: r.passenger_name, phone: r.passenger_phone, email: r.passenger_email,
     flight: r.flight, address: r.address, notes: r.notes,
+    puAddress: r.pu_address || "", doAddress: r.do_address || "",
     pax: r.pax, childSeats: r.child_seats, trailer: r.trailer,
     returnDate: r.return_date, returnTime: r.return_time, returnFlight: r.return_flight,
     hours: r.hire_hours || null,
@@ -1360,8 +1365,8 @@ module.exports = function installAgentPortal(ctx) {
          (ref, pickup, dropoff, vehicle, pickup_date, pickup_time, passenger_name,
           passenger_phone, passenger_email, flight, address, notes, pax, child_seats,
           trailer, total_cents, status, user_agent, return_date, return_time, return_flight,
-          payment_intent, hire_hours, stops, confirmed_at, paid_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,
+          payment_intent, hire_hours, stops, pu_address, do_address, confirmed_at, paid_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,
                CASE WHEN $17 IN ('confirmed','paid') THEN now() END,
                CASE WHEN $17 = 'paid' THEN now() END)
        ON CONFLICT (ref) DO UPDATE SET
@@ -1371,6 +1376,8 @@ module.exports = function installAgentPortal(ctx) {
          status       = CASE WHEN web_bookings.status IN ('paid', 'cancelled') THEN web_bookings.status
                              ELSE EXCLUDED.status END,
          stops        = COALESCE(web_bookings.stops, EXCLUDED.stops),
+         pu_address   = COALESCE(web_bookings.pu_address, EXCLUDED.pu_address),
+         do_address   = COALESCE(web_bookings.do_address, EXCLUDED.do_address),
          total_cents  = GREATEST(web_bookings.total_cents, EXCLUDED.total_cents),
          confirmed_at = COALESCE(web_bookings.confirmed_at, EXCLUDED.confirmed_at),
          paid_at      = COALESCE(web_bookings.paid_at, EXCLUDED.paid_at),
@@ -1386,7 +1393,9 @@ module.exports = function installAgentPortal(ctx) {
        String((b && b.returnTime) || "").trim() || null,
        String((b && b.returnFlight) || "").trim().slice(0, 40) || null,
        String((b && b.paymentIntent) || "").trim() || null,
-       hoursOf(b), stopsJson(b)]
+       hoursOf(b), stopsJson(b),
+       String((b && b.pickupAddress) || "").trim().slice(0, 300) || null,
+       String((b && b.dropoffAddress) || "").trim().slice(0, 300) || null]
     );
     /* Paid means the link has done its job. Switching it off stops a second
        payment and stops a forwarded link being payable by anyone else. */
@@ -1566,6 +1575,8 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
         return_date: String(r.return_date_text || ""), return_time: String(r.return_time || ""),
         return_flight: String(r.return_flight || "").slice(0, 40),
         hours: r.hire_hours ? String(r.hire_hours) : "",
+        pu_address: String(r.pu_address || "").slice(0, 300),
+        do_address: String(r.do_address || "").slice(0, 300),
       },
       after_completion: {
         type: "redirect",
@@ -1786,6 +1797,7 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
       email: r.passenger_email || "", address: r.address || "", notes: r.notes || "",
       returnDate: r.return_date_text || "", returnTime: r.return_time || "",
       returnFlight: r.return_flight || "",
+      pickupAddress: r.pu_address || "", dropoffAddress: r.do_address || "",
       hourly: r.hire_hours ? { hours: r.hire_hours } : undefined,
       paid: r.status === "paid", confirmed: r.status === "confirmed" || r.status === "paid",
       ...(() => { const j = stopsOf(r); return j ? { stops: j.list, stopsExtra: j.extra || 0, stopsKm: j.km } : {}; })(),
@@ -1857,6 +1869,9 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
       trailer: b0.trailer === true || b0.trailer === "true",
       name: String(b0.name || "").trim(), phone: String(b0.phone || "").trim(),
       email: String(b0.email || "").trim(), address: String(b0.address || "").trim(),
+      /* the two ends' street addresses, when the form sends them separately */
+      ...(b0.pickupAddress != null || b0.dropoffAddress != null
+        ? { pickupAddress: String(b0.pickupAddress || ""), dropoffAddress: String(b0.dropoffAddress || "") } : {}),
       notes: String(b0.notes || "").trim().slice(0, 450),
       returnDate: isoDate(b0.returnDate), returnTime: hhmm(b0.returnTime),
       returnFlight: String(b0.returnFlight || "").trim().slice(0, 40),
@@ -1886,6 +1901,8 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
       b.returnDate = ""; b.returnTime = ""; b.returnFlight = "";
       b.stops = [];
     }
+    /* keeps `address` - the dispatch text's single line - in step with them */
+    if (typeof normaliseAddresses === "function") normaliseAddresses(b);
     const missing = ["pickup", "dropoff", "vehicle", "date", "time", "name", "phone"].filter((f) => !b[f]);
     if (missing.length) return refuse("Please fill in: " + missing.join(", ") + ".");
     if (b.pickup === b.dropoff) return refuse("Pick-up and drop-off are the same place.");
@@ -2069,13 +2086,15 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
            passenger_name = $7, passenger_phone = $8, passenger_email = $9, flight = $10,
            address = $11, notes = $12, pax = $13, child_seats = $14, trailer = $15,
            total_cents = $16, return_date = $17, return_time = $18, return_flight = $19,
-           stops = $20, hire_hours = $21, balance_cents = 0, balance_link_id = NULL, balance_link_url = NULL` +
+           stops = $20, hire_hours = $21, pu_address = $22, do_address = $23,
+           balance_cents = 0, balance_link_id = NULL, balance_link_url = NULL` +
         /* An unpaid booking's link is replaced; a paid one keeps its payment history. */
         (wasPaid ? "" : ", payment_link_id = NULL, payment_link_url = NULL, link_seq = link_seq + 1") +
         ` WHERE ref = $1`,
         [ref, b.pickup, b.dropoff, b.vehicle, b.date, b.time, b.name, b.phone, b.email || null,
          b.flight || null, b.address || null, b.notes || null, b.pax, b.childSeats, b.trailer,
-         newCents, b.returnDate || null, b.returnTime || null, b.returnFlight || null, stopsJson(b), hoursOf(b)]);
+         newCents, b.returnDate || null, b.returnTime || null, b.returnFlight || null, stopsJson(b), hoursOf(b),
+         b.pickupAddress || null, b.dropoffAddress || null]);
 
       /* An earlier balance link, if any, is now wrong - switch it off. */
       if (r.balance_link_id && stripe) {
