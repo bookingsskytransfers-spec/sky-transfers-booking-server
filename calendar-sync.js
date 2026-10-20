@@ -202,8 +202,12 @@ module.exports = function calendarSync(ctx) {
        or a sentence about which coach is free is not a vehicle. */
     const vRaw = (vLab || "").replace(/\(.*?\)/g, "").trim();
     const vWords = /seat|coach|bus|van|sprinter|limo|sedan|suv|v-?class|wagon|minivan|car\b/i.test(vRaw) && vRaw.length <= 40;
-    j.vehicle = parseVehicle(vLab, VEHICLES) || parseVehicle(vParen, VEHICLES) || parseVehicle(body.join(" "), VEHICLES) || (vWords ? vRaw.slice(0, 80) : "");
-    if (!j.vehicle) checks.push(vRaw ? "vehicle unclear - see the calendar notes" : "no vehicle given");
+    /* BusCharter always books the 21-seat minibus (Aman, 21 Oct 2026). */
+    const busCharter = /bus\s*charter/i.test((j.account || "") + " " + s + " " + first(L.account));
+    j.vehicle = busCharter ? "21 Seat Mini Bus"
+      : parseVehicle(vLab, VEHICLES) || parseVehicle(vParen, VEHICLES) || parseVehicle(body.join(" "), VEHICLES) || (vWords ? vRaw.slice(0, 80) : "");
+    if (busCharter) { /* known, assigned by hand as always */ }
+    else if (!j.vehicle) checks.push(vRaw ? "vehicle unclear - see the calendar notes" : "no vehicle given");
     else if (VEHICLES.indexOf(j.vehicle) === -1) checks.push(`vehicle "${j.vehicle}" isn't one of our classes - assign it by hand`);
     const many = /\b(\d+)\s*x\s+[a-z]/i.exec(vLab + " " + s) || /\b(\d+)\s+vehicles\b/i.exec(s + " " + d);
     if (many && +many[1] > 1) checks.push(`needs ${many[1]} vehicles - the board holds it as one job; add the others by hand`);
