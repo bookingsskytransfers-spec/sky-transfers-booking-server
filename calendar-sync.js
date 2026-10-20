@@ -231,7 +231,9 @@ module.exports = function calendarSync(ctx) {
     j.trailer = /\btrailer( is)? required\b|\btrailer:\s*(yes|required)/i.test(d);
     const mins = ev.end && !ev.end.allDay ? Math.round((ev.end.ms - ev.start.ms) / 60000) : 0;
     j.hours = mins >= 180 && /\b(hours?|shuttle|charter|as directed|hire)\b/i.test(s + " " + d) ? Math.min(Math.ceil(mins / 60), 24) : null;
-    if (j.hours) checks.push(`by the hour: ${j.hours} h, from the calendar's ${Math.round(mins / 6) / 10} h`);
+    /* The hours are still set; BusCharter's shuttles are always by the
+       hour, so for them it is not worth a Check (Aman, 21 Oct 2026). */
+    if (j.hours && !/bus\s*charter/i.test((j.account || "") + " " + s)) checks.push(`by the hour: ${j.hours} h, from the calendar's ${Math.round(mins / 6) / 10} h`);
 
     if (/\b(time )?tbc\b|\bto be confirmed\b/i.test(s)) checks.push("the calendar says something is still TBC");
     if (!j.name) checks.push("no passenger name");
