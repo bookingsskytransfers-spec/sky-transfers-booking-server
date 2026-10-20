@@ -163,10 +163,27 @@ const VEHICLE_ALIASES = {
    MUST match HOURLY_RATES / HOURLY_HOURS in index.html. */
 const HOURLY_RATES = [90, 100, 115, 125, 135, 160, 185, null];
 const HOURLY_MIN_HOURS = 3, HOURLY_MAX_HOURS = 6;
+/* A booking can be held for 1 to 16 hours, but only 3 to 6 has an online
+   price (baseFareForBooking). Longer - or shorter - is charter work the office
+   books from admin.html at an agreed total; past six hours it is worded as a
+   charter on everything the guest sees (20 Oct 2026). */
+const HIRE_MIN_HOURS = 1, HIRE_MAX_HOURS = 16;
 function hourlyHours(b) {
   const h = b && b.hourly && parseInt(b.hourly.hours, 10);
-  return Number.isInteger(h) && h >= HOURLY_MIN_HOURS && h <= HOURLY_MAX_HOURS ? h : null;
+  return Number.isInteger(h) && h >= HIRE_MIN_HOURS && h <= HIRE_MAX_HOURS ? h : null;
 }
+const isCharterHire = (b) => (hourlyHours(b) || 0) > HOURLY_MAX_HOURS;
+/* "Charter — 8 hours as directed" / "By the hour — 4 hours as directed" */
+const hireLabel = (b) => `${isCharterHire(b) ? "Charter" : "By the hour"} — ${hourlyHours(b)} hours as directed`;
+/* What a hire includes - not the airport list (name board at arrivals,
+   flight tracking), which is meaningless for a vehicle held by the hour.
+   HTML-escaped for the email; the PDF unescapes &amp;. */
+const includedForHire = (b) => [
+  `Your own chauffeur and vehicle for the ${hourlyHours(b)} hours booked — never shared`,
+  "Stops and changes of plan along the way, as you direct",
+  "Free changes &amp; cancellation to 24 hours before pick-up",
+  isCharterHire(b) ? "The agreed price above is final" : "No surge pricing — the fare above is final",
+];
 const CHILD_SEAT_PRICE = 15; // per seat, AUD
 const TRAILER_PRICE = 30;    // luggage trailer, AUD
 
@@ -186,7 +203,7 @@ async function baseFareForBooking(b) {
     const h = hourlyHours(b);
     const vi = VEHICLES.indexOf(VEHICLE_ALIASES[b.vehicle] || b.vehicle);
     const rate = vi === -1 ? null : HOURLY_RATES[vi];
-    return h && rate ? rate * h : null;
+    return h && h >= HOURLY_MIN_HOURS && h <= HOURLY_MAX_HOURS && rate ? rate * h : null;
   }
   if (b && b.p2p && p2p && typeof p2p.fareFor === "function") return p2p.fareFor(b);
   if (b && b.km && kmq && typeof kmq.fareFor === "function") return kmq.fareFor(b);
@@ -335,7 +352,7 @@ function bookingPdf(b, s) {
       ["OUTBOUND", `${b.pickup}  to  ${b.dropoff}\n${niceDate(b.date)} at ${b.time}`],
       ["RETURN", `${b.dropoff}  to  ${b.pickup}\n${niceDate(ret.date)} at ${ret.time}`],
     ] : hourlyHours(b) ? [
-      ["HIRE", `By the hour — ${hourlyHours(b)} hours as directed`],
+      [isCharterHire(b) ? "CHARTER" : "HIRE", hireLabel(b)],
       ["STARTS", `${b.pickup}\n${niceDate(b.date)} at ${b.time}`],
     ] : [
       ["ROUTE", `${b.pickup}  to  ${b.dropoff}`],
@@ -347,6 +364,8 @@ function bookingPdf(b, s) {
       b.flight ? [ret ? "OUTBOUND FLIGHT" : "FLIGHT", b.flight] : null,
       ret && ret.flight ? ["RETURN FLIGHT", ret.flight] : null,
       b.address ? ["PICK-UP / DROP-OFF ADDRESS", b.address] : null,
+      /* on a hire the notes are the itinerary, which the guest should see */
+      hourlyHours(b) && b.notes ? ["ITINERARY", String(b.notes)] : null,
       ["LEAD PASSENGER", `${b.name}   ·   ${b.phone}`],
       ["EXTRAS", extras + (ret && extras !== "None" ? "  (each leg)" : "")],
     ]).filter(Boolean);
@@ -381,7 +400,7 @@ function bookingPdf(b, s) {
         .text(`Both legs${extras !== "None" ? ", extras each leg" : ""} · ${Math.round(RETURN_DISCOUNT * 100)}% return discount included`, L + 20, y + 26);
     } else if (hourlyHours(b)) {
       doc.font("Helvetica").fontSize(8).fillColor(MUTED)
-        .text(`${hourlyHours(b)} hours, chauffeur and vehicle at your disposal · the same rate at any hour`, L + 20, y + 26);
+        .text(`${hourlyHours(b)} hours, chauffeur and vehicle at your disposal` + (isCharterHire(b) ? " · the agreed price" : " · the same rate at any hour"), L + 20, y + 26);
     }
     doc.font("Times-Roman").fontSize(24).fillColor(INK)
       .text(`$${s.total}`, L, y + 10, { width: CW - 20, align: "right" });
@@ -392,9 +411,9 @@ function bookingPdf(b, s) {
 
     // ---------- Included ----------
     y += 66;
-    doc.font("Helvetica-Bold").fontSize(8).fillColor(MUTED).text("INCLUDED WITH EVERY TRANSFER", L, y, { characterSpacing: 1.5 });
+    doc.font("Helvetica-Bold").fontSize(8).fillColor(MUTED).text(hourlyHours(b) ? "INCLUDED" : "INCLUDED WITH EVERY TRANSFER", L, y, { characterSpacing: 1.5 });
     y += 14;
-    const inc = [
+    const inc = hourlyHours(b) ? includedForHire(b).map((t) => t.replace(/&amp;/g, "&")) : [
       "Meet & greet — your chauffeur waits at arrivals with a name board",
       "Flight tracking with 30 minutes' free airport waiting (60 min international at BNE)",
       "Free changes and cancellation up to 24 hours before pick-up",
@@ -493,7 +512,7 @@ function bookingEmailHtml(b, s) {
     <tr><td style="padding:10px 36px 4px;">
       <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
         ${ret ? row("TRIP", "Return — two transfers on one booking") : ""}
-        ${hrs ? row("HIRE", `By the hour — ${hrs} hours as directed`) : ""}
+        ${hrs ? row(isCharterHire(b) ? "CHARTER" : "HIRE", hireLabel(b)) : ""}
         ${ret
           ? row("OUTBOUND", `${b.pickup}  →  ${b.dropoff}  ·  ${niceDate(b.date)} at ${b.time}`)
           : hrs ? row("STARTS", `${b.pickup}  ·  ${niceDate(b.date)} at ${b.time}`)
@@ -508,6 +527,7 @@ function bookingEmailHtml(b, s) {
         ${row(ret ? "OUTBOUND FLIGHT" : "FLIGHT", b.flight)}
         ${ret ? row("RETURN FLIGHT", ret.flight) : ""}
         ${row("PICK-UP / DROP-OFF ADDRESS", b.address)}
+        ${hrs ? row("ITINERARY", b.notes) : ""}
         ${row("EXTRAS", extras + (ret && extras !== "None" ? " (each leg)" : ""))}
       </table>
     </td></tr>
@@ -528,7 +548,7 @@ function bookingEmailHtml(b, s) {
       ${ret ? `<div style="font:400 12px Arial,sans-serif;color:#68707F;padding-top:8px;text-align:right;">
         Covers both legs${extras !== "None" ? ", with extras charged each leg" : ""} &middot; includes the ${Math.round(RETURN_DISCOUNT * 100)}% return discount.</div>`
         : hrs ? `<div style="font:400 12px Arial,sans-serif;color:#68707F;padding-top:8px;text-align:right;">
-        ${hrs} hours with the chauffeur and vehicle at your disposal &middot; the same rate at any hour.</div>` : ""}
+        ${hrs} hours with the chauffeur and vehicle at your disposal &middot; ${isCharterHire(b) ? "the agreed price" : "the same rate at any hour"}.</div>` : ""}
       <div style="font:400 12px Arial,sans-serif;color:#68707F;padding-top:${ret ? 2 : 8}px;text-align:right;">
         ${paid && s.balance ? `Paid $${s.total - s.balance} by card &middot; $${s.balance} balance to pay with the button above.`
           : paid && s.refund ? `Paid securely by card via Stripe &middot; $${s.refund} refunded to your card.`
@@ -539,12 +559,14 @@ function bookingEmailHtml(b, s) {
 
     <!-- What's included -->
     <tr><td style="padding:14px 36px 4px;">
-      <div style="font:700 10px Arial,sans-serif;letter-spacing:1.5px;color:#68707F;padding-bottom:8px;">INCLUDED WITH EVERY TRANSFER</div>
+      <div style="font:700 10px Arial,sans-serif;letter-spacing:1.5px;color:#68707F;padding-bottom:8px;">${hrs ? "INCLUDED" : "INCLUDED WITH EVERY TRANSFER"}</div>
       <div style="font:400 13.5px/1.9 Arial,sans-serif;color:#333B4C;">
-        <span style="color:#C9A227;">&#9679;</span>&nbsp; Meet &amp; greet with a name board at arrivals<br>
-        <span style="color:#C9A227;">&#9679;</span>&nbsp; Flight tracking &middot; 30 min free waiting (60 min international at BNE)<br>
-        <span style="color:#C9A227;">&#9679;</span>&nbsp; Free changes &amp; cancellation to 24 hours before pick-up<br>
-        <span style="color:#C9A227;">&#9679;</span>&nbsp; Fixed fare — no surge pricing, ever
+        ${(hrs ? includedForHire(b) : [
+          "Meet &amp; greet with a name board at arrivals",
+          "Flight tracking &middot; 30 min free waiting (60 min international at BNE)",
+          "Free changes &amp; cancellation to 24 hours before pick-up",
+          "Fixed fare — no surge pricing, ever",
+        ]).map((t) => `<span style="color:#C9A227;">&#9679;</span>&nbsp; ${t}`).join("<br>\n        ")}
       </div>
     </td></tr>
 
@@ -661,7 +683,7 @@ function bookingSummary(b, fare, seats, trailer, ret) {
      lines are therefore inserted only when there is a return. */
   const hrs = hourlyHours(b);
   const hourlyLines = hrs ? [
-    `Hire: BY THE HOUR — ${hrs} hours as directed from ${b.time}`,
+    `Hire: ${isCharterHire(b) ? "CHARTER" : "BY THE HOUR"} — ${hrs} hours as directed from ${b.time}`,
   ] : [];
   const returnLines = ret ? [
     `Trip: RETURN`,
@@ -1116,7 +1138,7 @@ app.post("/stripe-webhook", async (req, res) => {
       const total = Math.round((sess.amount_total || 0) / 100);
       const ret = returnLeg(b);
       const s = { total, isReturn: !!ret, text: bookingSummary(b, 0, b.childSeats, b.trailer, ret).text
-        .replace(/Fare: \$0 one-way\n/, "")
+        .replace(/^Fare: \$0 (one-way|for \d+ hours.*)\n/m, "")
         .replace(/^Return fare: .*\n/m, "")
         .replace(/TOTAL: \$\d+/, `TOTAL: $${total} (PAID)`) };
       const pdf = await bookingPdf(b, s).catch((e) => { console.error("PDF failed:", e.message); return null; });
@@ -1132,7 +1154,9 @@ app.post("/stripe-webhook", async (req, res) => {
           from: `"Sky Transfers" <${process.env.GMAIL_USER}>`,
           to: b.email, replyTo: BOOKINGS_EMAIL,
           subject: `Booking confirmed & paid — Sky Transfers · ${b.ref}`,
-          text: `Hi ${b.name},\n\nPayment received — your transfer is confirmed. Your printable confirmation is attached.\n\n${s.text}\n\nWe track your flight and your chauffeur meets you with a name board. Free changes to 24 hours before pick-up: reply to this email or call +61 481 437 772.\n\nSky Transfers — Gold Coast & Brisbane airport transfers\nwww.skytransfers.com.au`,
+          text: `Hi ${b.name},\n\nPayment received — your ${hourlyHours(b) ? "booking" : "transfer"} is confirmed. Your printable confirmation is attached.\n\n${s.text}\n\n` +
+            (hourlyHours(b) ? "Your chauffeur will be at the pick-up at the time above. " : "We track your flight and your chauffeur meets you with a name board. ") +
+            `Free changes to 24 hours before pick-up: reply to this email or call +61 481 437 772.\n\nSky Transfers — Gold Coast & Brisbane airport transfers\nwww.skytransfers.com.au`,
           html: bookingEmailHtml(b, s),
           attachments: guestAttachments(pdf),
         });
