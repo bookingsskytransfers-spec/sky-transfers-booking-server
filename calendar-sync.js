@@ -112,7 +112,7 @@ module.exports = function calendarSync(ctx) {
   /* ---- an event as a job ---------------------------------------------------- */
   const sha = (s) => crypto.createHash("sha1").update(s).digest("hex");
   const squash = (s) => String(s || "").toLowerCase().replace(/&/g, "and").replace(/[^a-z0-9]/g, "");
-  const NOT_GIVEN = /\b(not (supplied|stated|given|quoted|provided)|tbc|tba|to be (confirmed|advised)|unknown)\b/i;
+  const NOT_GIVEN = /\b(not (supplied|stated|given|quoted|provided|specified)|tbc|tba|to be (confirmed|advised)|unknown)\b/i;
   const ARROW = /\s*(?:→|->|=>|➔)\s*/;
   const PHONE = /(\+?\d[\d ()-]{7,}\d)/;
   function labels(text) {
@@ -137,25 +137,41 @@ module.exports = function calendarSync(ctx) {
   const cleanName = (s) => String(s || "").replace(/\(.*?\)/g, "").split(/\s+[—–-]\s+|,|;/)[0].replace(PHONE, "").trim().slice(0, 120);
 
   function mapEvent(ev, known) {
-    const s = ev.summary, d = ev.description, L = labels(d), checks = [];
+    const d = ev.description, L = labels(d), checks = [];
+    /* "07:15 KIFF & Culture - ...", "06:00-14:30 BusCharter ...": the time
+       at the front is the office's note, not part of the name */
+    const tm = /^\s*(\d{1,2})[:.](\d{2})(?:\s*[-–]\s*\d{1,2}[:.]\d{2})?\s+/.exec(ev.summary);
+    const s = tm ? ev.summary.slice(tm[0].length) : ev.summary;
     const segs = s.split(/\s+[-–—]\s+/).map((x) => x.trim()).filter(Boolean);
     const warn = segs.filter((x) => /^⚠|^(time tbc|tbc)$|\bvehicles?\b/i.test(x));
     const body = segs.filter((x) => warn.indexOf(x) === -1);
     const j = { date: ev.start.date, time: ev.start.time };
+    if (tm) {
+      const tt = tm[1].padStart(2, "0") + ":" + tm[2];
+      if (tt !== j.time) checks.push(`the title says ${tt} but the event starts at ${j.time} - check which is right`);
+    }
 
     /* where: the location's "A -> B" first, then labelled lines */
     const loc = ev.location.split(ARROW);
-    j.pickup = (loc.length >= 2 ? loc[0] : first(L.pickup) || (loc.length === 1 ? loc[0] : "")).replace(/^\d{1,2}:\d{2}\s*(am|pm)?\s*(from\s+)?/i, "").trim().slice(0, 200);
-    j.dropoff = (loc.length >= 2 ? loc.slice(1).join(" -> ") : first(L.dropoff)).trim().slice(0, 200);
+    const noTime = (x) => String(x || "").replace(/^\d{1,2}:\d{2}\s*(am|pm)?\s*(from\s+)?/i, "").replace(/\s*[-–]\s*\d{1,2}[:.]\d{2}\s*(am|pm)?\s*$/i, "").trim().slice(0, 200);
+    j.pickup = noTime(loc.length >= 2 ? loc[0] : first(L.pickup) || (loc.length === 1 ? loc[0] : ""));
+    j.dropoff = noTime(loc.length >= 2 ? loc.slice(1).join(" -> ") : first(L.dropoff));
 
-    /* who books it */
+    /* who books it: a labelled supplier, or the first part of a title that
+       has the supplier, the passenger and the trip ("Yarra Tours - Ms X
+       (3 Pax) - A -> B"). A two-part title ("Colleen Nieves - A -> B") is a
+       passenger booking direct, unless the name is a known account. */
+    const isAcct = (k, n) => { const q = squash(n); return q && (q === k || (q.length >= 4 && k.indexOf(q) !== -1) || (k.length >= 4 && q.indexOf(k) !== -1)); };
+    const knownHit = (x) => { const k = squash(x); return k ? known.find((n) => isAcct(k, n)) : null; };
+    const person = (x) => /^(mr|mrs|ms|miss|dr|mx)\b\.?/i.test(x) || /\bpax\b|\d{3,}/i.test(x) || ARROW.test(x);
+    const head = (body[0] || "").replace(/\s+(res#?|ref\.?|booking)\s*[#:]?\s*\S+.*$/i, "").replace(/\s*[\/|].*$/, "").trim();
     let acct = cleanName(first(L.account));
-    if (!acct && body.length > 1 && !/^(web|website|private|direct)\b/i.test(body[0]) && !parseVehicle(body[0], VEHICLES) && !/\bpax\b|\d{3,}/i.test(body[0])) acct = cleanName(body[0]);
-    if (acct) {
-      const k = squash(acct);
-      const hit = known.find((n) => { const q = squash(n); return q && (q === k || (q.length >= 4 && k.indexOf(q) !== -1) || (k.length >= 4 && q.indexOf(k) !== -1)); });
-      if (hit) j.account = hit; else { j.account = acct; checks.push(`"${acct}" isn't set up as an account on the Invoices tab`); }
-    } else j.account = null;
+    if (!acct && head && !/^(web|website|private|direct)\b/i.test(head) && !parseVehicle(head, VEHICLES) && !person(head)) {
+      if (body.length >= 3 || knownHit(head)) acct = cleanName(head);
+    }
+    /* A name not yet on the Invoices tab is kept as written; the invoice
+       screen already lists such names as "Not set up". */
+    j.account = acct ? (knownHit(acct) || acct) : null;
     j.web = /^(web|website)\b/i.test(segs[0] || "");
     const refSeg = body.find((x) => /^(res#?\s*\S+|#?\d{5,}|[A-Z]{2,}[A-Z0-9]*\d{4,}[A-Z0-9]*)$/i.test(x));
     /* "TOUR REFERENCE: AKWT181026 GROUP NAME" - the reference is the code */
@@ -163,22 +179,31 @@ module.exports = function calendarSync(ctx) {
     j.accountRef = ((/\d/.test(refTok) ? refTok : refLab) || refSeg || "").replace(/^res#?\s*|^#/i, "").trim().slice(0, 60) || null;
 
     /* the passenger */
-    const paxSeg = body.find((x) => /\(\s*\d+\s*pax\s*\)/i.test(x));
+    const PAXRE = /\(?\s*(\d+)(?:\s*[-–]\s*(\d+))?\s*pax\b[^)]*\)?/i;
+    const paxSeg = body.find((x) => PAXRE.test(x) && !ARROW.test(x) && !/^(web|private)\b/i.test(x));
     const nameLab = first(L.name, (v) => !/^\d+\s*(adults?|pax)/i.test(v));
-    j.name = cleanName(nameLab) || (paxSeg ? cleanName(paxSeg.replace(/\(\s*\d+\s*pax\s*\)/i, "")) : "");
+    j.name = cleanName(nameLab) || (paxSeg ? cleanName(paxSeg.replace(PAXRE, "")) : "");
+    j.name = j.name.split(/\.\s/)[0].replace(/\.$/, "").trim();
+    if (j.account && squash(j.name) === squash(j.account)) j.name = "";
     const phoneSrc = [first(L.phone)].concat(L.name || []).find((v) => v && PHONE.test(v)) || "";
     j.phone = phoneSrc ? (PHONE.exec(phoneSrc) || [""])[0].trim().slice(0, 40) : "";
     const em = first(L.email); const emm = /[^\s@<>()]+@[^\s@<>()]+\.[a-z]{2,}/i.exec(em || (/\(email:\s*([^)\s]+)\)/i.exec(d) || [])[1] || "");
     j.email = emm ? emm[0].toLowerCase() : null;
-    const paxM = /\(\s*(\d+)\s*pax\s*\)/i.exec(s) || /(\d+)/.exec(first(L.pax, (v) => /\d/.test(v)) || "");
-    j.pax = paxM ? Math.min(Math.max(+paxM[1], 1), 60) : 1;
+    /* "(3 Pax)", "(10-11 pax, ...)" - the larger number of a range */
+    const paxM = /\b(\d+)(?:\s*[-–]\s*(\d+))?\s*pax\b/i.exec(s) || /(\d+)/.exec(first(L.pax, (v) => /\d/.test(v)) || "");
+    j.pax = paxM ? Math.min(Math.max(+(paxM[2] || paxM[1]), 1), 60) : 1;
     if (!paxM) checks.push("number of passengers not given");
 
     /* the vehicle */
     const vLab = first(L.vehicle);
     const vParen = (/\(([^()]*)\)\s*$/.exec(s) || [])[1] || "";
-    j.vehicle = parseVehicle(vLab, VEHICLES) || parseVehicle(vParen, VEHICLES) || parseVehicle(body.join(" "), VEHICLES) || (vLab || "").replace(/\(.*?\)/g, "").trim().slice(0, 80);
-    if (!j.vehicle) checks.push("no vehicle given");
+    /* A vehicle line that isn't one of our classes is kept as written only
+       when it names a vehicle ("21 Seat Mini Bus"); "Airport transfer", "P2P"
+       or a sentence about which coach is free is not a vehicle. */
+    const vRaw = (vLab || "").replace(/\(.*?\)/g, "").trim();
+    const vWords = /seat|coach|bus|van|sprinter|limo|sedan|suv|v-?class|wagon|minivan|car\b/i.test(vRaw) && vRaw.length <= 40;
+    j.vehicle = parseVehicle(vLab, VEHICLES) || parseVehicle(vParen, VEHICLES) || parseVehicle(body.join(" "), VEHICLES) || (vWords ? vRaw.slice(0, 80) : "");
+    if (!j.vehicle) checks.push(vRaw ? "vehicle unclear - see the calendar notes" : "no vehicle given");
     else if (VEHICLES.indexOf(j.vehicle) === -1) checks.push(`vehicle "${j.vehicle}" isn't one of our classes - assign it by hand`);
     const many = /\b(\d+)\s*x\s+[a-z]/i.exec(vLab + " " + s) || /\b(\d+)\s+vehicles\b/i.exec(s + " " + d);
     if (many && +many[1] > 1) checks.push(`needs ${many[1]} vehicles - the board holds it as one job; add the others by hand`);
@@ -188,6 +213,7 @@ module.exports = function calendarSync(ctx) {
     const pm = /([\d,]+(?:\.\d{1,2})?)/.exec(String(priceTxt).replace(/^[^\d]*/, ""));
     j.priceCents = pm ? Math.round(+pm[1].replace(/,/g, "") * 100) : null;
     if (j.priceCents == null) checks.push("no price");
+    else if (/\btotal\b|\bruns?\b|\btrips\b/i.test(priceTxt) && !/\(\s*\$/.test(priceTxt.slice(0, 3))) checks.push("the price may be a total for several trips - check it's this one's");
     const fl = first(L.flight) || (/\(([A-Z0-9]{2})-?\s?(\d{1,4})\b[^)]*\)/.exec(s) || []).slice(1, 3).join("");
     j.flight = (/\b([A-Z0-9]{2})-?\s?(\d{1,4})\b/.exec(String(fl).toUpperCase()) || []).slice(1, 3).join("") || null;
     const seatM = /(\d+)\s*x?\s*(baby|child|booster|infant)\s*seats?/i.exec(d) || /(baby|child|booster)\s*seats?\s*:?\s*(\d+)/i.exec(d);
