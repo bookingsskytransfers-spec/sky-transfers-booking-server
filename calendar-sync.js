@@ -213,7 +213,9 @@ module.exports = function calendarSync(ctx) {
     const pm = /([\d,]+(?:\.\d{1,2})?)/.exec(String(priceTxt).replace(/^[^\d]*/, ""));
     j.priceCents = pm ? Math.round(+pm[1].replace(/,/g, "") * 100) : null;
     if (j.priceCents == null) checks.push("no price");
-    else if (/\btotal\b|\bruns?\b|\btrips\b/i.test(priceTxt) && !/\(\s*\$/.test(priceTxt.slice(0, 3))) checks.push("the price may be a total for several trips - check it's this one's");
+    /* "$10,746 total for 12 runs" is a total; "$895.50 ($7,164 total for 8
+       runs)" is the price of one, with the total in brackets */
+    else if (/\btotal\b|\bruns?\b|\btrips\b/i.test(String(priceTxt).split("(")[0])) checks.push("the price may be a total for several trips - check it's this one's");
     const fl = first(L.flight) || (/\(([A-Z0-9]{2})-?\s?(\d{1,4})\b[^)]*\)/.exec(s) || []).slice(1, 3).join("");
     j.flight = (/\b([A-Z0-9]{2})-?\s?(\d{1,4})\b/.exec(String(fl).toUpperCase()) || []).slice(1, 3).join("") || null;
     const seatM = /(\d+)\s*x?\s*(baby|child|booster|infant)\s*seats?/i.exec(d) || /(baby|child|booster)\s*seats?\s*:?\s*(\d+)/i.exec(d);
