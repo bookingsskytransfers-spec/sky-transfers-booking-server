@@ -139,6 +139,14 @@ module.exports = function installAgentPortal(ctx) {
       ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS tour_ref      TEXT;
       ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS tour_name     TEXT;
       ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS tour_seq      INTEGER;
+      -- paying one booking by card (20 Oct 2026): a Stripe payment link the
+      -- agent pays or forwards to their client; once paid the trip is
+      -- settled and stays off the monthly invoice
+      ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS pay_link_id    TEXT;
+      ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS pay_link_url   TEXT;
+      ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS pay_link_cents INTEGER;
+      ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS card_paid_at   TIMESTAMPTZ;
+      ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS card_pi        TEXT;
       CREATE INDEX IF NOT EXISTS agent_bookings_by_agent
         ON agent_bookings (agent_code, created_at DESC);
       CREATE INDEX IF NOT EXISTS agent_bookings_by_tour ON agent_bookings (tour_ref);
@@ -707,6 +715,8 @@ module.exports = function installAgentPortal(ctx) {
     if (!bk) return { error: "We can't find that booking.", code: 404 };
     if (forChange) {
       if (bk.status !== "confirmed") return { error: "That booking is already cancelled.", code: 400 };
+      /* money has been taken for it, so a change or refund is the office's */
+      if (bk.card_paid_at) return { error: "This booking has been paid by card, so changes and cancellations go through us - call +61 481 437 772.", code: 409 };
       const iso = bk.pickup_date instanceof Date ? bk.pickup_date.toISOString().slice(0, 10) : String(bk.pickup_date);
       const h = hoursUntil(iso, bk.pickup_time);
       if (h == null || h < CHANGE_CUTOFF_HOURS) return { error: CHANGE_CLOSED, code: 400 };
@@ -721,6 +731,7 @@ module.exports = function installAgentPortal(ctx) {
       const bk = found.booking;
       await pool.query(
         "UPDATE agent_bookings SET status = 'cancelled', cancelled_at = now(), changed_by = $2 WHERE ref = $1", [bk.ref, bookedByOf(req)]);
+      await dropAgentPayLink(bk, "This booking has been cancelled, so there is nothing to pay. Call +61 481 437 772 with any questions.");
       /* The commission goes with it: the wallet only counts confirmed bookings,
          so cancelling reverses the earning automatically. */
       notifyOffice(
@@ -738,6 +749,94 @@ module.exports = function installAgentPortal(ctx) {
       res.status(500).json({ error: "Could not cancel that booking — please call us." });
     }
   });
+
+  /* ---- paying one booking by card (20 Oct 2026) -------------------------
+     Agency bookings normally go on the monthly invoice. An agent can instead
+     settle a single trip by card at the full fare, no surcharge: the portal
+     makes a Stripe payment link the agent pays there and then, or forwards so
+     their client pays it - the better way, since the agent never handles the
+     client's card. When Stripe reports it paid (the webhook calls
+     settleAgentCard) the trip is settled and stays off the invoice. The
+     commission is unchanged: it is in the wallet and paid out as usual. */
+  async function dropAgentPayLink(bk, message) {
+    if (!bk || !bk.pay_link_id) return;
+    if (stripe) {
+      await stripe.paymentLinks.update(bk.pay_link_id, { active: false, inactive_message: message })
+        .catch((e) => console.error("agent pay link off:", e.message));
+    }
+    await pool.query("UPDATE agent_bookings SET pay_link_id = NULL, pay_link_url = NULL, pay_link_cents = NULL WHERE ref = $1", [bk.ref]);
+  }
+  async function onIssuedInvoice(ref) {
+    const r = await pool.query(
+      `SELECT i.number FROM ops_invoice_lines l JOIN ops_invoices i ON i.id = l.invoice_id WHERE l.ref = $1 AND i.status <> 'void'`, [ref])
+      .catch(() => ({ rows: [] }));
+    return r.rows[0] ? r.rows[0].number : null;
+  }
+  app.post("/agent/booking/pay-link", requireAgent, async (req, res) => {
+    try {
+      if (!stripe) return res.status(503).json({ error: "Card payments are not set up on this server - call +61 481 437 772." });
+      const found = await loadOwnBooking(req, String(req.body?.ref || ""), { forChange: false });
+      if (found.error) return res.status(found.code).json({ error: found.error });
+      const bk = found.booking;
+      if (bk.status !== "confirmed") return res.status(400).json({ error: "That booking is cancelled, so there is nothing to pay." });
+      if (bk.card_paid_at) return res.status(409).json({ error: "That booking is already paid by card." });
+      const inv = await onIssuedInvoice(bk.ref);
+      if (inv) return res.status(409).json({ error: `That trip is already on invoice ${inv} - pay the invoice instead, from Invoices & statement.` });
+      /* the same link while the price has not changed, so it can be shared once */
+      if (bk.pay_link_url && Number(bk.pay_link_cents) === Number(bk.total_cents)) return res.json({ ok: true, url: bk.pay_link_url, total: bk.total_cents / 100 });
+      await dropAgentPayLink(bk, "This payment link has been replaced - please use the newer link you were sent.");
+      const date = bk.pickup_date instanceof Date ? bk.pickup_date.toISOString().slice(0, 10) : String(bk.pickup_date);
+      const what = bk.hire_hours ? `${bk.hire_hours} hours from ${bk.pickup}` : `${bk.pickup} to ${bk.dropoff}`;
+      /* keyed to the minute: a double click dedupes, but a link made later
+         (after a price change and back) is a new one, never a dead old one */
+      const price = await stripe.prices.create({
+        currency: "aud", unit_amount: bk.total_cents,
+        product_data: { name: `Transfer ${bk.ref} - ${what}, ${date} ${bk.pickup_time}` },
+      }, { idempotencyKey: `agent-price-${bk.ref}-${bk.total_cents}-${Math.floor(Date.now() / 60000)}` });
+      const link = await stripe.paymentLinks.create({
+        line_items: [{ price: price.id, quantity: 1 }],
+        /* read by the webhook, which settles the booking and stops there -
+           it is not a website booking */
+        metadata: { agent_booking_for: bk.ref, ref: bk.ref, agent: req.agent.code },
+        after_completion: { type: "redirect", redirect: { url: process.env.SUCCESS_URL || "https://www.skytransfers.com.au/?booking=confirmed" } },
+        inactive_message: "This booking has already been paid. If you need anything, call or text +61 481 437 772.",
+      }, { idempotencyKey: `agent-plink-${bk.ref}-${bk.total_cents}-${Math.floor(Date.now() / 60000)}` });
+      await pool.query("UPDATE agent_bookings SET pay_link_id = $2, pay_link_url = $3, pay_link_cents = $4 WHERE ref = $1",
+        [bk.ref, link.id, link.url, bk.total_cents]);
+      res.json({ ok: true, url: link.url, total: bk.total_cents / 100 });
+    } catch (err) {
+      console.error("agent pay link:", err);
+      res.status(500).json({ error: "Could not make a payment link just now - please call us." });
+    }
+  });
+
+  /* The Stripe webhook, when a link carrying agent_booking_for is paid. */
+  async function settleAgentCard(ref, paidCents, paymentIntent) {
+    const { rows } = await pool.query(
+      `UPDATE agent_bookings SET card_paid_at = COALESCE(card_paid_at, now()), card_pi = COALESCE(card_pi, $2)
+        WHERE ref = $1 RETURNING *`, [ref, paymentIntent || null]);
+    const bk = rows[0];
+    if (!bk) return null;
+    if (stripe && bk.pay_link_id) {
+      await stripe.paymentLinks.update(bk.pay_link_id, { active: false, inactive_message: "This booking has already been paid. If you need anything, call or text +61 481 437 772." })
+        .catch((e) => console.error("agent pay link off:", e.message));
+    }
+    const ag = (await pool.query("SELECT code, name, email FROM agents WHERE code = $1", [bk.agent_code])).rows[0] || { code: bk.agent_code, name: bk.agent_code };
+    const date = bk.pickup_date instanceof Date ? bk.pickup_date.toISOString().slice(0, 10) : String(bk.pickup_date);
+    notifyOffice(`AGENT BOOKING PAID BY CARD (${ag.code}): ${money(paidCents)} [${bk.ref}]`,
+      `PAID BY CARD - ${ag.name} (${ag.code})\n\nReference: ${bk.ref}\nRoute: ${bk.pickup} -> ${bk.dropoff}\nDate: ${date} ${bk.pickup_time}\n` +
+      `Passenger: ${bk.passenger_name}\nPaid: ${money(paidCents)} (fare ${money(bk.total_cents)})\n\n` +
+      `Settled - it will not go on the agency's monthly invoice. Commission is unchanged and stays in their wallet.\n`, ag);
+    if (mailer && ag.email) {
+      mailer.sendMail({
+        from: `"Sky Transfers" <${process.env.GMAIL_USER}>`, to: ag.email, replyTo: BOOKINGS_EMAIL,
+        subject: `Payment received — ${bk.ref} · Sky Transfers`,
+        text: `Hi ${ag.name},\n\nWe've received ${money(paidCents)} by card for booking ${bk.ref} (${bk.pickup} to ${bk.dropoff}, ${date} ${bk.pickup_time}).\n\n` +
+          `It's settled and won't appear on your monthly invoice. Your commission on it stays in your wallet as usual.\n\nSky Transfers`,
+      }).catch((e) => console.error("agent paid email:", e.message));
+    }
+    return bk;
+  }
 
   app.post("/agent/booking/update", requireAgent, async (req, res) => {
     try {
@@ -764,6 +863,10 @@ module.exports = function installAgentPortal(ctx) {
          p.clientRef, p.ret ? p.ret.date : null, p.ret ? p.ret.time : null, p.ret ? (p.ret.flight || null) : null, p.hours, p.ends, p.stops, bookedByOf(req)]
       );
 
+      /* a payment link made for the old price is now wrong */
+      if (old.pay_link_id && Number(old.pay_link_cents) !== p.totalCents) {
+        await dropAgentPayLink(old, "This booking has been changed, so this payment link no longer applies. Ask your travel agent for the new one.");
+      }
       const wasDate = old.pickup_date instanceof Date ? old.pickup_date.toISOString().slice(0, 10) : old.pickup_date;
       notifyOffice(
         `AGENT AMENDED (${req.agent.code}): ${b.pickup} -> ${b.dropoff} (${b.date} ${b.time}) [${old.ref}]`,
@@ -1222,6 +1325,8 @@ module.exports = function installAgentPortal(ctx) {
     tourRef: r.tour_ref || null,
     tourName: r.tour_name || "",
     tourSeq: r.tour_seq || null,
+    cardPaid: !!r.card_paid_at,
+    payUrl: !r.card_paid_at && r.pay_link_url && Number(r.pay_link_cents) === Number(r.total_cents) ? r.pay_link_url : null,
     ends: (() => { try { return r.ends ? JSON.parse(r.ends) : null; } catch (e) { return null; } })(),
     ...(() => {
       try { const j = r.stops ? JSON.parse(r.stops) : null; return { stops: j && Array.isArray(j.list) ? j.list : [], stopsExtra: j && j.extra || 0 }; }
@@ -1262,7 +1367,7 @@ module.exports = function installAgentPortal(ctx) {
         bookings: rows.map((r) => {
           const b = bookingRow(r);
           const h = hoursUntil(b.date, b.time);
-          b.changeable = r.status === "confirmed" && h != null && h >= CHANGE_CUTOFF_HOURS;
+          b.changeable = r.status === "confirmed" && !r.card_paid_at && h != null && h >= CHANGE_CUTOFF_HOURS;
           b.trip = trips[b.ref] || null;
           if (b.tourRef) b.tourCount = tourCount[b.tourRef];
           if (!money_) { b.commission = null; b.settled = null; }
@@ -2609,5 +2714,5 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
      is handed out so other modules can sit behind the same admin login rather
      than growing a second path that accepts the PIN. */
   /* pool goes to ops.js (the dispatch board), which reads these same tables. */
-  return { saveWebBooking, actionLinks, findOpenWebBooking, requireAdmin, getWebBooking, rowToBooking, summaryForRow, settleBalance, pool, setTripStatus, requireAgent, requireAgentAccounts };
+  return { saveWebBooking, actionLinks, findOpenWebBooking, requireAdmin, getWebBooking, rowToBooking, summaryForRow, settleBalance, pool, setTripStatus, requireAgent, requireAgentAccounts, settleAgentCard };
 };
