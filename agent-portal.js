@@ -24,7 +24,7 @@ module.exports = function installAgentPortal(ctx) {
     /* The website's own confirmation pieces, so what the office sends a guest
        is byte-for-byte what the site would have sent. */
     bookingPdf, bookingEmailHtml, guestAttachments, fareForBooking, returnLeg, HUB_NAMES,
-    hourlyHours, normaliseAddresses,
+    hourlyHours, normaliseAddresses, COMPANY,
   } = ctx;
   const hoursOf = (b) => (typeof hourlyHours === "function" ? hourlyHours(b) : null);
   const { Pool } = require("pg");
@@ -828,14 +828,80 @@ module.exports = function installAgentPortal(ctx) {
       `Passenger: ${bk.passenger_name}\nPaid: ${money(paidCents)} (fare ${money(bk.total_cents)})\n\n` +
       `Settled - it will not go on the agency's monthly invoice. Commission is unchanged and stays in their wallet.\n`, ag);
     if (mailer && ag.email) {
+      const trip = bk.hire_hours ? `${bk.hire_hours} hours as directed from ${bk.pickup}` : `${bk.pickup} to ${bk.dropoff}`;
+      const longDate = (() => { try { const [y, mo, d] = date.split("-").map(Number);
+        return new Date(Date.UTC(y, mo - 1, d)).toLocaleDateString("en-AU", { weekday: "long", day: "numeric", month: "long", year: "numeric", timeZone: "UTC" }); }
+        catch (e) { return date; } })();
       mailer.sendMail({
         from: `"Sky Transfers" <${process.env.GMAIL_USER}>`, to: ag.email, replyTo: BOOKINGS_EMAIL,
         subject: `Payment received — ${bk.ref} · Sky Transfers`,
         text: `Hi ${ag.name},\n\nWe've received ${money(paidCents)} by card for booking ${bk.ref} (${bk.pickup} to ${bk.dropoff}, ${date} ${bk.pickup_time}).\n\n` +
           `It's settled and won't appear on your monthly invoice. Your commission on it stays in your wallet as usual.\n\nSky Transfers`,
+        html: brandedAgentEmail({
+          heading: "PAYMENT RECEIVED", ref: bk.ref, name: ag.name, pill: "PAID BY CARD",
+          intro: `We've received ${money(paidCents)} by card for this booking. It's settled and won't appear on your monthly invoice.`,
+          sections: [
+            ["Booking", [["Reference", bk.ref], bk.client_ref ? ["Your reference", bk.client_ref] : null, ["Trip", trip],
+              ["Date & time", `${longDate} at ${bk.pickup_time}`], ["Vehicle", bk.vehicle], ["Passenger", bk.passenger_name]]],
+            ["Payment", [["Paid by card", money(paidCents)], ["Monthly invoice", "Settled - not on your invoice"],
+              ["Your commission", `${money(bk.commission_cents)} - in your wallet, paid out as usual`]]],
+          ],
+        }),
+        attachments: guestAttachments(null),
       }).catch((e) => console.error("agent paid email:", e.message));
     }
     return bk;
+  }
+
+  /* The guest confirmation's look for an email to an agency: logo header
+     with the reference, a status badge, labelled sections, the company
+     footer. Tables and inline styles only, for Outlook and Gmail. */
+  function brandedAgentEmail({ heading, ref, name, pill, intro, sections }) {
+    const esc = (t) => String(t == null ? "" : t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    const cellL = "padding:9px 14px;font:700 12px/1.45 Arial,sans-serif;color:#141D30;vertical-align:top;width:34%;border-bottom:1px solid #EFE6D0;";
+    const cellR = "padding:9px 14px;font:400 14px/1.45 Arial,sans-serif;color:#333B4C;vertical-align:top;border-bottom:1px solid #EFE6D0;";
+    const co = COMPANY || { name: "Sky Transfers", ids: "" };
+    return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#F7F4ED;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F7F4ED;"><tr><td align="center" style="padding:24px 10px;">
+  <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:#FFFFFF;border-radius:10px;overflow:hidden;border:1px solid #E5E0D2;">
+    <tr><td style="background:#101828;padding:18px 28px;border-bottom:3px solid #C9A227;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+        <td style="vertical-align:middle;"><img src="cid:stlogo" alt="SKY TRANSFERS" height="58" style="height:58px;display:block;font:400 20px Georgia,serif;letter-spacing:4px;color:#F6F2E8;"></td>
+        <td align="right" style="vertical-align:middle;">
+          <div style="font:700 10px Arial,sans-serif;letter-spacing:2.5px;color:#D9B44A;">${esc(heading)}</div>
+          <div style="font:700 20px Arial,sans-serif;color:#FFFFFF;padding-top:3px;">${esc(ref)}</div>
+        </td></tr></table>
+    </td></tr>
+    <tr><td style="padding:22px 28px 4px;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+        <td style="vertical-align:top;font:700 22px Arial,sans-serif;color:#141D30;">${esc(name)}</td>
+        <td align="right" style="vertical-align:top;"><span style="display:inline-block;padding:6px 14px;border-radius:12px;font:700 10px Arial,sans-serif;letter-spacing:1px;background:#1E7F4F;color:#FFFFFF;">${esc(pill)}</span></td>
+      </tr></table>
+      <div style="font:400 14.5px/1.6 Arial,sans-serif;color:#333B4C;padding-top:10px;">${esc(intro)}</div>
+    </td></tr>
+    ${sections.map(([title, rows]) => `
+    <tr><td style="padding:14px 28px 0;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;border-bottom:2px solid #C9A227;">
+        <tr><td colspan="2" style="background:#101828;border-radius:5px 5px 0 0;padding:8px 14px;font:700 13px Arial,sans-serif;color:#FFFFFF;">
+          <span style="display:inline-block;width:7px;height:7px;background:#C9A227;margin-right:8px;vertical-align:middle;"></span>${esc(title)}</td></tr>
+        ${rows.filter(Boolean).map((r) => `<tr><td style="${cellL}">${esc(r[0])}</td><td style="${cellR}">${esc(r[1])}</td></tr>`).join("")}
+      </table>
+    </td></tr>`).join("")}
+    <tr><td style="padding:18px 28px 22px;font:400 13.5px/1.7 Arial,sans-serif;color:#333B4C;">
+      Questions? Reply to this email or call us any time on
+      <a href="tel:+61481437772" style="color:#8E701C;font-weight:700;text-decoration:none;">+61&nbsp;481&nbsp;437&nbsp;772</a> — we're on 24/7.
+    </td></tr>
+    <tr><td style="background:#101828;padding:20px 28px;border-top:2px solid #C9A227;">
+      <div style="font:700 12.5px Arial,sans-serif;color:#F6F2E8;">${esc(co.name)}</div>
+      <div style="font:400 11.5px/1.8 Arial,sans-serif;color:#A9B0BE;padding-top:4px;">
+        ${esc(co.ids).replace(/  ·  /g, " &middot; ")}${co.ids ? "<br>" : ""}
+        24/7 &middot; +61 481 437 772 &middot; <a href="mailto:info@skytransfers.com.au" style="color:#D9B44A;text-decoration:none;">info@skytransfers.com.au</a> &middot; <a href="https://www.skytransfers.com.au/agent.html" style="color:#D9B44A;text-decoration:none;">Agent portal</a>
+      </div>
+    </td></tr>
+  </table>
+</td></tr></table>
+</body></html>`;
   }
 
   app.post("/agent/booking/update", requireAgent, async (req, res) => {
