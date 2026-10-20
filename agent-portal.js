@@ -211,6 +211,10 @@ module.exports = function installAgentPortal(ctx) {
       -- column keeps the single combined line the dispatch text has always had
       ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS pu_address       TEXT;
       ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS do_address       TEXT;
+      -- a deposit booking (20 Oct 2026): the percentage the first link
+      -- charges, and the PaymentIntents of any balance paid after it
+      ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS deposit_pct      INTEGER;
+      ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS balance_pis      TEXT;
       CREATE INDEX IF NOT EXISTS web_bookings_recent ON web_bookings (created_at DESC);
       CREATE INDEX IF NOT EXISTS web_bookings_status ON web_bookings (status, created_at DESC);
     `);
@@ -1522,7 +1526,32 @@ module.exports = function installAgentPortal(ctx) {
     stops: (stopsOf(r) || { list: [] }).list.map((s) => s.address),
     cancelledAt: r.cancelled_at || null, refunded: (r.refunded_cents || 0) / 100, cancelNote: r.cancel_note || "",
     balance: (r.balance_cents || 0) / 100,
+    depositPct: r.deposit_pct || null, balanceLinkUrl: r.balance_link_url || null,
   });
+
+  /* ---- deposit bookings (20 Oct 2026) ------------------------------------
+     Office-made only. The first link charges a percentage of the total (20%
+     unless the office types another); once that is paid the booking is
+     'paid' with the rest in balance_cents - the same shape as a paid booking
+     amended upwards, so the board, the cancel refund and the amend maths all
+     already understand it. The balance link is the office's decision: no
+     automatic email, a button on the admin page sends it. */
+  const DEPOSIT_MIN = 10, DEPOSIT_MAX = 90;
+  const depositPctOf = (v) => { const n = parseInt(v, 10); return Number.isFinite(n) && n >= DEPOSIT_MIN && n <= DEPOSIT_MAX ? n : null; };
+  /* whole dollars, so the guest sees $56, not $55.80 */
+  const depositCents = (totalCents, pct) => Math.round((totalCents || 0) * pct / 10000) * 100;
+  function addDeposit(s, r, paid) {
+    if (!r || !r.deposit_pct) return s;
+    s.deposit = true; s.depositPct = r.deposit_pct;
+    const total = Math.round((r.total_cents || 0) / 100);
+    if (!paid) {
+      s.depositDue = Math.round(depositCents(r.total_cents, r.deposit_pct) / 100);
+      s.text = s.text.replace(/TOTAL: \$\d+[^\n]*/, `TOTAL: $${total} (deposit $${s.depositDue} due now, $${total - s.depositDue} balance later)`);
+    } else if (s.balance) {
+      s.balanceLink = !!r.balance_link_url;
+    }
+    return s;
+  }
 
   async function saveWebBooking(b, s, status) {
     if (!AGENTS_ON || !pool) return;
@@ -1720,13 +1749,15 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
      forwarded to somebody else.
      --------------------------------------------------------------------- */
   async function createPaymentLinkFor(r) {
+    /* a deposit booking's first link is for the deposit only */
+    const dep = r.deposit_pct ? depositCents(r.total_cents, r.deposit_pct) : 0;
     const price = await stripe.prices.create({
       currency: "aud",
-      unit_amount: r.total_cents,
-      product_data: { name: r.hire_hours
+      unit_amount: dep || r.total_cents,
+      product_data: { name: (dep ? `${r.deposit_pct}% deposit for booking ${r.ref} — ` : "") + (r.hire_hours
         ? `${r.hire_hours > 6 ? "Charter" : "Hourly hire"}, ${r.hire_hours} hours from ${r.pickup}`
-        : `Transfer — ${r.pickup} to ${r.dropoff}` },
-    }, { idempotencyKey: "price-" + r.ref + "-" + (r.link_seq || 0) });
+        : `Transfer — ${r.pickup} to ${r.dropoff}`) },
+    }, { idempotencyKey: "price-" + r.ref + "-" + (r.link_seq || 0) + (dep ? "-dep" + dep : "") });
 
     const link = await stripe.paymentLinks.create({
       line_items: [{ price: price.id, quantity: 1 }],
@@ -1748,13 +1779,16 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
         hours: r.hire_hours ? String(r.hire_hours) : "",
         pu_address: String(r.pu_address || "").slice(0, 300),
         do_address: String(r.do_address || "").slice(0, 300),
+        /* read by the webhook, which settles the deposit and stops there */
+        ...(dep ? { deposit_for: r.ref, deposit_cents: String(dep) } : {}),
       },
       after_completion: {
         type: "redirect",
         redirect: { url: process.env.SUCCESS_URL || "https://www.skytransfers.com.au/?booking=confirmed" },
       },
-      inactive_message: "This booking has already been paid. If you need anything, call or text +61 481 437 772.",
-    }, { idempotencyKey: "plink-" + r.ref + "-" + (r.link_seq || 0) });
+      inactive_message: dep ? "This deposit has already been paid. If you need anything, call or text +61 481 437 772."
+                            : "This booking has already been paid. If you need anything, call or text +61 481 437 772.",
+    }, { idempotencyKey: "plink-" + r.ref + "-" + (r.link_seq || 0) + (dep ? "-dep" + dep : "") });
 
     await pool.query(
       `UPDATE web_bookings SET payment_link_id = $2, payment_link_url = $3 WHERE ref = $1`,
@@ -1816,14 +1850,74 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
   }
 
   /* The balance link was paid: clear it, switch the link off. */
-  async function settleBalance(ref) {
+  async function settleBalance(ref, paymentIntent) {
     const r = await getWebBooking(ref);
     if (!r) return null;
-    await pool.query(`UPDATE web_bookings SET balance_cents = 0, balance_link_id = NULL, balance_link_url = NULL WHERE ref = $1`, [ref]);
+    /* The balance is a second card payment, so a later refund may need to
+       come off it - its PaymentIntent is kept beside the first one. */
+    const pis = String(r.balance_pis || "").split(",").map((x) => x.trim()).filter(Boolean);
+    if (paymentIntent && pis.indexOf(paymentIntent) === -1 && paymentIntent !== r.payment_intent) pis.push(paymentIntent);
+    await pool.query(`UPDATE web_bookings SET balance_cents = 0, balance_link_id = NULL, balance_link_url = NULL, balance_pis = $2 WHERE ref = $1`,
+      [ref, pis.length ? pis.join(",") : null]);
     if (r.balance_link_id && stripe) {
       await stripe.paymentLinks.update(r.balance_link_id, { active: false }).catch((e) => console.error("settle balance link:", e.message));
     }
     return getWebBooking(ref);
+  }
+
+  /* The webhook, when a deposit link is paid: the booking becomes 'paid'
+     with the rest owing. _fresh is false on a replayed event, so nobody is
+     emailed twice. */
+  async function settleDeposit(ref, paidCents, paymentIntent) {
+    const r = await getWebBooking(ref);
+    if (!r) return null;
+    if (r.status === "paid" || r.status === "cancelled") return { ...r, _fresh: false };
+    await pool.query(
+      `UPDATE web_bookings SET status = 'paid', paid_at = COALESCE(paid_at, now()), confirmed_at = COALESCE(confirmed_at, now()),
+         payment_intent = COALESCE(payment_intent, $2), balance_cents = GREATEST(total_cents - $3::int, 0),
+         balance_link_id = NULL, balance_link_url = NULL
+       WHERE ref = $1 AND status NOT IN ('paid', 'cancelled')`, [ref, paymentIntent || null, Math.round(Number(paidCents) || 0)]);
+    await deactivatePaymentLink(ref).catch((e) => console.error("deposit link off:", e.message));
+    return { ...(await getWebBooking(ref)), _fresh: true };
+  }
+
+  /* A refund that may have to come off more than one card payment - the
+     deposit and the balance - newest first. With a single payment it is
+     exactly the one refund it always was. Returns the refund ids, null when
+     no payment can be found, or { short } when Stripe holds less than asked. */
+  async function refundAcross(r, cents, metadata, idem) {
+    const first = await findPaymentIntent(r);
+    /* "manual:<cents>" marks a balance the office took another way (cash,
+       bank transfer) - money Stripe never held, so it can't refund it */
+    const all = String(r.balance_pis || "").split(",").map((x) => x.trim()).filter(Boolean);
+    const extra = all.filter((x) => !/^manual:/.test(x));
+    if (all.length === 0) {
+      if (!first) return null;
+      const p = { payment_intent: first, amount: cents, metadata };
+      const rf = idem ? await stripe.refunds.create(p, { idempotencyKey: idem }) : await stripe.refunds.create(p);
+      return { ids: [rf.id] };
+    }
+    const pis = extra.slice().reverse().concat(first ? [first] : []);
+    if (!pis.length) return null;
+    const left = [];
+    for (const pi of pis) {
+      const p = await stripe.paymentIntents.retrieve(pi, { expand: ["latest_charge"] });
+      const ch = p && p.latest_charge && typeof p.latest_charge === "object" ? p.latest_charge : null;
+      left.push(Math.max(0, ch ? (ch.amount || 0) - (ch.amount_refunded || 0) : (p && p.amount_received) || 0));
+    }
+    const avail = left.reduce((a, x) => a + x, 0);
+    if (avail < cents) return { short: avail };
+    const ids = [];
+    let want = cents;
+    for (let i = 0; i < pis.length && want > 0; i++) {
+      const take = Math.min(want, left[i]);
+      if (!take) continue;
+      const p = { payment_intent: pis[i], amount: take, metadata };
+      const rf = idem ? await stripe.refunds.create(p, { idempotencyKey: idem + "-" + i }) : await stripe.refunds.create(p);
+      ids.push(rf.id);
+      want -= take;
+    }
+    return { ids };
   }
 
   async function deactivatePaymentLink(ref) {
@@ -1994,17 +2088,30 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
       s.balance = Math.round(r.balance_cents / 100);
       s.text = s.text.replace(/\(PAID\)/, "(paid $" + (total - s.balance) + ", balance $" + s.balance + " to pay)");
     }
-    return s;
+    return addDeposit(s, r, b.paid);
   }
 
   async function emailGuestConfirmation(b, s, payUrl) {
     const pdf = await bookingPdf(b, s).catch((e) => { console.error("PDF failed:", e.message); return null; });
-    const subject = s.balance ? `Booking updated — $${s.balance} balance to pay — Sky Transfers · ${b.ref}`
+    /* a deposit booking: deposit due, deposit paid, or its balance link */
+    const dep = s.deposit && !s.refund ? (s.depositDue && !b.paid ? "due" : b.paid && s.balance ? (payUrl ? "balance" : "paid") : null) : null;
+    const paidSoFar = s.balance ? s.total - s.balance : 0;
+    const subject = dep === "due" ? `Booking confirmed — $${s.depositDue} deposit to pay — Sky Transfers · ${b.ref}`
+                  : dep === "balance" ? `Balance due — $${s.balance} — Sky Transfers · ${b.ref}`
+                  : dep === "paid" ? `Booking confirmed — deposit paid — Sky Transfers · ${b.ref}`
+                  : s.balance ? `Booking updated — $${s.balance} balance to pay — Sky Transfers · ${b.ref}`
                   : s.refund ? `Booking updated — $${s.refund} refunded — Sky Transfers · ${b.ref}`
                   : b.paid ? `Booking confirmed & paid — Sky Transfers · ${b.ref}`
                   : b.confirmed ? `Booking confirmed — Sky Transfers · ${b.ref}`
                   : `Booking request received — Sky Transfers · ${b.ref}`;
-    const opening = s.balance
+    const opening = dep === "due"
+      ? `Your booking is confirmed. To secure it, please pay the $${s.depositDue} deposit (${s.depositPct}% of the $${s.total} total) here:\n${payUrl || ""}\n\n` +
+        `The $${s.total - s.depositDue} balance is paid later - we'll send you a link for it. Your printable confirmation is attached.`
+      : dep === "balance"
+      ? `Thank you for your deposit. The $${s.balance} balance for your booking can now be paid securely here:\n${payUrl || ""}\n\nYour confirmation is attached.`
+      : dep === "paid"
+      ? `Your booking is confirmed and your $${paidSoFar} deposit is paid. The $${s.balance} balance is paid later - we'll send you a secure link for it. Your printable confirmation is attached.`
+      : s.balance
       ? `Your booking has been updated. Your earlier payment of $${s.total - s.balance} is held against it, and the $${s.balance} difference can be paid securely here:\n${payUrl || ""}\n\nYour updated confirmation is attached.`
       : s.refund
       ? `Your booking has been updated, and $${s.refund} has been refunded to the card you paid with - it usually shows within 5 to 10 business days. Your updated confirmation is attached.`
@@ -2128,10 +2235,15 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
       const parsed = await parseOfficeBooking(b0, res);
       if (!parsed) return;
       const { b, ret, fare, override, hasOverride } = parsed;
-      const mode = b0.mode === "paid" ? "paid" : "link";
-      if (mode === "link" && !stripe) {
+      const mode = b0.mode === "paid" ? "paid" : b0.mode === "deposit" ? "deposit" : "link";
+      if (mode !== "paid" && !stripe) {
         console.log("office booking refused: payments not configured |", b.pickup, "->", b.dropoff);
         return res.status(503).json({ error: "Payments are not configured, so no link can be sent. Choose 'paid elsewhere'." });
+      }
+      const depPct = mode === "deposit" ? depositPctOf(b0.depositPct == null || b0.depositPct === "" ? 20 : b0.depositPct) : null;
+      if (mode === "deposit" && !depPct) {
+        console.log("office booking refused: deposit % |", b0.depositPct);
+        return res.status(400).json({ error: `The deposit has to be between ${DEPOSIT_MIN}% and ${DEPOSIT_MAX}% of the total.` });
       }
       b.ref = makeRef(b.date);
       b.paid = mode === "paid";
@@ -2144,10 +2256,18 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
         .replace(/^Return fare: \$0 .*\n/m, "")
         .replace(/TOTAL: \$\d+/, "TOTAL: $" + s.total + tag);
 
+      if (depPct) {
+        const dc = depositCents(Math.round(s.total * 100), depPct);
+        if (dc <= 0 || dc >= Math.round(s.total * 100)) return res.status(400).json({ error: "That total is too small to split into a deposit - send a normal payment link instead." });
+      }
       await saveWebBooking({ ...b, userAgent: "office" }, s, b.paid ? "paid" : "confirmed");
+      if (depPct) {
+        await pool.query(`UPDATE web_bookings SET deposit_pct = $2 WHERE ref = $1`, [b.ref, depPct]);
+        addDeposit(s, { total_cents: Math.round(s.total * 100), deposit_pct: depPct }, false);
+      }
 
       let payUrl = null;
-      if (mode === "link") {
+      if (mode !== "paid") {
         const row = await getWebBooking(b.ref);
         payUrl = await paymentUrlFor(row);
       }
@@ -2156,11 +2276,13 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
       mailer.sendMail({
         from: `"Sky Transfers Website" <${process.env.GMAIL_USER}>`,
         to: BOOKINGS_EMAIL, replyTo: b.email || undefined,
-        subject: `OFFICE booking${b.paid ? " (paid elsewhere)" : ", payment link sent"}: ${b.pickup} -> ${b.dropoff} (${b.date} ${b.time}) [${b.ref}]`,
-        text: `OFFICE BOOKING — made from the admin page\n\n${s.text}\n` + (payUrl ? `\nPayment link: ${payUrl}\n` : ""),
+        subject: `OFFICE booking${b.paid ? " (paid elsewhere)" : depPct ? `, ${depPct}% deposit link sent ($${s.depositDue})` : ", payment link sent"}: ${b.pickup} -> ${b.dropoff} (${b.date} ${b.time}) [${b.ref}]`,
+        text: `OFFICE BOOKING — made from the admin page\n\n${s.text}\n` +
+              (payUrl ? `\n${depPct ? `Deposit link ($${s.depositDue}, ${depPct}%)` : "Payment link"}: ${payUrl}\n` : "") +
+              (depPct ? `\nThe $${s.total - s.depositDue} balance is NOT requested automatically - send it from the admin page (Web bookings > Send balance link) when you're ready.\n` : ""),
       }).catch((e) => console.error("office booking copy:", e.message));
-      console.log("office booking:", b.ref, mode, emailed ? "emailed" : "no guest email");
-      res.json({ ok: true, ref: b.ref, total: s.total, emailed, payUrl });
+      console.log("office booking:", b.ref, mode + (depPct ? " " + depPct + "%" : ""), emailed ? "emailed" : "no guest email");
+      res.json({ ok: true, ref: b.ref, total: s.total, emailed, payUrl, deposit: s.depositDue || 0, depositPct: depPct || null });
     } catch (err) {
       console.error("office booking:", err);
       res.status(500).json({ error: "Could not make that booking." });
@@ -2198,6 +2320,82 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
     } catch (err) {
       console.error("resend confirmation:", err);
       res.status(500).json({ error: "Could not send that confirmation." });
+    }
+  });
+
+  /* ---- the balance of a deposit booking -----------------------------------
+     Asking for it is the office's call (Aman, 20 Oct 2026): this sends the
+     guest a link for what is owing - the same balance link an upward amend
+     makes, so the webhook settles it the same way - and hands the link back
+     so it can also go by text or WhatsApp. Pressing it again re-sends the
+     same link rather than minting a second one. */
+  app.post("/admin/web-booking/balance-link", requireAdmin, async (req, res) => {
+    try {
+      if (!stripe) return res.status(503).json({ error: "Payments are not configured, so no link can be made." });
+      const ref = String((req.body && req.body.ref) || "").trim();
+      const r = ref ? await getWebBooking(ref) : null;
+      if (!r) return res.status(404).json({ error: "No booking with that reference." });
+      if (r.status !== "paid") return res.status(409).json({ error: r.status === "confirmed" ? "The deposit hasn't been paid yet - Resend sends the deposit link." : "That booking has nothing owing." });
+      if (!(r.balance_cents > 0)) return res.status(409).json({ error: "Nothing is owing on that booking - it is paid in full." });
+      const payUrl = balanceUrlFor(r) || await createBalanceLinkFor(r, r.balance_cents);
+      const fresh = await getWebBooking(ref);
+      const b = rowToBooking(fresh);
+      const to = String((req.body && req.body.to) || "").trim() || fresh.passenger_email || "";
+      if (to && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) return res.status(400).json({ error: "That doesn't look like an email address." });
+      b.email = to;
+      const s = summaryForRow(fresh, b);
+      let emailed = null;
+      if (to && mailer) { await emailGuestConfirmation(b, s, payUrl); emailed = to; }
+      if (mailer) mailer.sendMail({
+        from: `"Sky Transfers Website" <${process.env.GMAIL_USER}>`, to: BOOKINGS_EMAIL, replyTo: to || undefined,
+        subject: `BALANCE LINK sent: $${s.balance} on ${ref} - ${r.pickup} -> ${r.dropoff} (${r.pickup_date_text} ${r.pickup_time})`,
+        text: `Balance link for ${ref}: $${s.balance} owing of $${s.total}.\n${emailed ? "Emailed to " + emailed : "NOT emailed - no address on the booking"}.\n\nLink: ${payUrl}\n\n${s.text}\n`,
+      }).catch((e) => console.error("balance link copy:", e.message));
+      console.log("balance link:", ref, "$" + s.balance, emailed ? "emailed" : "not emailed");
+      res.json({ ok: true, ref, balance: s.balance, payUrl, emailed });
+    } catch (err) {
+      console.error("balance link:", err);
+      res.status(500).json({ error: "Could not make the balance link." });
+    }
+  });
+
+  /* The balance was taken another way - cash on the day, a bank transfer.
+     The booking becomes paid in full; any open balance link is switched off.
+     Marked in balance_pis so a later refund knows Stripe never held it. */
+  app.post("/admin/web-booking/balance-paid", requireAdmin, async (req, res) => {
+    try {
+      const ref = String((req.body && req.body.ref) || "").trim();
+      const r = ref ? await getWebBooking(ref) : null;
+      if (!r) return res.status(404).json({ error: "No booking with that reference." });
+      if (r.status !== "paid" || !(r.balance_cents > 0)) return res.status(409).json({ error: "Nothing is owing on that booking." });
+      const how = String((req.body && req.body.how) || "").trim().slice(0, 120) || "settled with the office";
+      const pis = String(r.balance_pis || "").split(",").map((x) => x.trim()).filter(Boolean);
+      pis.push("manual:" + r.balance_cents);
+      await pool.query(`UPDATE web_bookings SET balance_cents = 0, balance_link_id = NULL, balance_link_url = NULL, balance_pis = $2 WHERE ref = $1`, [ref, pis.join(",")]);
+      if (r.balance_link_id && stripe) {
+        await stripe.paymentLinks.update(r.balance_link_id, { active: false, inactive_message: "This balance has already been settled. If you need anything, call or text +61 481 437 772." })
+          .catch((e) => console.error("balance paid: link off:", e.message));
+      }
+      const owed = Math.round(r.balance_cents / 100);
+      const fresh = await getWebBooking(ref);
+      const b = rowToBooking(fresh);
+      const s = summaryForRow(fresh, b);
+      const notify = req.body && (req.body.notifyGuest === true || req.body.notifyGuest === "true");
+      let emailed = null;
+      if (notify && b.email && mailer) {
+        try { await emailGuestConfirmation(b, s, null); emailed = b.email; } catch (e) { console.error("balance paid guest email:", e.message); }
+      }
+      if (mailer) mailer.sendMail({
+        from: `"Sky Transfers Website" <${process.env.GMAIL_USER}>`, to: BOOKINGS_EMAIL,
+        subject: `BALANCE settled by hand: $${owed} on ${ref} - now paid in full`,
+        text: `The $${owed} balance on ${ref} was marked paid from the admin page (${how}). The booking is now paid in full.\n` +
+              (emailed ? `Guest sent a paid-in-full confirmation at ${emailed}.\n` : "Guest not emailed.\n") + `\n${s.text}\n`,
+      }).catch((e) => console.error("balance paid copy:", e.message));
+      console.log("balance settled by hand:", ref, "$" + owed, how);
+      res.json({ ok: true, ref, settled: owed, emailed });
+    } catch (err) {
+      console.error("balance paid:", err);
+      res.status(500).json({ error: "Could not mark that balance paid." });
     }
   });
 
@@ -2240,16 +2438,18 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
       let refundId = null;
       if (wasPaid && diff < 0 && !manual) {
         if (!stripe) return res.status(503).json({ error: "Payments are not configured, so the difference cannot be refunded automatically.", needsManual: true });
-        const pi = await findPaymentIntent(r).catch((e) => { console.error("amend: find payment:", e.message); return null; });
-        if (!pi) {
+        const got = await refundAcross(r, -diff, { ref, reason: "booking amended by office" }).catch((e) => { console.error("amend: refund:", e.message); return null; });
+        if (!got || got.short != null) {
           return res.status(409).json({ needsManual: true,
-            error: `The card payment for ${ref} could not be found in Stripe, so the $${Math.round(-diff / 100)} difference cannot be refunded automatically. ` +
+            error: `The card payment for ${ref} could not be ${got ? "fully " : ""}found in Stripe, so the $${Math.round(-diff / 100)} difference cannot be refunded automatically. ` +
                    "Refund it from the Stripe dashboard, then save again with 'settle the money by hand' ticked." });
         }
-        const refund = await stripe.refunds.create({ payment_intent: pi, amount: -diff, metadata: { ref, reason: "booking amended by office" } });
-        refundId = refund.id;
+        refundId = got.ids.join(", ");
         s.refund = Math.round(-diff / 100);
       }
+      /* A deposit booking's percentage, which an unpaid one may change. */
+      const depPct = r.deposit_pct ? (!wasPaid && b0.depositPct != null && b0.depositPct !== "" ? depositPctOf(b0.depositPct) : r.deposit_pct) : null;
+      if (r.deposit_pct && !depPct) return res.status(400).json({ error: `The deposit has to be between ${DEPOSIT_MIN}% and ${DEPOSIT_MAX}% of the total.` });
 
       await pool.query(
         `UPDATE web_bookings SET
@@ -2258,14 +2458,14 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
            address = $11, notes = $12, pax = $13, child_seats = $14, trailer = $15,
            total_cents = $16, return_date = $17, return_time = $18, return_flight = $19,
            stops = $20, hire_hours = $21, pu_address = $22, do_address = $23,
-           balance_cents = 0, balance_link_id = NULL, balance_link_url = NULL` +
+           balance_cents = 0, balance_link_id = NULL, balance_link_url = NULL, deposit_pct = $24` +
         /* An unpaid booking's link is replaced; a paid one keeps its payment history. */
         (wasPaid ? "" : ", payment_link_id = NULL, payment_link_url = NULL, link_seq = link_seq + 1") +
         ` WHERE ref = $1`,
         [ref, b.pickup, b.dropoff, b.vehicle, b.date, b.time, b.name, b.phone, b.email || null,
          b.flight || null, b.address || null, b.notes || null, b.pax, b.childSeats, b.trailer,
          newCents, b.returnDate || null, b.returnTime || null, b.returnFlight || null, stopsJson(b), hoursOf(b),
-         b.pickupAddress || null, b.dropoffAddress || null]);
+         b.pickupAddress || null, b.dropoffAddress || null, depPct]);
 
       /* An earlier balance link, if any, is now wrong - switch it off. */
       if (r.balance_link_id && stripe) {
@@ -2280,7 +2480,13 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
         }).catch((e) => console.error("amend: old link:", e.message));
       }
       let payUrl = null;
-      if (wasPaid) {
+      if (wasPaid && depPct && diff > 0 && !manual && !r.balance_link_id) {
+        /* A deposit booking whose balance has not been asked for yet: the new
+           balance is recorded, and asking for it stays the office's call. */
+        await pool.query(`UPDATE web_bookings SET balance_cents = $2 WHERE ref = $1`, [ref, diff]);
+        s.balance = Math.round(diff / 100);
+        s.text = s.text.replace(/\(PAID\)/, "(paid $" + Math.round(paidCents / 100) + ", balance $" + s.balance + " to pay)");
+      } else if (wasPaid) {
         if (diff > 0 && !manual && stripe) {
           payUrl = await createBalanceLinkFor(await getWebBooking(ref), diff).catch((e) => { console.error("amend balance link:", e.message); return null; });
           if (payUrl) {
@@ -2292,6 +2498,7 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
       } else if (b.confirmed && stripe) {
         payUrl = await paymentUrlFor(await getWebBooking(ref)).catch((e) => { console.error("amend pay link:", e.message); return null; });
       }
+      if (depPct) addDeposit(s, { total_cents: newCents, deposit_pct: depPct, balance_link_url: s.balance && payUrl ? payUrl : null }, wasPaid);
       /* A request that is not confirmed yet is not re-sent: confirming it is
          still the dispatch email's job, and that email carries the new figures. */
       let emailed = null;
@@ -2300,10 +2507,11 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
         from: `"Sky Transfers Website" <${process.env.GMAIL_USER}>`,
         to: BOOKINGS_EMAIL, replyTo: b.email || undefined,
         subject: `OFFICE amended: ${b.pickup} -> ${b.dropoff} (${b.date} ${b.time}) [${ref}] now $${s.total}` +
-                 (s.refund ? ` ($${s.refund} refunded)` : s.balance ? ` ($${s.balance} balance link sent)` : ""),
+                 (s.refund ? ` ($${s.refund} refunded)` : s.balance && payUrl ? ` ($${s.balance} balance link sent)` : s.balance ? ` ($${s.balance} balance owing)` : ""),
         text: `OFFICE AMENDMENT - changed from the admin page\nWas $${Math.round(wasCents / 100)}, now $${s.total}.\n` +
               (s.refund ? `Refunded $${s.refund} to the guest's card (Stripe ${refundId}).\n` : "") +
-              (s.balance ? `Guest emailed a link for the $${s.balance} balance.\n` : "") +
+              (s.balance && payUrl ? `Guest emailed a link for the $${s.balance} balance.\n`
+                : s.balance ? `$${s.balance} balance owing - not asked for yet; send the balance link from the admin page when ready.\n` : "") +
               (wasPaid && manual && diff !== 0 ? `Money settled by hand: ${diff < 0 ? "refund" : "collect"} $${Math.round(Math.abs(diff) / 100)}.\n` : "") +
               `\n${s.text}\n` +
               (payUrl && !s.balance ? `\nNew payment link: ${payUrl}\n` : "") + (oldLink ? "The previous payment link has been switched off.\n" : ""),
@@ -2311,7 +2519,8 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
       console.log("office booking amended:", ref, "$" + Math.round(wasCents / 100), "->", "$" + s.total,
         s.refund ? "refunded $" + s.refund : s.balance ? "balance $" + s.balance : wasPaid && manual ? "manual money" : "", emailed ? "emailed" : "no guest email");
       res.json({ ok: true, ref, total: s.total, was: Math.round(wasCents / 100), emailed, payUrl, status: r.status,
-                 refunded: s.refund || 0, balance: s.balance || 0, manual: wasPaid && manual && diff !== 0 });
+                 refunded: s.refund || 0, balance: s.balance || 0, balanceLink: !!(s.balance && payUrl),
+                 deposit: s.depositDue || 0, depositPct: depPct || null, manual: wasPaid && manual && diff !== 0 });
     } catch (err) {
       console.error("office amend:", err);
       res.status(500).json({ error: "Could not change that booking." });
@@ -2352,15 +2561,17 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
       let refundId = null;
       if (refundCents > 0 && !manual) {
         if (!stripe) return res.status(503).json({ error: "Payments are not configured, so the refund cannot be made automatically.", needsManual: true });
-        const pi = await findPaymentIntent(r).catch((e) => { console.error("cancel: find payment:", e.message); return null; });
-        if (!pi) {
+        const got = await refundAcross(r, refundCents, { ref, reason: "booking cancelled by office" }, "cancel-" + ref + "-" + refundCents)
+          .catch((e) => { console.error("cancel: refund:", e.message); return null; });
+        if (!got || got.short != null) {
           return res.status(409).json({ needsManual: true,
-            error: `The card payment for ${ref} could not be found in Stripe, so the $${Math.round(refundCents / 100)} refund cannot be made automatically. ` +
-                   "Refund it from the Stripe dashboard, then cancel again with 'settle the money by hand' ticked." });
+            error: got && got.short != null
+              ? `Only $${Math.round(got.short / 100)} of ${ref} was paid by card through Stripe (the rest was settled another way), so the $${Math.round(refundCents / 100)} refund cannot be made automatically. ` +
+                "Refund it by hand, then cancel again with 'settle the money by hand' ticked."
+              : `The card payment for ${ref} could not be found in Stripe, so the $${Math.round(refundCents / 100)} refund cannot be made automatically. ` +
+                "Refund it from the Stripe dashboard, then cancel again with 'settle the money by hand' ticked." });
         }
-        const refund = await stripe.refunds.create({ payment_intent: pi, amount: refundCents, metadata: { ref, reason: "booking cancelled by office" } },
-          { idempotencyKey: "cancel-" + ref + "-" + refundCents });
-        refundId = refund.id;
+        refundId = got.ids.join(", ");
       }
       await pool.query(
         `UPDATE web_bookings SET status = 'cancelled', cancelled_at = now(), refunded_cents = refunded_cents + $2, cancel_note = $3 WHERE ref = $1`,
@@ -2386,11 +2597,13 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
       let emailed = null;
       if (notify && r.passenger_email && mailer) {
         const first = String(r.passenger_name || "").trim().split(/\s+/)[0] || "there";
+        /* a deposit booking with the balance still owing has only paid the deposit */
+        const what = r.deposit_pct && r.balance_cents > 0 ? "deposit" : "fare";
         const money = refundCents > 0
           ? (manual
             ? `A refund of $${Math.round(refundCents / 100)} is being arranged - we'll let you know when it has been sent.`
             : `$${Math.round(refundCents / 100)} has been refunded to the card you paid with - it usually shows within 5 to 10 business days.`)
-          : paid ? (early ? "The fare is not refunded." : "As the cancellation was within 24 hours of pick-up, the fare is not refunded, in line with our booking terms.")
+          : paid ? (early ? `The ${what} is not refunded.` : `As the cancellation was within 24 hours of pick-up, the ${what} is not refunded, in line with our booking terms.`)
           : "Nothing was charged.";
         /* The booking is already cancelled and any refund made, so a failed
            email must not turn into an error that invites a second attempt. */
@@ -2780,5 +2993,5 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
      is handed out so other modules can sit behind the same admin login rather
      than growing a second path that accepts the PIN. */
   /* pool goes to ops.js (the dispatch board), which reads these same tables. */
-  return { saveWebBooking, actionLinks, findOpenWebBooking, requireAdmin, getWebBooking, rowToBooking, summaryForRow, settleBalance, pool, setTripStatus, requireAgent, requireAgentAccounts, settleAgentCard };
+  return { saveWebBooking, actionLinks, findOpenWebBooking, requireAdmin, getWebBooking, rowToBooking, summaryForRow, settleBalance, settleDeposit, pool, setTripStatus, requireAgent, requireAgentAccounts, settleAgentCard };
 };
