@@ -1272,6 +1272,32 @@ app.post("/stripe-webhook", async (req, res) => {
         }
         return res.json({ received: true });
       }
+      /* A payment with no booking in it: a payment link made by hand in the
+         Stripe dashboard. Until 20 Oct 2026 this fell through to the booking
+         email below and sent the office AND the payer a "PAID booking" with
+         "undefined" in every field and a PDF to match. Now the office is told
+         who paid what, and nobody else is emailed. */
+      if (!m.pickup && !m.dropoff && !m.date && !m.hours) {
+        const paid = Math.round((sess.amount_total || 0)) / 100;
+        const who = sess.customer_details || {};
+        let items = "";
+        try {
+          const li = await stripe.checkout.sessions.listLineItems(sess.id, { limit: 10 });
+          items = (li.data || []).map((x) => `${x.description || "item"} x${x.quantity || 1}  $${((x.amount_total || 0) / 100).toFixed(2)}`).join("\n");
+        } catch (e) { items = ""; }
+        console.log("payment without booking details:", sess.id, "$" + paid.toFixed(2), m.ref || "");
+        if (mailer) await mailer.sendMail({
+          from: `"Sky Transfers Website" <${process.env.GMAIL_USER}>`, to: BOOKINGS_EMAIL, replyTo: who.email || undefined,
+          subject: `CARD PAYMENT received: $${paid.toFixed(2)} from ${who.name || who.email || "a customer"} (payment link)`,
+          text: `CARD PAYMENT - Stripe, through a payment link made outside the booking system\n\n` +
+                `Amount: $${paid.toFixed(2)}\nFrom: ${who.name || "-"}${who.email ? " <" + who.email + ">" : ""}${who.phone ? ", " + who.phone : ""}\n` +
+                (items ? `For:\n${items}\n` : "") + (sess.payment_link ? `Payment link: ${sess.payment_link}\n` : "") +
+                `Stripe payment: ${b.paymentIntent || sess.id}\n\n` +
+                `The link carried no booking details, so nothing was put on the board and the customer was not sent a confirmation. ` +
+                `Match it to its booking yourself - for a booking already on the admin page, use "Balance paid another way" or mark it paid there.\n`,
+        }).catch((e) => console.error("payment-link email:", e.message));
+        return res.json({ received: true });
+      }
       /* An office payment link made before 13 Oct 2026 carried no return leg
          in its metadata, so a paid return printed as a one-way at the return
          price. The stored row is the authority whenever the metadata is

@@ -119,6 +119,13 @@ module.exports = function installLaImport(ctx) {
           `SELECT ref FROM ops_jobs WHERE lower(account) = lower($1) AND account_ref = $2 AND pickup_date = $3 AND pickup_time = $4 AND status <> 'cancelled'`,
           [account, accountRef, w.date, w.time])).rows[0] : null);
       if (dupe) { out.push(Object.assign(row, { status: "exists", why: "already on the board as " + dupe.ref })); continue; }
+      /* The same job put on the board from the Google Calendar, or typed in:
+         the same day and time for the same passenger. */
+      const sur = (last || name.split(" ").pop() || "").toLowerCase().replace(/[^a-z'-]/g, "");
+      const same = sur.length >= 3 ? (await pool.query(
+        `SELECT ref FROM ops_jobs WHERE pickup_date = $1 AND pickup_time = $2 AND lower(passenger_name) LIKE $3 AND status <> 'cancelled' AND import_key IS NULL`,
+        [w.date, w.time, "%" + sur + "%"])).rows[0] : null;
+      if (same) { out.push(Object.assign(row, { status: "exists", why: "already on the board as " + same.ref })); continue; }
       const luggage = pick(r, "luggage count", "luggage");
       const notes = [pick(r, "notes"), luggage && luggage !== "0" ? `Luggage: ${luggage}.` : "",
         /charter|tour/i.test(service) ? `Service: ${service}.` : "", cls === null && rawVehicle ? `Vehicle booked: ${rawVehicle}.` : ""].filter(Boolean).join(" ");

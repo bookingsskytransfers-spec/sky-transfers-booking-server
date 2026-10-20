@@ -125,4 +125,4 @@ function parseBookingEmail({ subject, text, classes }) {
   return { ok: true, job: j, checks };
 }
 
-module.exports = { parseBookingEmail, parseDate, parseTime, parseVehicle };
+module.exports = { parseBookingEmail, parseDate, parseTime, parseVehicle, KEYS };
