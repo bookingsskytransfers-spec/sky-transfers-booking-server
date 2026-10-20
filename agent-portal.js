@@ -1543,7 +1543,9 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
     const price = await stripe.prices.create({
       currency: "aud",
       unit_amount: r.total_cents,
-      product_data: { name: `Transfer — ${r.pickup} to ${r.dropoff}` },
+      product_data: { name: r.hire_hours
+        ? `${r.hire_hours > 6 ? "Charter" : "Hourly hire"}, ${r.hire_hours} hours from ${r.pickup}`
+        : `Transfer — ${r.pickup} to ${r.dropoff}` },
     }, { idempotencyKey: "price-" + r.ref + "-" + (r.link_seq || 0) });
 
     const link = await stripe.paymentLinks.create({
@@ -1800,7 +1802,7 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
     const total = Math.round((r.total_cents || 0) / 100);
     const ret = returnLeg(b);
     const text = bookingSummary(b, 0, b.childSeats, b.trailer, ret).text
-      .replace(/Fare: \$0 one-way\n/, "")
+      .replace(/^Fare: \$0 (one-way|for \d+ hours.*)\n/m, "")
       .replace(/^Return fare: .*\n/m, "")
       .replace(/TOTAL: \$\d+/, "TOTAL: $" + total + (b.paid ? " (PAID)" : ""));
     const s = { total, isReturn: !!ret, text };
@@ -1824,16 +1826,17 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
       : s.refund
       ? `Your booking has been updated, and $${s.refund} has been refunded to the card you paid with - it usually shows within 5 to 10 business days. Your updated confirmation is attached.`
       : b.paid
-      ? "Your transfer is confirmed and paid. Your printable confirmation is attached."
+      ? `Your ${hoursOf(b) ? "booking" : "transfer"} is confirmed and paid. Your printable confirmation is attached.`
       : b.confirmed
-        ? "Your transfer is confirmed and your chauffeur is booked. Your printable confirmation is attached" +
+        ? `Your ${hoursOf(b) ? "booking" : "transfer"} is confirmed and your chauffeur is booked. Your printable confirmation is attached` +
           (payUrl ? `, and you can pay securely here to secure it:\n${payUrl}` : ".")
         : "Thanks for your booking request. We'll reply shortly, usually within the hour, to confirm your chauffeur.";
     await mailer.sendMail({
       from: `"Sky Transfers" <${process.env.GMAIL_USER}>`,
       to: b.email, replyTo: BOOKINGS_EMAIL, subject,
       text: `Hi ${b.name},\n\n${opening}\n\n${s.text}\n\n` +
-            `We track your flight and your chauffeur meets you with a name board. Free changes to 24 hours ` +
+            (hoursOf(b) ? "Your chauffeur will be at the pick-up at the time above. Free changes to 24 hours "
+                        : `We track your flight and your chauffeur meets you with a name board. Free changes to 24 hours `) +
             `before pick-up: reply to this email or call +61 481 437 772.\n\n` +
             `Sky Transfers — Gold Coast & Brisbane airport transfers\nwww.skytransfers.com.au`,
       html: bookingEmailHtml(b, payUrl ? { ...s, payUrl } : s),
@@ -1871,6 +1874,18 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
       res.status(code || 400).json({ error: msg });
       return null;
     };
+    /* By the hour, or a charter (20 Oct 2026): the vehicle is held for N
+       hours from the pick-up, as directed - no drop-off, no return leg, no
+       stops. 3 to 6 hours has the website's hourly price; anything else is
+       charter work and needs the agreed total in the override box. */
+    if (b0.tripType === "hourly" || (b0.hourly && b0.hourly.hours)) {
+      const hours = parseInt(b0.hours != null ? b0.hours : b0.hourly && b0.hourly.hours, 10);
+      b.hourly = { hours };
+      if (!hoursOf(b)) return refuse("Choose how many hours the vehicle is booked for (1 to 16).");
+      b.dropoff = "As directed";
+      b.returnDate = ""; b.returnTime = ""; b.returnFlight = "";
+      b.stops = [];
+    }
     const missing = ["pickup", "dropoff", "vehicle", "date", "time", "name", "phone"].filter((f) => !b[f]);
     if (missing.length) return refuse("Please fill in: " + missing.join(", ") + ".");
     if (b.pickup === b.dropoff) return refuse("Pick-up and drop-off are the same place.");
@@ -1884,6 +1899,16 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
     /* The two ends must be places we price - a suburb or airport from the
        list - unless the office is naming its own total. A street address
        belongs in the exact-address field, not here. */
+    if (b.hourly) {
+      /* the hourly rate does not depend on where it starts, so any pick-up */
+      const fare = hasOverride ? null : await fareForBooking(b);
+      if (fare == null && !hasOverride) {
+        return refuse(hoursOf(b) > 6 || hoursOf(b) < 3
+          ? `${hoursOf(b)} hours is charter work with no online price — type the agreed total in the override box.`
+          : "There is no online hourly price for that vehicle — type the agreed total in the override box.");
+      }
+      return { b, ret: null, fare, override, hasOverride };
+    }
     if (!hasOverride) {
       const unknown = [b.pickup, b.dropoff].filter((p) => !PRICED_PLACES.has(p));
       if (unknown.length) {
@@ -1927,7 +1952,7 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
       if (hasOverride) s.total = override;
       const tag = b.paid ? " (PAID)" : hasOverride ? " (agreed price)" : "";
       s.text = s.text
-        .replace(/Fare: \$0 one-way\n/, "")
+        .replace(/^Fare: \$0 (one-way|for \d+ hours.*)\n/m, "")
         .replace(/^Return fare: \$0 .*\n/m, "")
         .replace(/TOTAL: \$\d+/, "TOTAL: $" + s.total + tag);
 
@@ -2014,7 +2039,7 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
       const s = bookingSummary(b, hasOverride ? 0 : fare, b.childSeats, b.trailer, ret);
       if (hasOverride) s.total = override;
       s.text = s.text
-        .replace(/Fare: \$0 one-way\n/, "")
+        .replace(/^Fare: \$0 (one-way|for \d+ hours.*)\n/m, "")
         .replace(/^Return fare: \$0 .*\n/m, "")
         .replace(/TOTAL: \$\d+/, "TOTAL: $" + s.total + (wasPaid ? " (PAID)" : hasOverride ? " (agreed price)" : ""));
       const wasCents = r.total_cents || 0;
@@ -2044,13 +2069,13 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
            passenger_name = $7, passenger_phone = $8, passenger_email = $9, flight = $10,
            address = $11, notes = $12, pax = $13, child_seats = $14, trailer = $15,
            total_cents = $16, return_date = $17, return_time = $18, return_flight = $19,
-           stops = $20, balance_cents = 0, balance_link_id = NULL, balance_link_url = NULL` +
+           stops = $20, hire_hours = $21, balance_cents = 0, balance_link_id = NULL, balance_link_url = NULL` +
         /* An unpaid booking's link is replaced; a paid one keeps its payment history. */
         (wasPaid ? "" : ", payment_link_id = NULL, payment_link_url = NULL, link_seq = link_seq + 1") +
         ` WHERE ref = $1`,
         [ref, b.pickup, b.dropoff, b.vehicle, b.date, b.time, b.name, b.phone, b.email || null,
          b.flight || null, b.address || null, b.notes || null, b.pax, b.childSeats, b.trailer,
-         newCents, b.returnDate || null, b.returnTime || null, b.returnFlight || null, stopsJson(b)]);
+         newCents, b.returnDate || null, b.returnTime || null, b.returnFlight || null, stopsJson(b), hoursOf(b)]);
 
       /* An earlier balance link, if any, is now wrong - switch it off. */
       if (r.balance_link_id && stripe) {
