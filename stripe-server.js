@@ -371,9 +371,14 @@ function confirmationContent(b, s) {
   const trailer = b.trailer === true || b.trailer === "true";
   const legs = ret ? 2 : 1;
   const stops = Array.isArray(b.stops) ? b.stops.filter((x) => x && (x.address || x.suburb)) : [];
-  const state = b.paid && s.balance ? "balance" : b.paid ? "paid" : b.confirmed ? "confirmed" : "request";
-  const pill = { balance: "PAID  ·  BALANCE DUE", paid: "CONFIRMED  ·  PAID", confirmed: "CONFIRMED  ·  PAYMENT DUE", request: "REQUEST RECEIVED" }[state];
+  /* deposit_due / deposit_paid: an office booking taking a deposit first */
+  const state = b.paid && s.balance ? (s.deposit ? "deposit_paid" : "balance") : b.paid ? "paid"
+    : b.confirmed ? (s.depositDue ? "deposit_due" : "confirmed") : "request";
+  const pill = { balance: "PAID  ·  BALANCE DUE", paid: "CONFIRMED  ·  PAID", confirmed: "CONFIRMED  ·  PAYMENT DUE", request: "REQUEST RECEIVED",
+                 deposit_due: "CONFIRMED  ·  DEPOSIT DUE", deposit_paid: "DEPOSIT PAID  ·  BALANCE DUE" }[state];
   const intro = {
+    deposit_due: "Thank you for booking with Sky Transfers. Your booking is confirmed - a deposit secures it.",
+    deposit_paid: "Thank you for booking with Sky Transfers. Your booking is confirmed and your deposit is paid.",
     balance: "Your booking has been updated. A balance is due - see below.",
     paid: "Thank you for booking with Sky Transfers. Your booking is confirmed and paid.",
     confirmed: "Thank you for booking with Sky Transfers. Your booking is confirmed.",
@@ -430,7 +435,17 @@ function confirmationContent(b, s) {
     const ex = extrasLabel(b);
     if (!hrs && ex !== "None") pay.push(["Extras", ex + (ret ? " (each leg)" : "")]);
   }
-  const status = state === "balance" ? `Paid $${s.total - s.balance} by card. $${s.balance} balance to pay with the link in your email.`
+  if (state === "deposit_due") {
+    pay.push([`Deposit due now (${s.depositPct}%)`, `$${s.depositDue}`]);
+    pay.push(["Balance, paid later", `$${s.total - s.depositDue}`]);
+  } else if (state === "deposit_paid") {
+    pay.push(["Paid so far", `$${s.total - s.balance} by card`]);
+    pay.push(["Balance to pay", `$${s.balance}`]);
+  }
+  const status = state === "deposit_due" ? `Deposit of $${s.depositDue} due now - pay with the link in your confirmation email. The $${s.total - s.depositDue} balance is paid later; we'll send you a link.`
+    : state === "deposit_paid" ? (s.balanceLink ? `Deposit paid. $${s.balance} balance to pay with the link in your email.`
+                                                : `Deposit paid. $${s.balance} balance to pay - we'll send you a secure link for it.`)
+    : state === "balance" ? `Paid $${s.total - s.balance} by card. $${s.balance} balance to pay with the link in your email.`
     : state === "paid" && s.refund ? `Paid by card. $${s.refund} refunded to your card.`
     : state === "paid" ? "Paid in full. Nothing to pay the chauffeur."
     : state === "confirmed" ? "Payment due. Pay securely with the link in your confirmation email."
@@ -470,7 +485,7 @@ function bookingPdf(b, s) {
       const W = 595.28, H = 841.89, L = 40, R = W - 40, CW = R - L, LABEL_W = 150, FY = H - 66;
       const NAVY = "#101828", INK = "#141D30", TEXT = "#333B4C", MUTED = "#68707F", GOLD = "#C9A227", GOLD_D = "#8E701C",
             GOLD_LT = "#D9B44A", LINE = "#E9DFC6", SOFT = "#F6EED9", CREAM = "#F6F2E8", OK = "#1E7F4F", WARN = "#9C6A0E";
-      const pillColour = { paid: OK, balance: WARN, confirmed: WARN, request: GOLD_D }[c.state];
+      const pillColour = { paid: OK, balance: WARN, confirmed: WARN, request: GOLD_D, deposit_due: WARN, deposit_paid: WARN }[c.state];
 
       const header = (first) => {
         doc.rect(0, 0, W, first ? 92 : 56).fill(NAVY);
@@ -581,7 +596,7 @@ function bookingEmailHtml(b, s) {
   const c = confirmationContent(b, s);
   const paid = !!b.paid;
   const confirmed = !paid && !!b.confirmed;
-  const pillBg = { paid: "#1E7F4F", balance: "#9C6A0E", confirmed: "#9C6A0E", request: "#8E701C" }[c.state];
+  const pillBg = { paid: "#1E7F4F", balance: "#9C6A0E", confirmed: "#9C6A0E", request: "#8E701C", deposit_due: "#9C6A0E", deposit_paid: "#9C6A0E" }[c.state];
   const cellL = "padding:9px 14px;font:700 12px/1.45 Arial,sans-serif;color:#141D30;vertical-align:top;width:34%;border-bottom:1px solid #EFE6D0;";
   const cellR = "padding:9px 14px;font:400 14px/1.45 Arial,sans-serif;color:#333B4C;vertical-align:top;border-bottom:1px solid #EFE6D0;";
   const value = (v) => (v && v.timeline)
@@ -604,7 +619,12 @@ function bookingEmailHtml(b, s) {
         <tr><td style="${cellL}background:#F6EED9;padding-top:12px;padding-bottom:12px;">Total (AUD, GST incl.)</td>
             <td style="${cellR}background:#F6EED9;font:700 22px Arial,sans-serif;color:#141D30;">$${c.total}</td></tr>
         <tr><td style="${cellL}">Status</td><td style="${cellR}font-weight:700;color:${c.state === "paid" ? "#1E7F4F" : c.state === "request" ? "#68707F" : "#9C6A0E"};">${esc(c.status)}</td></tr>`;
-  const greeting = paid && s.balance
+  const greeting = c.state === "deposit_due"
+    ? `Your booking is confirmed. Pay the $${s.depositDue} deposit below to secure it — the $${s.total - s.depositDue} balance is paid later, and we'll send you a link for it. Your printable confirmation is attached.`
+    : c.state === "deposit_paid"
+    ? (s.payUrl ? `Thank you for your deposit. The $${s.balance} balance for your booking can now be paid below. Your confirmation is attached.`
+                : `Your booking is confirmed and your $${s.total - s.balance} deposit is paid. The $${s.balance} balance is paid later — we'll send you a secure link for it. Your printable confirmation is attached.`)
+    : paid && s.balance
     ? `Your booking has been updated. Your earlier payment of $${s.total - s.balance} is held against it — the $${s.balance} difference can be paid below. Your updated confirmation is attached.`
     : paid && s.refund
     ? `Your booking has been updated, and $${s.refund} has been refunded to the card you paid with — it usually shows within 5 to 10 business days. Your updated confirmation is attached.`
@@ -642,7 +662,7 @@ function bookingEmailHtml(b, s) {
 
     ${s.payUrl ? `<!-- Pay button: only a confirmation the office sent with a payment link -->
     <tr><td align="center" style="padding:16px 28px 2px;">
-      <a href="${esc(s.payUrl)}" style="display:inline-block;background:#C9A227;color:#141D30;font:700 15px Arial,sans-serif;padding:14px 30px;border-radius:9px;text-decoration:none;">${s.balance ? `Pay the $${s.balance} balance now` : `Pay $${s.total} now to secure your booking`}</a>
+      <a href="${esc(s.payUrl)}" style="display:inline-block;background:#C9A227;color:#141D30;font:700 15px Arial,sans-serif;padding:14px 30px;border-radius:9px;text-decoration:none;">${s.balance ? `Pay the $${s.balance} balance now` : s.depositDue ? `Pay the $${s.depositDue} deposit now` : `Pay $${s.total} now to secure your booking`}</a>
       <div style="font:400 12.5px Arial,sans-serif;color:#68707F;padding-top:8px;">Secure card payment by Stripe &mdash; card details never touch our website.</div>
     </td></tr>` : ""}
     ${section("Booking details", c.booking)}
@@ -1196,10 +1216,42 @@ app.post("/stripe-webhook", async (req, res) => {
       }
       /* A balance link - the difference after a paid booking was amended
          upwards. Not a new booking: settle it and tell both sides. */
+      /* A deposit link (an office booking taking 20% or so now). The booking
+         becomes paid with the rest owing; asking for the balance is the
+         office's call, from the admin page. Not a new booking: stop here. */
+      if (m.deposit_for && portal && typeof portal.settleDeposit === "function") {
+        const ref = String(m.deposit_for);
+        const got = Math.round((sess.amount_total || 0) / 100);
+        const row = await portal.settleDeposit(ref, sess.amount_total || 0, b.paymentIntent || "").catch((e) => { console.error("settle deposit:", e.message); return null; });
+        console.log("deposit paid:", ref, "$" + got, row ? (row._fresh ? "settled" : "already settled") : "row missing");
+        if (row && row._fresh && mailer) {
+          const rb = portal.rowToBooking(row);
+          rb.email = rb.email || sess.customer_email || sess.customer_details?.email || "";
+          const rs = portal.summaryForRow(row, rb);
+          const rpdf = await bookingPdf(rb, rs).catch((e) => { console.error("PDF failed:", e.message); return null; });
+          await mailer.sendMail({
+            from: `"Sky Transfers Website" <${process.env.GMAIL_USER}>`, to: BOOKINGS_EMAIL, replyTo: rb.email || undefined,
+            subject: `DEPOSIT PAID: $${got} on ${ref} - $${rs.balance || 0} balance owing - ${rb.pickup} -> ${rb.dropoff} (${rb.date} ${rb.time})`,
+            text: `DEPOSIT PAID - Sky Transfers (Stripe)\n\n$${got} deposit received for ${ref}. $${rs.balance || 0} balance still owing.\n` +
+                  `It is NOT requested automatically - send it from the admin page (Web bookings > Send balance link) when you're ready, ` +
+                  `or mark it paid there if the guest pays another way.\n\n${rs.text}`,
+            attachments: rpdf ? [{ filename: "SkyTransfers-Booking.pdf", content: rpdf }] : [],
+          });
+          if (rb.email) await mailer.sendMail({
+            from: `"Sky Transfers" <${process.env.GMAIL_USER}>`, to: rb.email, replyTo: BOOKINGS_EMAIL,
+            subject: `Deposit received — booking confirmed — Sky Transfers · ${ref}`,
+            text: `Hi ${rb.name},\n\nThank you - we've received your $${got} deposit and your booking is confirmed. ` +
+                  `The $${rs.balance || 0} balance is paid later; we'll send you a secure link for it. Your printable confirmation is attached.\n\n${rs.text}\n\n` +
+                  `Free changes to 24 hours before pick-up: reply to this email or call +61 481 437 772.\n\nSky Transfers — Gold Coast & Brisbane airport transfers\nwww.skytransfers.com.au`,
+            html: bookingEmailHtml(rb, rs), attachments: guestAttachments(rpdf),
+          });
+        }
+        return res.json({ received: true });
+      }
       if (m.balance_for && portal && typeof portal.settleBalance === "function") {
         const ref = String(m.balance_for);
         const got = Math.round((sess.amount_total || 0) / 100);
-        const row = await portal.settleBalance(ref).catch((e) => { console.error("settle balance:", e.message); return null; });
+        const row = await portal.settleBalance(ref, b.paymentIntent || "").catch((e) => { console.error("settle balance:", e.message); return null; });
         console.log("balance paid:", ref, "$" + got, row ? "settled" : "row missing");
         if (row && mailer) {
           const rb = portal.rowToBooking(row);
@@ -1209,12 +1261,12 @@ app.post("/stripe-webhook", async (req, res) => {
           await mailer.sendMail({
             from: `"Sky Transfers Website" <${process.env.GMAIL_USER}>`, to: BOOKINGS_EMAIL, replyTo: rb.email || undefined,
             subject: `BALANCE PAID: $${got} on ${ref} - ${rb.pickup} -> ${rb.dropoff} (${rb.date} ${rb.time})`,
-            text: `BALANCE PAID - Sky Transfers website (Stripe)\n\n$${got} received for the change to ${ref}. The booking is now fully paid.\n\n${rs.text}`,
+            text: `BALANCE PAID - Sky Transfers website (Stripe)\n\n$${got} received for ${row.deposit_pct ? "the balance of" : "the change to"} ${ref}. The booking is now fully paid.\n\n${rs.text}`,
           });
           if (rb.email) await mailer.sendMail({
             from: `"Sky Transfers" <${process.env.GMAIL_USER}>`, to: rb.email, replyTo: BOOKINGS_EMAIL,
             subject: `Balance received — fully paid — Sky Transfers · ${ref}`,
-            text: `Hi ${rb.name},\n\nThank you - we've received $${got} and your updated booking is now fully paid. Your confirmation is attached.\n\n${rs.text}\n\nSky Transfers — Gold Coast & Brisbane airport transfers\nwww.skytransfers.com.au`,
+            text: `Hi ${rb.name},\n\nThank you - we've received $${got} and your ${row.deposit_pct ? "" : "updated "}booking is now fully paid. Your confirmation is attached.\n\n${rs.text}\n\nSky Transfers — Gold Coast & Brisbane airport transfers\nwww.skytransfers.com.au`,
             html: bookingEmailHtml(rb, rs), attachments: guestAttachments(rpdf),
           });
         }
