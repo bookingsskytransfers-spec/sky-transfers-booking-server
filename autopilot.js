@@ -127,6 +127,8 @@ module.exports = function installAutopilot(ctx) {
     intakeOn: false, intakeSince: null,
     /* the Google Calendar -> the board (calendar-sync.js) */
     calOn: false,
+    /* Outlook info@ -> Claude -> the Google Calendar (inbox-ai.js) */
+    aiOn: false, aiSince: null,
     alertTo: "",
     /* Phase 3, guest-updates.js: emails (and later WhatsApp) to the guest -
        driver assigned the evening before, on the way, arrived. */
@@ -141,7 +143,7 @@ module.exports = function installAutopilot(ctx) {
     const cur = await getSettings();
     const b = patch || {}, next = Object.assign({}, cur);
     const bool = (k) => { if (k in b) next[k] = b[k] === true || b[k] === "true"; };
-    ["dispatchOn", "closeOn", "autoCloseStarted", "invoicesOn", "digestOn", "intakeOn", "calOn",
+    ["dispatchOn", "closeOn", "autoCloseStarted", "invoicesOn", "digestOn", "intakeOn", "calOn", "aiOn",
      "guestOn", "guestAgentAccount", "guestWhatsApp"].forEach(bool);
     for (const k of ["dispatchAt", "invoiceAt", "digestAt", "guestNoticeAt"]) if (k in b) { const t = hhmm(b[k]); if (!t) throw { code: 400, message: "Times are 24-hour, like 18:00." }; next[k] = t; }
     if ("closeAfterHours" in b) {
@@ -157,6 +159,7 @@ module.exports = function installAutopilot(ctx) {
     /* Only mail that arrives after intake is switched on is read, so the
        first run can't re-enter a week of bookings already typed in. */
     if (next.intakeOn && !cur.intakeOn) next.intakeSince = new Date(nowMs()).toISOString();
+    if (next.aiOn && !cur.aiOn) next.aiSince = new Date(nowMs()).toISOString();
     await pool.query(
       `INSERT INTO ops_settings (key, value, updated_at) VALUES ('autopilot', $1, now())
        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`, [JSON.stringify(next)]);
@@ -195,6 +198,8 @@ module.exports = function installAutopilot(ctx) {
 
   /* The Google Calendar, read on every pass when it is switched on. */
   const cal = require("./calendar-sync")({ app, pool, requireAdmin, makeRef, VEHICLES, logEvent, alert, nowMs, BOARD, fetchIcs: ctx.fetchIcs });
+  const inbox = require("./inbox-ai")({ pool, logEvent, alert, nowMs, BOARD, VEHICLES, claim, insertOnce, senderVerified,
+    fetch: ctx.aiFetch, anthropic: ctx.anthropic });
 
   /* ---- choosing a driver ---------------------------------------------------------
      Eligible: active, has not turned this leg down, licence and driver
@@ -659,6 +664,8 @@ module.exports = function installAutopilot(ctx) {
         try { ran[name] = await fn(); } catch (e) { ran[name] = { error: e.message || String(e) }; await logEvent("error", `${name}: ${e.message || e}`); }
       };
       await step("intake", s.intakeOn, () => intakePass(s));
+      /* before the calendar read: what it adds goes into the calendar first */
+      await step("inbox", s.aiOn, () => inbox.pass(s));
       /* before dispatch, so a job that has just arrived can be given a driver */
       await step("calendar", s.calOn, () => cal.pass(s));
       await step("dispatch", s.dispatchOn, () => dispatchPass(s));
@@ -694,7 +701,7 @@ module.exports = function installAutopilot(ctx) {
         .concat(agents.map((g) => ({ type: "agent", key: g.code, name: g.name, email: g.email, schedule: sOf("agent", g.code) })));
       const events = (await pool.query(`SELECT id, at, kind, ref, leg, message FROM ops_events ORDER BY id DESC LIMIT 100`)).rows;
       const n = bne();
-      res.json({ settings: s, parties, events, now: { date: n.date, time: n.hm }, intake: intakeReady(), calendar: cal.ready(), mailer: !!mailer,
+      res.json({ settings: s, parties, events, now: { date: n.date, time: n.hm }, intake: intakeReady(), calendar: cal.ready(), inboxAi: inbox.ready(), mailer: !!mailer,
         alertDefault: BOOKINGS_EMAIL });
     } catch (err) { fail(res, err, "load the autopilot"); }
   });
@@ -727,6 +734,17 @@ module.exports = function installAutopilot(ctx) {
       res.json({ ok: true });
     } catch (err) { fail(res, err, "save that schedule"); }
   });
+  /* The AI inbox reader: test the three connections (reads nothing private),
+     and a look at what it would make of the last day's mail - nothing saved,
+     nothing put in the calendar (it does use up to 10 AI reads). */
+  app.get("/autopilot/inbox-ai/check", requireAdmin, async (req, res) => {
+    try { const r = inbox.ready(); res.json(r.ok ? { ok: true, ready: r, checks: await inbox.check() } : { ok: false, why: r.why }); }
+    catch (err) { fail(res, err, "check the inbox reader"); }
+  });
+  app.post("/autopilot/inbox-ai/preview", requireAdmin, async (req, res) => {
+    try { res.json({ ok: true, result: await inbox.pass(await getSettings(), { dry: true }) }); }
+    catch (err) { fail(res, err, "preview the inbox"); }
+  });
   /* "Run now" - the same passes, without waiting for their time of day. */
   app.post("/autopilot/run", requireAdmin, async (req, res) => {
     try {
@@ -734,7 +752,7 @@ module.exports = function installAutopilot(ctx) {
       const s = await getSettings();
       const fns = { dispatch: () => dispatchPass(s, { force: true }), close: () => closePass(s), invoices: () => invoicePass(s, { force: true }),
                     digest: () => digestPass(s, { force: true }), intake: () => intakePass(s, { force: true }),
-                    calendar: () => cal.pass(s, { force: true }) };
+                    calendar: () => cal.pass(s, { force: true }), inbox: () => inbox.pass(s, { force: true }) };
       if (!fns[what]) throw { code: 400, message: "Unknown job." };
       const r = await fns[what]();
       await logEvent("run", `"${what}" run from the office.`);
@@ -813,6 +831,7 @@ button{margin-top:12px;font:inherit;font-weight:700;background:#141D30;color:#ff
   let timer = null;
   initSchema()
     .then(() => cal.initSchema())
+    .then(() => inbox.initSchema())
     .then(() => {
       console.log("Autopilot ready (checks every 5 minutes; each job is off until switched on)");
       if (!ctx.noTimer) {
@@ -824,5 +843,5 @@ button{margin-top:12px;font:inherit;font-weight:700;background:#141D30;color:#ff
     .catch((e) => console.error("Autopilot setup failed:", e.message));
 
   return { on: true, tick, dispatchPass, closePass, invoicePass, digestPass, intakePass, getSettings, saveSettings,
-           pickDriver, periodFor, approveToken, approvedId, initSchema, cal, stop: () => timer && clearInterval(timer) };
+           pickDriver, periodFor, approveToken, approvedId, initSchema, cal, inbox, stop: () => timer && clearInterval(timer) };
 };

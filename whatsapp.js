@@ -16,6 +16,12 @@
  * English). Meta does not allow a variable at the very start or end.
  * ------------------------------------------------------------------------ */
 const TEMPLATES = {
+  /* to the DRIVER, from "WhatsApp to driver" on the board (ops.js). Never the
+     account or agency name. */
+  sky_driver_job: {
+    params: ["job reference", "date", "pick-up time", "from", "to", "details", "driver's job link"],
+    body: "New Sky Transfers job {{1}} on {{2}} at {{3}}. From: {{4}}. To: {{5}}. Details: {{6}}. Accept and update the job here: {{7}} - reply here if you can't do it.",
+  },
   sky_driver_assigned: {
     params: ["guest first name", "date and time", "driver first name", "car", "tracking link"],
     body: "Hi {{1}}, your Sky Transfers driver for {{2}} is {{3}}, in a {{4}}. Track your driver here: {{5}} - reply or call +61 481 437 772 to change anything.",
@@ -63,7 +69,8 @@ module.exports = function makeWhatsApp(opts) {
         body: JSON.stringify({
           messaging_product: "whatsapp", to, type: "template",
           template: { name, language: { code: lang },
-            components: [{ type: "body", parameters: (params || []).map((t) => ({ type: "text", text: String(t == null ? "" : t).slice(0, 300) })) }] },
+            components: [{ type: "body", /* Meta refuses a parameter with a new line, a tab or 4+ spaces in a row */
+            parameters: (params || []).map((t) => ({ type: "text", text: String(t == null ? "" : t).replace(/\s+/g, " ").trim().slice(0, 400) || "-" })) }] },
         }),
       });
       const j = await r.json().catch(() => ({}));

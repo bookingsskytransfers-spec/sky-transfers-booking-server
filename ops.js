@@ -494,6 +494,57 @@ module.exports = function installOps(ctx) {
     }
   });
 
+  /* WhatsApp Business Platform: "WhatsApp to driver" sends the job from the
+     Sky Transfers number itself, as the approved sky_driver_job template,
+     when WA_TOKEN and WA_PHONE_NUMBER_ID are on the server. Until then (or if
+     Meta refuses) the board falls back to opening WhatsApp on the office's
+     phone as before. The job is built here from the booking tables, never
+     from what the browser sends, and it never carries the account name. */
+  const wa = ctx.wa || require("./whatsapp")();
+  const one = (s, n) => String(s == null ? "" : s).replace(/\s+/g, " ").trim().slice(0, n || 300);
+  const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"], MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const niceDay = (d) => { const x = new Date(d + "T00:00:00Z"); return DAYS[x.getUTCDay()] + " " + x.getUTCDate() + " " + MONTHS[x.getUTCMonth()]; };
+  function driverJobParams(l, d, v, link) {
+    const bits = [];
+    if (l.hours && (!l.to || l.to === "As directed")) bits.push(`by the hour, ${l.hours} h as directed`);
+    (l.stops || []).forEach((s, i) => bits.push(`stop ${i + 1}: ${s}`));
+    if (l.flight) bits.push(`flight ${l.flight}`);
+    bits.push(`${l.guest || "Guest"}${l.phone ? " " + l.phone : ""}, ${l.pax} pax`);
+    bits.push(v ? v.label : l.vehicleClass || "vehicle to confirm");
+    if (l.childSeats) bits.push(`child seats: ${l.childSeats}`);
+    if (l.trailer) bits.push("luggage trailer");
+    if (l.address) bits.push(`address: ${l.address}`);
+    if (l.notes) bits.push(`guest notes: ${l.notes}`);
+    if (l.officeNote) bits.push(`office: ${l.officeNote}`);
+    if (l.driverPay != null) bits.push(`your pay $${l.driverPay}`);
+    return [l.ref + (l.isReturn ? (l.leg === "ret" ? " (return leg)" : " (outbound leg)") : ""), niceDay(l.date), l.time || "time to confirm",
+      one(l.from, 120), one(l.hours && (!l.to || l.to === "As directed") ? "as directed" : l.to, 120), one(bits.join("; "), 350), link];
+  }
+  app.get("/ops/wa-status", requireAdmin, (req, res) => res.json({ connected: wa.enabled, template: "sky_driver_job" }));
+  app.post("/ops/wa-driver", requireAdmin, async (req, res) => {
+    try {
+      const ref = txt((req.body || {}).ref, 40), leg = (req.body || {}).leg === "ret" ? "ret" : "out";
+      if (!wa.enabled) return res.status(409).json({ error: "WhatsApp isn't connected on the server yet.", reason: "not_connected" });
+      const legs = (await sourceRows(null, null, [ref])).filter((l) => l.leg === leg);
+      if (!legs.length) return res.status(404).json({ error: "No such job." });
+      const disp = (await pool.query(`SELECT * FROM ops_dispatch WHERE ref = $1 AND leg = $2`, [ref, leg])).rows;
+      const drivers = await allDrivers(), vehicles = await allVehicles();
+      const l = attachDispatch(legs, disp, drivers, vehicles)[0];
+      const d = drivers.find((x) => x.id === l.driverId);
+      if (!d) return res.status(409).json({ error: "Save a driver on this job first." });
+      if (!d.active) return res.status(409).json({ error: d.name + " is inactive." });
+      const v = vehicles.find((x) => x.id === l.vehicleId) || null;
+      const r = await wa.sendTemplate(d.phone, "sky_driver_job", driverJobParams(l, d, v, linkFor(d)));
+      if (!r.ok) return res.status(502).json({ error: "WhatsApp didn't send it (" + r.reason + ").", reason: r.reason });
+      await pool.query(`UPDATE ops_dispatch SET sent_at = now(), updated_at = now() WHERE ref = $1 AND leg = $2`, [ref, leg]);
+      console.log("ops whatsapp job:", ref, leg, "to driver", d.id);
+      res.json({ ok: true, to: d.name });
+    } catch (err) {
+      console.error("ops wa-driver:", err);
+      res.status(500).json({ error: "Could not send that." });
+    }
+  });
+
   /* ---- office: drivers ------------------------------------------------------- */
   app.get("/ops/drivers", requireAdmin, async (req, res) => {
     try { res.json({ drivers: await allDrivers() }); }
