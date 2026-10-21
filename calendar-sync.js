@@ -230,7 +230,8 @@ module.exports = function calendarSync(ctx) {
     }
     const fl = first(L.flight) || (/\(([A-Z0-9]{2})-?\s?(\d{1,4})\b[^)]*\)/.exec(s) || []).slice(1, 3).join("");
     j.flight = (/\b([A-Z0-9]{2})-?\s?(\d{1,4})\b/.exec(String(fl).toUpperCase()) || []).slice(1, 3).join("") || null;
-    const seatM = /(\d+)\s*x?\s*(baby|child|booster|infant)\s*seats?/i.exec(d) || /(baby|child|booster)\s*seats?\s*:?\s*(\d+)/i.exec(d);
+    /* on one line: "Price: $145.00" above "Child seats: 1" is not 0 seats */
+    const seatM = /(\d+)[ \t]*x?[ \t]*(baby|child|booster|infant)[ \t]*seats?/i.exec(d) || /(baby|child|booster)[ \t]*seats?[ \t]*:?[ \t]*(\d+)/i.exec(d);
     j.childSeats = seatM ? Math.min(+(seatM[1].match(/\d/) ? seatM[1] : seatM[2]) || 0, 6) : 0;
     j.trailer = /\btrailer( is)? required\b|\btrailer:\s*(yes|required)/i.test(d);
     const mins = ev.end && !ev.end.allDay ? Math.round((ev.end.ms - ev.start.ms) / 60000) : 0;
@@ -241,6 +242,11 @@ module.exports = function calendarSync(ctx) {
 
     if (/\b(time )?tbc\b|\bto be confirmed\b/i.test(s)) checks.push("the calendar says something is still TBC");
     if (!j.name) checks.push("no passenger name");
+    /* put in the calendar by the AI inbox reader (inbox-ai.js): always a Check */
+    if (/^Source: Sky Transfers AI inbox reader/m.test(d)) {
+      checks.push("read from an email by the AI - check it against the email");
+      const aiq = /^AI check:\s*(.+)$/m.exec(d); if (aiq) checks.push("the AI says: " + aiq[1].slice(0, 200));
+    }
     /* Agencies often don't pass on the guest's mobile, and the agency itself
        is the contact (Aman, 21 Oct 2026) - so only a direct booking with no
        phone is worth a Check. */
