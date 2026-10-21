@@ -283,7 +283,7 @@ module.exports = function calendarSync(ctx) {
       ["agent_bookings", "out", `pickup_date = $1 AND pickup_time = $2`], ["agent_bookings", "ret", `return_date = $1 AND return_time = $2`],
     ];
     for (const [t, leg, where] of tries) {
-      const live = t === "web_bookings" ? `status NOT IN ('declined','cancelled')` : `status <> 'cancelled'`;
+      const live = t === "web_bookings" ? `status NOT IN ('declined','cancelled')` : `status NOT IN ('cancelled','late_cancel')`;
       const byName = like ? (await pool.query(`SELECT ref FROM ${t} WHERE ${where} AND ${live} AND lower(passenger_name) LIKE $3`, [j.date, j.time, like]).catch(() => ({ rows: [] }))).rows : [];
       const byRef = t === "ops_jobs" && j.accountRef ? (await pool.query(`SELECT ref FROM ops_jobs WHERE ${where} AND ${live} AND account_ref = $3`, [j.date, j.time, j.accountRef]).catch(() => ({ rows: [] }))).rows : [];
       for (const r of byName.concat(byRef)) if (!(await taken(r.ref, leg))) return { ref: r.ref, table: t, leg };

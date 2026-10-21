@@ -254,7 +254,7 @@ module.exports = function installOps(ctx) {
       byRef ? refs : [from, to]);
     const agent = await pool.query(
       `SELECT ${AGENT_COLS} FROM agent_bookings a LEFT JOIN agents g ON g.code = a.agent_code
-        WHERE a.status <> 'cancelled' AND ` + (byRef ? `a.ref IN (${inList(refs.length)})`
+        WHERE a.status NOT IN ('cancelled', 'late_cancel') AND ` + (byRef ? `a.ref IN (${inList(refs.length)})`
           : `((a.pickup_date >= $1 AND a.pickup_date <= $2) OR (a.return_date >= $1 AND a.return_date <= $2))`),
       byRef ? refs : [from, to]);
     const jobs = await pool.query(

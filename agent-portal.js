@@ -64,6 +64,16 @@ module.exports = function installAgentPortal(ctx) {
   const CHANGE_CLOSED =
     `Changes and cancellations close ${CHANGE_CUTOFF_HOURS} hours before pick-up. ` +
     "Call +61 481 437 772 and we'll do what we can.";
+  /* The DMC rate card (rate-card.js), for agencies ticked "Rate card" in
+     admin.html: net prices, no commission, and the card's own cancellation
+     policy - changes close 12 hours out instead of 24. */
+  const card = require("./rate-card")({ OOL: (HUB_NAMES || [])[0], BNE: (HUB_NAMES || [])[1], CRUISE: (HUB_NAMES || [])[2] });
+  const onCard = (a) => !!(a && a.rate_card);
+  const cutoffFor = (a) => (onCard(a) ? card.CANCEL.freeHours : CHANGE_CUTOFF_HOURS);
+  const closedFor = (a) => (onCard(a) ? card.CLOSED_TEXT : CHANGE_CLOSED);
+  /* Inside 12 hours a card agency can still cancel online, at the card's
+     charge: 50%, or 100% inside 6 hours. null once the pick-up has passed. */
+  const lateFeePct = (h) => (h == null || h <= 0 ? null : h < card.CANCEL.halfHours ? 100 : h < card.CANCEL.freeHours ? 50 : 0);
 
   /* One idempotent migration at boot. The ALTERs are separate and guarded so
      an instance running the previous version can be rolled forward without a
@@ -147,6 +157,12 @@ module.exports = function installAgentPortal(ctx) {
       ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS pay_link_cents INTEGER;
       ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS card_paid_at   TIMESTAMPTZ;
       ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS card_pi        TEXT;
+      -- the DMC rate card (21 Oct 2026): which agencies get it, which card
+      -- price a booking was made at, and the charge on a late cancellation
+      -- (status 'late_cancel' keeps the charge on the invoice, off the board)
+      ALTER TABLE agents ADD COLUMN IF NOT EXISTS rate_card BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS rate_card      TEXT;
+      ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS cancel_fee_pct INTEGER;
       CREATE INDEX IF NOT EXISTS agent_bookings_by_agent
         ON agent_bookings (agent_code, created_at DESC);
       CREATE INDEX IF NOT EXISTS agent_bookings_by_tour ON agent_bookings (tour_ref);
@@ -332,7 +348,7 @@ module.exports = function installAgentPortal(ctx) {
     const claim = readToken(bearer(req));
     if (!claim || claim.role !== "agent") return res.status(401).json({ error: "Your session has expired — please sign in again." });
     const { rows } = await pool.query(
-      "SELECT code, name, email, commission_pct, active FROM agents WHERE code = $1", [claim.code]);
+      "SELECT code, name, email, commission_pct, active, rate_card FROM agents WHERE code = $1", [claim.code]);
     if (!rows.length || !rows[0].active) return res.status(401).json({ error: "This account is no longer active." });
     req.agent = rows[0];
     /* A staff login is re-checked on every request, so switching someone off
@@ -439,7 +455,7 @@ module.exports = function installAgentPortal(ctx) {
   /* The portal holds no rate tables of its own — it asks for the same places
      and the same fares the public site is quoting, so the two cannot drift. */
   app.get("/agent/places", requireAgent, (req, res) => {
-    res.json({ places: PLACES_FOR_AGENTS, vehicles: VEHICLES });
+    res.json({ places: PLACES_FOR_AGENTS, vehicles: VEHICLES, rateCard: onCard(req.agent) ? card.publicCard() : null });
   });
 
   /* ---- pricing: exactly what the public site charges --------------------
@@ -501,10 +517,51 @@ module.exports = function installAgentPortal(ctx) {
     return { ret };
   }
 
+  /* A service picked from the rate card fixes one end (and the hours): set
+     them before the trip is read, so the rest of the code sees an ordinary
+     booking. */
+  function applyService(b) {
+    const svc = b.service ? card.SERVICE[String(b.service)] : null;
+    if (!svc) return null;
+    b.ends = b.ends && typeof b.ends === "object" ? { ...b.ends } : {};
+    if (svc.kind === "pkg") { b.pickup = svc.from; b.ends.pickup = { suburb: svc.from }; delete b.hourly; }
+    else if (svc.kind === "park") { b.dropoff = svc.park; b.ends.dropoff = { suburb: svc.park, address: svc.park }; delete b.hourly; b.returnTrip = true; }
+    else { b.hourly = { hours: svc.hours }; b.dropoff = ""; }
+    b.stops = [];
+    return svc;
+  }
+  /* The card's answer for this trip (null: not on the card), with any stops
+     priced as the website prices them (the 21-seater as the 14-seat Sprinter). */
+  async function cardQuote(b, t) {
+    const svc = b.service ? card.SERVICE[String(b.service)] : null;
+    const isReturn = svc ? svc.kind === "park" : !t.hours && !!(b.returnTrip || b.returnDate);
+    const c = card.quote({ service: svc ? svc.id : (b.service || null), pickup: t.pickup, dropoff: t.dropoff, hours: svc ? null : t.hours, isReturn,
+      date: b.date, time: b.time, ret: { date: b.returnDate, time: b.returnTime } });
+    if (!c || c.error || !t.stops.length) return c;
+    for (const v of c.vehicles) {
+      const r = await agentFare(t, v.vehicle === card.MINIBUS ? "Mercedes Sprinter 14-Seater" : v.vehicle).catch(() => null);
+      if (!r) return { error: "We couldn't price those stops — check each stop was picked from the list, or call us." };
+      v.stopsExtra = r.stopsExtra || 0; v.stops = r.stops; v.stopsKm = r.stopsKm;
+    }
+    return c;
+  }
+
   app.post("/agent/quote", requireAgent, async (req, res) => {
     try {
-      const body = req.body || {};
+      const body = { ...(req.body || {}) };
+      if (onCard(req.agent)) applyService(body);
       const t = tripOf(body);
+      if (onCard(req.agent)) {
+        const c = await cardQuote(body, t);
+        if (c && c.error) return res.json({ quotable: false, message: c.error });
+        if (c) {
+          return res.json({ quotable: true, commissionPct: canMoney(req) ? 0 : null, net: true, kind: c.kind, hours: c.hours,
+            rateCard: { id: c.id, label: c.label, kind: c.kind }, stops: t.stops.length,
+            vehicles: c.vehicles.map((v) => ({ vehicle: v.vehicle, fare: v.fare, total: v.total + (v.stopsExtra || 0), stopsExtra: v.stopsExtra || 0,
+              surcharge: [...new Set(v.legs.flatMap((l) => l.notes))], commission: canMoney(req) ? 0 : null })) });
+        }
+        if (body.service) return res.json({ quotable: false, message: "Choose a vehicle from your rate card, or call us." });
+      }
       const pct = agentPct(req.agent);
       const isReturn = !t.hours && !!body.returnTrip;
       const fares = await Promise.all(VEHICLES.map((v) => agentFare(t, v).catch(() => null)));
@@ -531,8 +588,17 @@ module.exports = function installAgentPortal(ctx) {
   });
 
   /* Shared by book and amend: validate, price, and normalise one booking. */
-  async function priceBooking(b, pct) {
+  async function priceBooking(b, pct, agent) {
+    const svc = onCard(agent) ? applyService(b) : null;
+    if (b.service && !svc && onCard(agent)) return { error: "That rate card service isn't on the card any more - choose another, or call us." };
+    if (b.service && !onCard(agent)) return { error: "Your agency isn't on the rate card - book it as a normal trip." };
     const t = tripOf(b);
+    if (onCard(agent)) {
+      b.pickup = t.pickup; b.dropoff = t.dropoff;
+      const c = await cardQuote(b, t);
+      if (c && c.error) return { error: c.error };
+      if (c) return cardBooking(b, t, c, svc);
+    }
     b.pickup = t.pickup; b.dropoff = t.dropoff;
     for (const f of ["pickup", "dropoff", "vehicle", "date", "time", "name", "phone"]) {
       if (!b[f]) return { error: "Please fill in every required field." };
@@ -562,6 +628,49 @@ module.exports = function installAgentPortal(ctx) {
     };
   }
 
+  /* A booking priced from the rate card: the same shape priceBooking
+     returns, so book, tour and change treat it like any other. */
+  function cardBooking(b, t, c, svc) {
+    for (const f of ["pickup", "dropoff", "vehicle", "date", "time", "name", "phone"]) {
+      if (!b[f]) return { error: "Please fill in every required field." };
+    }
+    const email = String(b.email || "").trim();
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return { error: "That passenger email doesn't look right." };
+    const v = c.vehicles.find((x) => x.vehicle === b.vehicle);
+    if (!v) return { error: "That vehicle isn't on your rate card for this trip - choose another, or call us." };
+    if (leadTimeShortfall(b.date, b.time) !== null) return { error: LEAD_TIME_ERROR };
+    const r = returnTripOf(b, t.hours);
+    if (r.error) return { error: r.error };
+    if (c.legsCount === 2 && !r.ret) return { error: svc && svc.kind === "park" ? "Give the date and time to collect them from the park (the return pick-up)." : "Please give both a date and a time for the return trip." };
+    const seats = Math.min(Math.max(parseInt(b.childSeats, 10) || 0, 0), 3);
+    const trailer = b.trailer === true || b.trailer === "true";
+    const stopsObj = v.stops && v.stops.length ? { list: v.stops.map((x) => ({ address: x.address, suburb: x.suburb, lat: x.lat, lng: x.lng })), extra: v.stopsExtra, km: v.stopsKm } : null;
+    const hours = svc ? (svc.hours || null) : t.hours;
+    const sumOf = (bb) => card.summary({ ...bb, email: email || bb.agentEmail || BOOKINGS_EMAIL }, c, v, seats, trailer, r.ret, stopsObj);
+    const s = sumOf(b);
+    return {
+      fare: v.fare, priced: { stops: v.stops || [], stopsExtra: v.stopsExtra || 0, stopsKm: v.stopsKm != null ? v.stopsKm : null },
+      seats, trailer, summary: s, totalCents: Math.round(s.total * 100), ret: r.ret, hours, email: email || null,
+      stops: stopsObj ? JSON.stringify(stopsObj) : null,
+      clientRef: String(b.clientRef || "").trim().slice(0, 60) || null,
+      ends: t.hours ? JSON.stringify({ pickup: t.pu }) : JSON.stringify({ pickup: t.pu, dropoff: t.dro }),
+      commissionCents: 0, pct: 0, rateCard: c.id, cardLabel: c.label, resummarize: sumOf,
+      pax: parseInt(b.pax, 10) || 1,
+    };
+  }
+  /* the booking text again once the reference exists */
+  const resummary = (b, p) => (p.resummarize ? p.resummarize(b)
+    : bookingSummary(withStops({ ...b, email: p.email || b.agentEmail || BOOKINGS_EMAIL }, p.priced), p.fare, p.seats, p.trailer, p.ret));
+  /* commission lines for the emails: a card booking has none */
+  const officeMoney = (p, pct, totalCents, commCents, what) => (p && p.rateCard
+    ? `Invoice the agent the rate card price: ${money(totalCents)}${what || ""} (net - no commission)\n`
+    : `Invoice the agent the full fare: ${money(totalCents)}${what || ""}\n` +
+      `Agent commission: ${pct}% = ${money(commCents)}, to their wallet - paid out separately\n`);
+  const agentMoney = (p, pct, totalCents, commCents, what) => (p && p.rateCard
+    ? `This ${what || "booking"} is at your rate card price, ${money(totalCents)}, and will appear on your monthly invoice at that price.\n\n`
+    : `Your commission on this ${what || "booking"}: ${money(commCents)} (${pct}%), added to your wallet and paid out to you separately.\n` +
+      `This ${what === "tour" ? "tour's trips" : "booking"} will appear on your monthly invoice at the full fare, ${money(totalCents)}${what === "tour" ? " in all" : ""}.\n\n`);
+
   function notifyOffice(subject, body, agent) {
     if (!mailer) return;
     mailer.sendMail({
@@ -582,14 +691,14 @@ module.exports = function installAgentPortal(ctx) {
           passenger_name, passenger_phone, passenger_email, flight, address, notes,
           pax, child_seats, trailer, total_cents, commission_cents, commission_pct,
           client_ref, return_date, return_time, return_flight, hire_hours, ends, stops,
-          booked_by, booked_by_id, tour_ref, tour_name, tour_seq)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31)`,
+          booked_by, booked_by_id, tour_ref, tour_name, tour_seq, rate_card)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32)`,
       [b.ref, req.agent.code, b.pickup, b.dropoff, b.vehicle, b.date, b.time,
        b.name, b.phone, p.email, b.flight || null, b.address || null, b.notes || null,
-       p.pax, p.seats, p.trailer, p.totalCents, p.commissionCents, pct,
+       p.pax, p.seats, p.trailer, p.totalCents, p.commissionCents, p.pct != null ? p.pct : pct,
        p.clientRef, p.ret ? p.ret.date : null, p.ret ? p.ret.time : null, p.ret ? (p.ret.flight || null) : null, p.hours, p.ends, p.stops,
        bookedByOf(req), req.user && req.user.id ? req.user.id : null,
-       tour ? tour.ref : null, tour ? tour.name : null, tour ? tour.seq : null]
+       tour ? tour.ref : null, tour ? tour.name : null, tour ? tour.seq : null, p.rateCard || null]
     );
   }
 
@@ -602,7 +711,8 @@ module.exports = function installAgentPortal(ctx) {
       from: `"Sky Transfers" <${process.env.GMAIL_USER}>`, to, replyTo: BOOKINGS_EMAIL, subject,
       text: `Hi ${hi},\n\n${lead}\n\n${body}\n\n` + (withMoney ? moneyLines : "") +
         `You can download a passenger voucher, change or cancel in the portal up to ` +
-        `${CHANGE_CUTOFF_HOURS} hours before pick-up.\n\nSky Transfers`,
+        `${cutoffFor(req.agent)} hours before pick-up.` +
+        (onCard(req.agent) ? " Inside 12 hours a cancellation is charged at 50% of the fare, inside 6 hours at 100%." : "") + `\n\nSky Transfers`,
     }).catch((e) => console.error("agent copy email:", e.message));
     if (req.agent.email) send(req.agent.email, true, req.agent.name);
     const mine = req.user && req.user.id && req.user.email ? String(req.user.email).trim() : "";
@@ -613,11 +723,11 @@ module.exports = function installAgentPortal(ctx) {
     try {
       const pct = agentPct(req.agent);
       const b = { ...(req.body || {}), agentEmail: req.agent.email };
-      const p = await priceBooking(b, pct);
+      const p = await priceBooking(b, pct, req.agent);
       if (p.error) return res.status(400).json({ error: p.error });
       b.ref = makeRef(b.date);
       /* again now the reference exists, so the emails carry it */
-      p.summary = bookingSummary(withStops({ ...b, email: p.email || b.agentEmail || BOOKINGS_EMAIL }, p.priced), p.fare, p.seats, p.trailer, p.ret);
+      p.summary = resummary(b, p);
 
       await insertAgentBooking(pool, req, b, p, pct, null);
 
@@ -627,15 +737,13 @@ module.exports = function installAgentPortal(ctx) {
         (p.clientRef ? `Agent reference: ${p.clientRef}\n` : "") + `\n${p.summary.text}\n\n` +
         /* Agencies are invoiced the FULL fare; commission sits in their wallet
            and is paid out separately (Aman, 19 Oct 2026). */
-        `Invoice the agent the full fare: ${money(p.totalCents)}\n` +
-        `Agent commission: ${pct}% = ${money(p.commissionCents)}, to their wallet - paid out separately\n`,
+        officeMoney(p, pct, p.totalCents, p.commissionCents),
         req.agent
       );
       agentCopies(req, `Booking confirmed — ${b.ref} · Sky Transfers`,
         "Your booking is in and we'll confirm the chauffeur shortly.",
         (p.clientRef ? `Your reference: ${p.clientRef}\n` : "") + p.summary.text,
-        `Your commission on this booking: ${money(p.commissionCents)} (${pct}%), added to your wallet and paid out to you separately.\n` +
-        `This booking will appear on your monthly invoice at the full fare, ${money(p.totalCents)}.\n\n`);
+        agentMoney(p, pct, p.totalCents, p.commissionCents));
 
       res.json({ ok: true, ref: b.ref, total: p.summary.total, commission: canMoney(req) ? p.commissionCents / 100 : null });
     } catch (err) {
@@ -665,7 +773,7 @@ module.exports = function installAgentPortal(ctx) {
       for (let i = 0; i < legs.length; i++) {
         const b = { ...(legs[i] && typeof legs[i] === "object" ? legs[i] : {}), agentEmail: req.agent.email };
         if (!String(b.clientRef || "").trim() && body.clientRef) b.clientRef = body.clientRef;
-        const p = await priceBooking(b, pct);
+        const p = await priceBooking(b, pct, req.agent);
         if (p.error) return res.status(400).json({ error: `Trip ${i + 1} (${b.date || "no date"}, ${b.pickup || "?"} to ${b.hourly ? "as directed" : (b.dropoff || "?")}): ${p.error}`, leg: i });
         priced.push({ b, p });
       }
@@ -673,7 +781,7 @@ module.exports = function installAgentPortal(ctx) {
       for (const x of priced) {
         let ref; do { ref = makeRef(x.b.date); } while (refs.has(ref));
         refs.add(ref); x.b.ref = ref;
-        x.p.summary = bookingSummary(withStops({ ...x.b, email: x.p.email || x.b.agentEmail || BOOKINGS_EMAIL }, x.p.priced), x.p.fare, x.p.seats, x.p.trailer, x.p.ret);
+        x.p.summary = resummary(x.b, x.p);
       }
       const tour = { ref: makeRef(priced[0].b.date).replace(/^ST-/, "TR-"), name };
 
@@ -692,15 +800,16 @@ module.exports = function installAgentPortal(ctx) {
         `AGENT TOUR (${req.agent.code}): ${priced.length} trips, ${name}, from ${priced[0].b.date} [${tour.ref}]`,
         `AGENT TOUR — ${req.agent.name} (${req.agent.code})\n` + (bookedByOf(req) ? `Booked by: ${bookedByOf(req)}\n` : "") +
         `Tour: ${name}\nTour reference: ${tour.ref}\nTrips: ${priced.length} (${priced.map((x) => x.b.ref).join(", ")})\n\n${legText}\n\n` +
-        `Invoice the agent the full fare: ${money(totalCents)} for the whole tour\n` +
-        `Agent commission: ${pct}% = ${money(commCents)}, to their wallet - paid out separately\n`,
+        (priced.some((x) => x.p.rateCard) ? `Rate card trips: ${priced.filter((x) => x.p.rateCard).length} of ${priced.length} (net - no commission on those)\n` : "") +
+        `Invoice the agent${priced.some((x) => x.p.rateCard) ? "" : " the full fare"}: ${money(totalCents)} for the whole tour\n` +
+        (commCents ? `Agent commission: ${pct}% = ${money(commCents)}, to their wallet - paid out separately\n` : ""),
         req.agent
       );
       agentCopies(req, `Tour booked — ${name}, ${priced.length} trips · ${tour.ref} · Sky Transfers`,
         `Your tour "${name}" is in: ${priced.length} trips, tour reference ${tour.ref}. We'll confirm each chauffeur shortly.`,
         legText,
-        `Your commission on this tour: ${money(commCents)} (${pct}%), added to your wallet and paid out to you separately.\n` +
-        `These trips will appear on your monthly invoice at the full fare, ${money(totalCents)} in all.\n\n`);
+        (commCents ? `Your commission on this tour: ${money(commCents)} (${pct}%), added to your wallet and paid out to you separately.\n` : "") +
+        `These trips will appear on your monthly invoice${priced.some((x) => x.p.rateCard) ? " (rate card trips at your rate card price)" : " at the full fare"}, ${money(totalCents)} in all.\n\n`);
 
       res.json({ ok: true, tourRef: tour.ref, tourName: name, refs: priced.map((x) => x.b.ref),
                  total: totalCents / 100, commission: canMoney(req) ? commCents / 100 : null });
@@ -723,14 +832,43 @@ module.exports = function installAgentPortal(ctx) {
       if (bk.card_paid_at) return { error: "This booking has been paid by card, so changes and cancellations go through us - call +61 481 437 772.", code: 409 };
       const iso = bk.pickup_date instanceof Date ? bk.pickup_date.toISOString().slice(0, 10) : String(bk.pickup_date);
       const h = hoursUntil(iso, bk.pickup_time);
-      if (h == null || h < CHANGE_CUTOFF_HOURS) return { error: CHANGE_CLOSED, code: 400 };
+      if (h == null || h < cutoffFor(req.agent)) return { error: closedFor(req.agent), code: 400 };
     }
     return { booking: bk };
   }
 
   app.post("/agent/booking/cancel", requireAgent, async (req, res) => {
     try {
-      const found = await loadOwnBooking(req, String(req.body?.ref || ""), { forChange: true });
+      const ref = String(req.body?.ref || "");
+      if (onCard(req.agent)) {
+        const any = await loadOwnBooking(req, ref, { forChange: false });
+        if (any.error) return res.status(any.code).json({ error: any.error });
+        const bk0 = any.booking;
+        const h0 = hoursUntil(isoOf(bk0.pickup_date), bk0.pickup_time);
+        const fee = lateFeePct(h0);
+        if (bk0.status === "confirmed" && !bk0.card_paid_at && fee) {
+          const feeCents = Math.round(bk0.total_cents * fee / 100);
+          if (!req.body || req.body.acceptCharge !== true) {
+            return res.status(409).json({ error: `This is inside ${fee === 100 ? 6 : 12} hours of pick-up, so cancelling is charged at ${fee}% of the fare: ${money(feeCents)}.`,
+              charge: { pct: fee, amount: feeCents / 100 } });
+          }
+          await pool.query(
+            `UPDATE agent_bookings SET status = 'late_cancel', cancelled_at = now(), changed_by = $2, cancel_fee_pct = $3,
+               total_cents = $4, commission_cents = 0 WHERE ref = $1 AND status = 'confirmed'`, [bk0.ref, bookedByOf(req), fee, feeCents]);
+          await dropAgentPayLink(bk0, "This booking has been cancelled. Call +61 481 437 772 with any questions.");
+          notifyOffice(
+            `AGENT LATE CANCELLATION (${req.agent.code}, ${fee}% charged): ${bk0.pickup} -> ${bk0.dropoff} [${bk0.ref}]`,
+            `LATE CANCELLATION by ${whoDid(req)} - ${Math.round(h0 * 10) / 10} hours before pick-up\n\n` +
+            `Reference: ${bk0.ref}\nRoute: ${bk0.pickup} -> ${bk0.dropoff}\nWas: ${isoOf(bk0.pickup_date)} ${bk0.pickup_time}\n` +
+            `Passenger: ${bk0.passenger_name}\nVehicle: ${bk0.vehicle}\n\n` +
+            `Rate card policy: ${fee}% of ${money(bk0.total_cents)} = ${money(feeCents)}, stays on their next invoice.\n` +
+            `It is off the dispatch board - take it off the driver if one was sent.\n`,
+            req.agent
+          );
+          return res.json({ ok: true, charged: feeCents / 100, pct: fee });
+        }
+      }
+      const found = await loadOwnBooking(req, ref, { forChange: true });
       if (found.error) return res.status(found.code).json({ error: found.error });
       const bk = found.booking;
       await pool.query(
@@ -916,7 +1054,9 @@ module.exports = function installAgentPortal(ctx) {
       const pct = agentPct(req.agent);
       const b = { ...(req.body || {}), agentEmail: req.agent.email };
       b.ref = old.ref;
-      const p = await priceBooking(b, pct);
+      /* a rate card package stays that package unless the page says otherwise */
+      if (old.rate_card && card.SERVICE[old.rate_card] && b.service == null) b.service = old.rate_card;
+      const p = await priceBooking(b, pct, req.agent);
       if (p.error) return res.status(400).json({ error: p.error });
 
       await pool.query(
@@ -925,12 +1065,14 @@ module.exports = function installAgentPortal(ctx) {
            passenger_name=$7, passenger_phone=$8, passenger_email=$9, flight=$10,
            address=$11, notes=$12, pax=$13, child_seats=$14, trailer=$15,
            total_cents=$16, commission_cents=$17, commission_pct=$18, updated_at=now(),
-           client_ref=$19, return_date=$20, return_time=$21, return_flight=$22, hire_hours=$23, ends=$24, stops=$25, changed_by=$26
+           client_ref=$19, return_date=$20, return_time=$21, return_flight=$22, hire_hours=$23, ends=$24, stops=$25, changed_by=$26,
+           rate_card=$27
          WHERE ref = $1`,
         [old.ref, b.pickup, b.dropoff, b.vehicle, b.date, b.time,
          b.name, b.phone, p.email, b.flight || null, b.address || null, b.notes || null,
-         p.pax, p.seats, p.trailer, p.totalCents, p.commissionCents, pct,
-         p.clientRef, p.ret ? p.ret.date : null, p.ret ? p.ret.time : null, p.ret ? (p.ret.flight || null) : null, p.hours, p.ends, p.stops, bookedByOf(req)]
+         p.pax, p.seats, p.trailer, p.totalCents, p.commissionCents, p.pct != null ? p.pct : pct,
+         p.clientRef, p.ret ? p.ret.date : null, p.ret ? p.ret.time : null, p.ret ? (p.ret.flight || null) : null, p.hours, p.ends, p.stops, bookedByOf(req),
+         p.rateCard || null]
       );
 
       /* a payment link made for the old price is now wrong */
@@ -944,8 +1086,9 @@ module.exports = function installAgentPortal(ctx) {
         `WAS: ${old.pickup} -> ${old.dropoff}, ${old.vehicle}, ${wasDate} ${old.pickup_time}, ` +
         `${old.passenger_name}, total ${money(old.total_cents)}\n\n` +
         `NOW:\n${p.summary.text}\n\n` +
-        `Invoice the agent the full fare: ${money(p.totalCents)} (was ${money(old.total_cents)})\n` +
-        `Commission now: ${pct}% = ${money(p.commissionCents)} (was ${money(old.commission_cents)}), to their wallet - paid out separately\n`,
+        (p.rateCard ? `Invoice the agent the rate card price: ${money(p.totalCents)} (was ${money(old.total_cents)}) - net, no commission\n`
+          : `Invoice the agent the full fare: ${money(p.totalCents)} (was ${money(old.total_cents)})\n` +
+            `Commission now: ${pct}% = ${money(p.commissionCents)} (was ${money(old.commission_cents)}), to their wallet - paid out separately\n`),
         req.agent
       );
       res.json({ ok: true, ref: old.ref, total: p.summary.total, commission: canMoney(req) ? p.commissionCents / 100 : null });
@@ -1390,6 +1533,9 @@ module.exports = function installAgentPortal(ctx) {
     returnTime: r.return_time || null,
     returnFlight: r.return_flight || "",
     hours: r.hire_hours || null,
+    rateCard: r.rate_card || null,
+    rateCardKind: r.rate_card && card.SERVICE[r.rate_card] ? card.SERVICE[r.rate_card].kind : null,
+    cancelFeePct: r.cancel_fee_pct || null,
     bookedBy: r.booked_by || "",
     changedBy: r.changed_by || "",
     tourRef: r.tour_ref || null,
@@ -1432,12 +1578,16 @@ module.exports = function installAgentPortal(ctx) {
         agent: { code: req.agent.code, name: req.agent.name, commissionPct: money_ ? agentPct(req.agent) : null },
         user: { name: req.user.name, role: req.user.role, canMoney: money_, canManage: canManage(req) },
         wallet: money_ ? { earned: earned / 100, paid: paid / 100, balance: (earned - paid) / 100 } : null,
-        changeCutoffHours: CHANGE_CUTOFF_HOURS,
+        changeCutoffHours: cutoffFor(req.agent),
+        rateCard: onCard(req.agent),
         tourMax: TOUR_MAX,
         bookings: rows.map((r) => {
           const b = bookingRow(r);
           const h = hoursUntil(b.date, b.time);
-          b.changeable = r.status === "confirmed" && !r.card_paid_at && h != null && h >= CHANGE_CUTOFF_HOURS;
+          b.changeable = r.status === "confirmed" && !r.card_paid_at && h != null && h >= cutoffFor(req.agent);
+          /* a card agency can still cancel inside 12 hours, at the card's charge */
+          const fee = onCard(req.agent) && r.status === "confirmed" && !r.card_paid_at ? lateFeePct(h) : null;
+          if (fee) b.lateCancel = { pct: fee, amount: Math.round(r.total_cents * fee / 100) / 100 };
           b.trip = trips[b.ref] || null;
           if (b.tourRef) b.tourCount = tourCount[b.tourRef];
           if (!money_) { b.commission = null; b.settled = null; }
@@ -1454,14 +1604,14 @@ module.exports = function installAgentPortal(ctx) {
   app.get("/admin/agents", requireAdmin, async (req, res) => {
     try {
       const { rows } = await pool.query(`
-        SELECT a.code, a.name, a.email, a.commission_pct, a.active, a.created_at,
+        SELECT a.code, a.name, a.email, a.commission_pct, a.active, a.created_at, a.rate_card,
                COALESCE(SUM(CASE WHEN b.status='confirmed' THEN b.commission_cents END), 0)                        AS earned_cents,
                COALESCE(SUM(CASE WHEN b.status='confirmed' AND b.settled THEN b.commission_cents END), 0)          AS paid_cents,
                COUNT(b.ref) FILTER (WHERE b.status='confirmed')                                                    AS trips,
                COALESCE(SUM(CASE WHEN b.status='confirmed' THEN b.total_cents END), 0)                             AS gross_cents
           FROM agents a
           LEFT JOIN agent_bookings b ON b.agent_code = a.code
-         GROUP BY a.code
+         GROUP BY a.code, a.rate_card
          ORDER BY a.name`);
       /* staff logins per agency, counted apart so the bookings join above
          isn't multiplied by them */
@@ -1471,7 +1621,7 @@ module.exports = function installAgentPortal(ctx) {
       res.json({
         agents: rows.map((r) => ({
           code: r.code, name: r.name, email: r.email,
-          commissionPct: Number(r.commission_pct), active: r.active,
+          commissionPct: Number(r.commission_pct), active: r.active, rateCard: !!r.rate_card,
           staff: staff[r.code] || 0,
           trips: Number(r.trips),
           gross: Number(r.gross_cents) / 100,
@@ -2724,6 +2874,8 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
           [code, b.name, b.email || null, makePinHash(pin), pct, b.active !== false]
         );
       }
+      /* only when the page sends it, so an older admin page can't clear it */
+      if (typeof b.rateCard === "boolean") await pool.query("UPDATE agents SET rate_card = $2 WHERE code = $1", [code, b.rateCard]);
       LOGIN_FAILS.delete(code);
       res.json({ ok: true, code, pin, created: !existing.length });
     } catch (err) {
