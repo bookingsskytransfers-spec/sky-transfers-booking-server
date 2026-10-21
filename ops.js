@@ -685,7 +685,8 @@ module.exports = function installOps(ctx) {
       attachDispatch(legs, disp, [{ id: d.id, name: d.name }], vehicles);
       const mine = legs.filter((l) => l.driverId === d.id)
         .sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time));
-      /* What a driver needs, and nothing about what the guest paid. */
+      /* What a driver needs, and nothing about what the guest paid or
+         which company booked it (no account - Aman, 21 Oct 2026). */
       res.json({
         driver: { name: d.name }, today: bneToday(0),
         jobs: mine.map((l) => ({
@@ -693,7 +694,7 @@ module.exports = function installOps(ctx) {
           flight: l.flight, hours: l.hours, guest: l.guest, phone: l.phone, pax: l.pax,
           childSeats: l.childSeats, trailer: l.trailer, address: l.address, notes: l.notes,
           vehicleClass: l.vehicleClass, vehicleLabel: l.vehicleLabel, officeNote: l.officeNote, stops: l.stops || [],
-          account: l.source === "web" ? null : l.account, pay: l.driverPay, status: l.status,
+          pay: l.driverPay, status: l.status,
         })),
       });
     } catch (err) {
