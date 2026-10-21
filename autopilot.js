@@ -569,7 +569,8 @@ module.exports = function installAutopilot(ctx) {
   }
   async function intakePass(s, opts) {
     const force = !!(opts && opts.force);
-    if (!force && nowMs() - lastIntake < 10 * 60e3) return { skipped: "too soon" };
+    /* once an hour (Aman, 21 Oct 2026); "Check the inbox now" reads at once */
+    if (!force && nowMs() - lastIntake < 60 * 60e3) return { skipped: "too soon" };
     lastIntake = nowMs();
     const ready = intakeReady();
     if (!ready.ok) { if (await claim("intake-off:" + bne().date)) await logEvent("intake", `Can't read the inbox: ${ready.why}.`); return { skipped: ready.why }; }
