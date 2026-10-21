@@ -136,6 +136,9 @@ module.exports = function installBilling(ctx) {
       ALTER TABLE ops_invoices ADD COLUMN IF NOT EXISTS bill_phone TEXT;
       ALTER TABLE ops_invoice_lines ADD COLUMN IF NOT EXISTS detail TEXT;
     `);
+    /* agent-portal.js owns agent_bookings and adds this too; added here as
+       well so the invoice query never depends on which module set up first */
+    await pool.query(`ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS cancel_fee_pct INTEGER`).catch(() => {});
   }
 
   /* ---- what can be billed ---------------------------------------------- */
@@ -165,6 +168,9 @@ module.exports = function installBilling(ctx) {
     if (r.pax) parts.push(r.pax + " pax");
     if (r.passenger_name) parts.push(r.passenger_name);
     if (r.account_ref) parts.push("their ref " + r.account_ref);
+    /* an agency on the rate card that cancelled inside 12 hours: the
+       charge, not the trip */
+    if (r.status === "late_cancel") return `LATE CANCELLATION - ${r.cancel_fee_pct || ""}% charge: ` + parts.join("; ");
     return parts.join("; ");
   }
 
@@ -229,7 +235,7 @@ module.exports = function installBilling(ctx) {
       rows = (await pool.query(
         `SELECT ref, client_ref AS account_ref, pickup, dropoff, vehicle, to_char(pickup_date, 'YYYY-MM-DD') AS d, pickup_time AS t,
                 to_char(return_date, 'YYYY-MM-DD') AS rd, return_time AS rt, return_flight AS rflight, hire_hours,
-                passenger_name, pax, flight, address, stops, child_seats, trailer, total_cents AS cents
+                passenger_name, pax, flight, address, stops, child_seats, trailer, total_cents AS cents, status, cancel_fee_pct
            FROM agent_bookings WHERE status <> 'cancelled' AND agent_code = $1 AND pickup_date >= $2 AND pickup_date <= $3`,
         [ag.code, from, to])).rows;
       party = { type: "agent", key: ag.code, name: ag.name, email: ag.email, contact: null, abn: null, address: null, phone: null, terms: 14 };
@@ -712,7 +718,7 @@ module.exports = function installBilling(ctx) {
         const late = open.filter((i) => i.overdue);
         const billed = await billedRefs();
         const unbilled = (await pool.query(
-          `SELECT ref, total_cents FROM agent_bookings WHERE agent_code = $1 AND status = 'confirmed' AND pickup_date <= $2`, [code, t]))
+          `SELECT ref, total_cents FROM agent_bookings WHERE agent_code = $1 AND status IN ('confirmed', 'late_cancel') AND pickup_date <= $2`, [code, t]))
           .rows.filter((r) => !billed.has(r.ref));
         const sum = (list, f) => Math.round(list.reduce((a, x) => a + f(x), 0) * 100) / 100;
         res.json({
