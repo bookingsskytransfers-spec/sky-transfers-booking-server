@@ -301,13 +301,19 @@ module.exports = function calendarSync(ctx) {
     return r && (r.sent_at || ["accepted", "on_way", "on_location", "pob"].indexOf(r.status) !== -1) ? (r.name || "the driver") : null;
   }
 
+  /* Read once an hour, though Autopilot ticks every 5 minutes (Aman,
+     21 Oct 2026). "Read the calendar now" reads at once. */
+  let lastPass = 0;
   async function pass(s, opts) {
+    const force = !!(opts && opts.force);
+    if (!force && nowMs() - lastPass < 60 * 60e3) return { skipped: "too soon", created: [], linked: 0, changed: [], removed: [], applied: [] };
+    lastPass = nowMs();
     const r0 = ready();
     if (!r0.ok) return { skipped: r0.why };
     const today = bneToday(), until = plusDays(today, 180);
     const all = parseIcs(await fetchIcs());
     const known = await knownAccounts();
-    const out = { created: [], linked: [], changed: [], removed: [], skipped: [] };
+    const out = { created: [], linked: [], changed: [], removed: [], skipped: [], applied: [] };
     const seen = new Set();
     for (const ev of all) {
       seen.add(ev.uid);
@@ -383,8 +389,25 @@ module.exports = function calendarSync(ctx) {
       const fp = sha(JSON.stringify(now));
       const changes = diff(was, now);
       if (!changes.length || fp === row.pending_fp) { await pool.query(`UPDATE ops_cal SET raw_fp = $2 WHERE uid = $1`, [ev.uid, rawFp]); continue; }
-      const isJob = (await pool.query(`SELECT 1 FROM ops_jobs WHERE ref = $1`, [row.ref])).rows.length > 0;
+      const jobRow = (await pool.query(`SELECT flight, return_flight, to_char(pickup_date, 'YYYY-MM-DD') AS d, pickup_time AS t,
+          to_char(return_date, 'YYYY-MM-DD') AS rd, return_time AS rt FROM ops_jobs WHERE ref = $1`, [row.ref])).rows[0] || null;
+      const isJob = !!jobRow;
       const sent = await wasSent(row.ref, row.leg);
+      /* A flight job whose only change is its time: Gemini moving it for an
+         early or late flight. Taken straight onto the job (Aman, 21 Oct 2026);
+         anything else still waits for the office. */
+      const moved = FIELDS.filter(([k]) => String(was[k] == null ? "" : was[k]) !== String(now[k] == null ? "" : now[k])).map(([k]) => k);
+      const flightJob = isJob && !!(now.flight || (row.leg === "ret" ? jobRow.return_flight : jobRow.flight));
+      if (flightJob && moved.length && moved.every((k) => k === "time" || k === "date") && now.date && now.time) {
+        const before = row.leg === "ret" ? `${jobRow.rd} ${jobRow.rt}` : `${jobRow.d} ${jobRow.t}`;
+        if (row.leg === "ret") await pool.query(`UPDATE ops_jobs SET return_date = $2, return_time = $3 WHERE ref = $1`, [row.ref, now.date, now.time]);
+        else await pool.query(`UPDATE ops_jobs SET pickup_date = $2, pickup_time = $3 WHERE ref = $1`, [row.ref, now.date, now.time]);
+        await pool.query(`UPDATE ops_cal SET raw_fp = $2, fields = $3, pending = NULL, pending_fp = NULL WHERE uid = $1`, [ev.uid, rawFp, JSON.stringify(now)]);
+        out.applied.push({ ref: row.ref, leg: row.leg, title, before, after: `${now.date} ${now.time}`, sent });
+        await logEvent("calendar", `Flight time updated from the calendar on ${row.ref}${row.leg === "ret" ? " (return)" : ""}: ${before} -> ${now.date} ${now.time}` +
+          (sent ? ` - it had been sent to ${sent}, who needs telling.` : "."), row.ref, row.leg);
+        continue;
+      }
       const note = `Calendar changed: ${changes.join("; ")}.` + (sent ? ` It had already been sent to ${sent} - tell them if you apply it.` : "") +
         (isJob ? " Apply the change, or keep the job as it is." : " This booking was made on the website or the agent portal - change it there if it's right.");
       await pool.query(`UPDATE ops_cal SET raw_fp = $2, pending = $3, pending_fp = $4 WHERE uid = $1`, [ev.uid, rawFp, JSON.stringify(now), fp]);
@@ -410,8 +433,16 @@ module.exports = function calendarSync(ctx) {
       await logEvent("error", `The calendar read is missing ${gone.length} upcoming jobs at once - nothing was flagged. If they really were deleted, look at them on the board.`);
     }
 
-    if (mailer() && (out.created.length || out.changed.length || out.removed.length || out.skipped.length)) {
+    if (mailer() && (out.created.length || out.changed.length || out.removed.length || out.skipped.length || out.applied.length)) {
       const L = [];
+      const tell = out.applied.filter((x) => x.sent);
+      if (tell.length) {
+        L.push(`FLIGHT TIME CHANGED - TELL THE DRIVER (${tell.length}):`);
+        tell.forEach((x) => L.push(`  ${x.ref}${x.leg === "ret" ? " (return)" : ""}  ${x.title}`, `      was ${x.before}, now ${x.after} - already sent to ${x.sent}; their job page shows the new time.`));
+        L.push("");
+      }
+      const quiet = out.applied.filter((x) => !x.sent);
+      if (quiet.length) { L.push(`FLIGHT TIME UPDATED ON THE BOARD (${quiet.length}):`); quiet.forEach((x) => L.push(`  ${x.ref}${x.leg === "ret" ? " (return)" : ""}  was ${x.before}, now ${x.after}  ${x.title}`)); L.push(""); }
       const flagged = out.created.filter((x) => x.checks.length), clean = out.created.filter((x) => !x.checks.length);
       if (clean.length) { L.push(`ON THE BOARD (${clean.length}):`); clean.forEach((x) => L.push(`  ${x.ref}  ${x.date} ${x.time}  ${x.title}`)); L.push(""); }
       if (flagged.length) { L.push(`ON THE BOARD, PLEASE CHECK (${flagged.length}):`); flagged.forEach((x) => L.push(`  ${x.ref}  ${x.date} ${x.time}  ${x.title}`, `      CHECK: ${x.checks.join("; ")}`)); L.push(""); }
@@ -424,11 +455,13 @@ module.exports = function calendarSync(ctx) {
       if (out.removed.length) { L.push(`REMOVED FROM THE CALENDAR (${out.removed.length}) - still on the board:`); out.removed.forEach((x) => L.push(`  ${x.ref}  ${x.why}` + (x.sent ? `  - ALREADY SENT TO ${String(x.sent).toUpperCase()}` : ""))); L.push("  If the trip is off, cancel it on the board.", ""); }
       if (out.skipped.length) { L.push(`NOT PUT ON THE BOARD (${out.skipped.length}):`); out.skipped.forEach((x) => L.push(`  ${x.date}  ${x.title}  - ${x.why}`)); L.push(""); }
       L.push(`Board: ${BOARD}`);
-      const n = out.changed.length + out.removed.length;
-      await alert(s, (n ? `Calendar: ${n} change${n === 1 ? "" : "s"} need you` : `Calendar: ${out.created.length} new job${out.created.length === 1 ? "" : "s"} on the board`) +
+      const n = out.changed.length + out.removed.length + tell.length;
+      await alert(s, (n ? `Calendar: ${n} change${n === 1 ? "" : "s"} need you` : out.created.length ? `Calendar: ${out.created.length} new job${out.created.length === 1 ? "" : "s"} on the board`
+          : `Calendar: ${out.applied.length} flight time${out.applied.length === 1 ? "" : "s"} updated`) +
         (n && out.created.length ? ` (+${out.created.length} new)` : ""), L.join("\n")).catch((e) => console.error("calendar alert:", e.message));
     }
-    return { created: out.created.map((x) => x.ref), linked: out.linked.length, changed: out.changed.map((x) => x.ref), removed: out.removed.map((x) => x.ref), skipped: out.skipped.length, events: all.length };
+    return { created: out.created.map((x) => x.ref), linked: out.linked.length, changed: out.changed.map((x) => x.ref), removed: out.removed.map((x) => x.ref),
+             applied: out.applied.map((x) => x.ref), skipped: out.skipped.length, events: all.length };
   }
   const mailer = () => typeof alert === "function";
 
