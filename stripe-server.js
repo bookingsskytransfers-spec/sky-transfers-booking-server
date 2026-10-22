@@ -1474,6 +1474,14 @@ try {
   console.error("Billing not mounted (bookings unaffected):", err.message);
 }
 
+/* The office dashboard in admin.html - revenue, own fleet against
+   subcontractors, driver pay. Read only, and wrapped like the rest. */
+try {
+  require("./dashboard")({ app, pool: portal && portal.pool, requireAdmin: portal && portal.requireAdmin, ops });
+} catch (err) {
+  console.error("Dashboard not mounted (bookings unaffected):", err.message);
+}
+
 /* Autopilot - picks drivers the evening before, chases unclosed jobs,
    prepares scheduled invoices for one-click approval, sends the morning
    digest and reads account booking emails. Every part is off until switched
