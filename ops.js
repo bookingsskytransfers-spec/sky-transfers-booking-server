@@ -398,11 +398,14 @@ module.exports = function installOps(ctx) {
   async function assignLeg({ ref, leg, driverId, vehicleId, payCents, note, auto }) {
     const job = ref ? await legExists(ref, leg) : null;
     if (!job) throw { code: 404, message: "No such job." };
-    if (driverId) {
+    /* Only a NEW driver or car has to be active: correcting the pay on an
+       old job of someone who has since left must still save (Aman, 22 Oct 2026). */
+    const was = (await pool.query(`SELECT driver_id, vehicle_id FROM ops_dispatch WHERE ref = $1 AND leg = $2`, [ref, leg])).rows[0] || {};
+    if (driverId && driverId !== was.driver_id) {
       const { rows } = await pool.query(`SELECT id FROM ops_drivers WHERE id = $1 AND active`, [driverId]);
       if (!rows.length) throw { code: 400, message: "That driver is not active." };
     }
-    if (vehicleId) {
+    if (vehicleId && vehicleId !== was.vehicle_id) {
       const { rows } = await pool.query(`SELECT id FROM ops_vehicles WHERE id = $1 AND active`, [vehicleId]);
       if (!rows.length) throw { code: 400, message: "That vehicle is not active." };
     }
@@ -451,6 +454,26 @@ module.exports = function installOps(ctx) {
       if (err && err.code) return res.status(err.code).json({ error: err.message });
       console.error("ops assign:", err);
       res.status(500).json({ error: "Could not save that assignment." });
+    }
+  });
+
+  /* Just the driver pay on one leg, at any time - before or after the job,
+     paid or not (the pay sheet's "Edit pay"). Nothing else on the leg moves. */
+  app.post("/ops/leg-pay", requireAdmin, async (req, res) => {
+    try {
+      const b = req.body || {};
+      const ref = txt(b.ref, 40), leg = b.leg === "ret" ? "ret" : "out";
+      const pay = b.driverPay === "" || b.driverPay == null ? null : cents(b.driverPay);
+      if (b.driverPay !== "" && b.driverPay != null && pay == null) return res.status(400).json({ error: "Driver pay has to be a number, like 65 or 65.50." });
+      if (pay != null && pay > 1000000) return res.status(400).json({ error: "That pay looks too high - check the amount." });
+      const r = await pool.query(`UPDATE ops_dispatch SET driver_pay_cents = $3, updated_at = now() WHERE ref = $1 AND leg = $2 AND driver_id IS NOT NULL
+        RETURNING driver_paid_at`, [ref, leg, pay]);
+      if (!r.rowCount) return res.status(404).json({ error: "That job has no driver yet - choose one on the Jobs tab first." });
+      console.log("ops leg pay:", ref, leg, pay);
+      res.json({ ok: true, paidAlready: !!r.rows[0].driver_paid_at });
+    } catch (err) {
+      console.error("ops leg pay:", err);
+      res.status(500).json({ error: "Could not save that pay." });
     }
   });
 

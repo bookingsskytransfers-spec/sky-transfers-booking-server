@@ -897,6 +897,52 @@ module.exports = function installBilling(ctx) {
     return { from: start, to: end, drivers: out };
   }
 
+  /* ---- change what a job is billed at, any time before it is invoiced ----
+     Account jobs and agent bookings (Aman, 22 Oct 2026). Once a job is on a
+     live invoice the invoice holds its own copy of the amount: void that
+     invoice, change the job, and invoice it again. Website bookings are paid
+     by card, so they change through Amend in admin.html, which charges or
+     refunds the guest; this never touches money already taken. */
+  app.post("/ops/job-amount", requireAdmin, async (req, res) => {
+    try {
+      const b = req.body || {};
+      const ref = txt(b.ref, 40);
+      const n = Number(b.amount);
+      if (!(Number.isFinite(n) && n >= 0 && n <= 100000)) return res.status(400).json({ error: "The amount has to be a number from 0 to 100,000, like 145 or 145.50." });
+      const amt = Math.round(n * 100);
+      const inv = (await pool.query(
+        `SELECT i.number FROM ops_invoice_lines l JOIN ops_invoices i ON i.id = l.invoice_id WHERE l.ref = $1 AND i.status <> 'void'`, [ref])).rows[0];
+      if (inv) return res.status(409).json({ error: `${ref} is on invoice ${inv.number}. Void that invoice first (Invoices tab), then change the amount and invoice it again.` });
+      const job = (await pool.query(`SELECT price_cents FROM ops_jobs WHERE ref = $1 AND status <> 'cancelled'`, [ref])).rows[0];
+      if (job) {
+        await pool.query(`UPDATE ops_jobs SET price_cents = $2, updated_at = now() WHERE ref = $1`, [ref, amt]);
+        console.log("job amount:", ref, job.price_cents, "->", amt);
+        return res.json({ ok: true, ref, was: job.price_cents / 100, now: amt / 100 });
+      }
+      const ag = (await pool.query(`SELECT * FROM agent_bookings WHERE ref = $1 AND status IN ('confirmed', 'late_cancel')`, [ref]).catch(() => ({ rows: [] }))).rows[0];
+      if (ag) {
+        if (ag.card_paid_at) return res.status(409).json({ error: `${ref} has been paid by card, so its amount can't change here.` });
+        /* commission follows the amount at the booking's own rate (0 on the rate card) */
+        const comm = ag.status === "late_cancel" ? 0 : Math.round(amt * Number(ag.commission_pct || 0) / 100);
+        await pool.query(`UPDATE agent_bookings SET total_cents = $2, commission_cents = $3, updated_at = now() WHERE ref = $1`, [ref, amt, comm]);
+        /* a card payment link made for the old amount must not stay payable */
+        if (ag.pay_link_id && Number(ag.pay_link_cents) !== amt) {
+          if (stripe) await stripe.paymentLinks.update(ag.pay_link_id, { active: false, inactive_message: "This booking's price has changed - ask your travel agent for the new link." })
+            .catch((e) => console.error("agent pay link off:", e.message));
+          await pool.query(`UPDATE agent_bookings SET pay_link_id = NULL, pay_link_url = NULL, pay_link_cents = NULL WHERE ref = $1`, [ref]);
+        }
+        console.log("agent booking amount:", ref, ag.total_cents, "->", amt);
+        return res.json({ ok: true, ref, was: ag.total_cents / 100, now: amt / 100, commission: comm / 100 });
+      }
+      const web = (await pool.query(`SELECT 1 FROM web_bookings WHERE ref = $1`, [ref]).catch(() => ({ rows: [] }))).rows[0];
+      if (web) return res.status(400).json({ error: "That's a website booking, paid by card - change it with Amend in admin.html, so the guest is charged or refunded correctly." });
+      res.status(404).json({ error: "No such job (or it's cancelled)." });
+    } catch (err) {
+      console.error("job amount:", err);
+      res.status(500).json({ error: "Could not change that amount." });
+    }
+  });
+
   app.get("/ops/pay", requireAdmin, async (req, res) => {
     try { res.json(await payWeek(isoDate(req.query.from) || today())); }
     catch (err) { console.error("pay sheet:", err); res.status(500).json({ error: "Could not build the pay sheet." }); }
