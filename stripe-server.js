@@ -423,7 +423,8 @@ function confirmationContent(b, s) {
   const known = (s.transfer || 0) > 0;
   if (known) {
     if (hrs) pay.push([charter ? `Charter, ${hrs} hours` : `Hourly hire, ${hrs} hours`, `$${s.transfer}`]);
-    else if (ret) pay.push(["Return transfer", `$${s.transfer}  (2 x $${Math.round((s.transfer + (s.saved || 0)) / 2)}, less ${Math.round(RETURN_DISCOUNT * 100)}% for the return)`]);
+    else if (ret) pay.push(["Return transfer", `$${s.transfer}  (2 x $${Math.round((s.transfer + (s.saved || 0)) / 2)}` +
+      (s.saved ? `, less ${Math.round(RETURN_DISCOUNT * 100)}% for the return)` : ")")]);
     else pay.push(["Transfer", `$${s.transfer}`]);
     if (s.stopsExtra > 0) pay.push(["Stops on the way", `$${s.stopsExtra}`]);
     if (seats) pay.push([`Child seat${seats > 1 ? "s" : ""} x ${seats}`, `$${seats * CHILD_SEAT_PRICE * legs}` +
@@ -772,9 +773,12 @@ function stopsText(b, sep) {
     (b.stopsExtra > 0 ? `${sep}(+$${Math.round(b.stopsExtra)} for the extra distance)` : "");
 }
 
+/* ret.noDiscount: both legs at the full fare - commission agencies (Aman,
+   23 Oct 2026: "we are already giving them percentage commission"). */
 function bookingSummary(b, fare, seats, trailer, ret) {
   const legs = ret ? 2 : 1;
-  const transfer = ret ? returnTransfer(fare) : fare;
+  const fullReturn = !!(ret && ret.noDiscount);
+  const transfer = ret ? (fullReturn ? fare * 2 : returnTransfer(fare)) : fare;
   const extras = (seats * CHILD_SEAT_PRICE + (trailer ? TRAILER_PRICE : 0)) * legs;
   /* Stops on the way: outbound only, added once, never discounted. */
   const stops = Array.isArray(b.stops) ? b.stops.filter((s) => s && (s.address || s.suburb)) : [];
@@ -799,7 +803,8 @@ function bookingSummary(b, fare, seats, trailer, ret) {
     `Return date: ${ret.date}`,
     `Return pick-up time: ${ret.time}`,
     `Return flight: ${ret.flight || "-"}`,
-    `Return fare: $${transfer} for both legs (saved $${saved}, ${Math.round(RETURN_DISCOUNT * 100)}% off)`,
+    fullReturn ? `Return fare: $${transfer} for both legs (2 x $${fare}, agency rate - no return discount)`
+      : `Return fare: $${transfer} for both legs (saved $${saved}, ${Math.round(RETURN_DISCOUNT * 100)}% off)`,
   ] : [];
   return {
     total,

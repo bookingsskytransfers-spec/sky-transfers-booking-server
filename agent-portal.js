@@ -571,11 +571,12 @@ module.exports = function installAgentPortal(ctx) {
       const out = VEHICLES.map((v, i) => {
         const r = fares[i];
         if (r == null) return null;
-        /* the transfer price for what was asked: one way, both legs (10% off,
-           the site's own formula), or the hours - plus any stops, added once
-           after the discount - before seats and trailer */
+        /* the transfer price for what was asked: one way, both legs (at the
+           full fare - agencies earn commission instead of the website's 10%
+           return discount, Aman 23 Oct 2026), or the hours - plus any stops -
+           before seats and trailer */
         const total = bookingSummary(withStops({ pickup: t.pickup, dropoff: t.dropoff, vehicle: v, hourly: t.hours ? { hours: t.hours } : undefined }, r),
-          r.fare, 0, false, isReturn ? { date: "", time: "", flight: "" } : null).total;
+          r.fare, 0, false, isReturn ? { date: "", time: "", flight: "", noDiscount: true } : null).total;
         return { vehicle: v, fare: r.fare, total, stopsExtra: r.stopsExtra, commission: canMoney(req) ? commissionOf(total * 100, pct) / 100 : null };
       }).filter(Boolean);
       const stopsKm = (fares.find((r) => r && r.stopsKm != null) || {}).stopsKm;
@@ -591,7 +592,11 @@ module.exports = function installAgentPortal(ctx) {
   });
 
   /* Shared by book and amend: validate, price, and normalise one booking. */
-  async function priceBooking(b, pct, agent) {
+  /* Agency returns are both legs at the full fare (Aman, 23 Oct 2026); a
+     booking made before that keeps its 10% when it is changed later. */
+  const AGENT_FULL_RETURN_FROM = Date.parse("2026-10-23T06:00:00Z");
+  async function priceBooking(b, pct, agent, opts) {
+    const returnDiscount = !!(opts && opts.returnDiscount);
     const svc = onCard(agent) ? applyService(b) : null;
     if (b.service && !svc && onCard(agent)) return { error: "That rate card service isn't on the card any more - choose another, or call us." };
     if (b.service && !onCard(agent)) return { error: "Your agency isn't on the rate card - book it as a normal trip." };
@@ -614,6 +619,7 @@ module.exports = function installAgentPortal(ctx) {
     if (leadTimeShortfall(b.date, b.time) !== null) return { error: LEAD_TIME_ERROR };
     const r = returnTripOf(b, t.hours);
     if (r.error) return { error: r.error };
+    if (r.ret && !returnDiscount) r.ret = { ...r.ret, noDiscount: true };
     const seats = Math.min(Math.max(parseInt(b.childSeats, 10) || 0, 0), 3);
     const trailer = b.trailer === true || b.trailer === "true";
     if (t.hours) b.hourly = { hours: t.hours };
@@ -1059,7 +1065,7 @@ module.exports = function installAgentPortal(ctx) {
       b.ref = old.ref;
       /* a rate card package stays that package unless the page says otherwise */
       if (old.rate_card && card.SERVICE[old.rate_card] && b.service == null) b.service = old.rate_card;
-      const p = await priceBooking(b, pct, req.agent);
+      const p = await priceBooking(b, pct, req.agent, { returnDiscount: Date.parse(old.created_at) < AGENT_FULL_RETURN_FROM });
       if (p.error) return res.status(400).json({ error: p.error });
 
       await pool.query(
