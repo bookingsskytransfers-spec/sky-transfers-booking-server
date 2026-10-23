@@ -231,6 +231,9 @@ module.exports = function installAgentPortal(ctx) {
       -- charges, and the PaymentIntents of any balance paid after it
       ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS deposit_pct      INTEGER;
       ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS balance_pis      TEXT;
+      -- paid another way (23 Oct 2026): how the office was paid, when the
+      -- whole fare came in outside Stripe - a bank transfer, cash
+      ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS paid_note        TEXT;
       CREATE INDEX IF NOT EXISTS web_bookings_recent ON web_bookings (created_at DESC);
       CREATE INDEX IF NOT EXISTS web_bookings_status ON web_bookings (status, created_at DESC);
     `);
@@ -1677,6 +1680,7 @@ module.exports = function installAgentPortal(ctx) {
     cancelledAt: r.cancelled_at || null, refunded: (r.refunded_cents || 0) / 100, cancelNote: r.cancel_note || "",
     balance: (r.balance_cents || 0) / 100,
     depositPct: r.deposit_pct || null, balanceLinkUrl: r.balance_link_url || null,
+    paidNote: r.paid_note || "",
   });
 
   /* ---- deposit bookings (20 Oct 2026) ------------------------------------
@@ -2048,7 +2052,8 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
       return { ids: [rf.id] };
     }
     const pis = extra.slice().reverse().concat(first ? [first] : []);
-    if (!pis.length) return null;
+    /* everything was paid another way: Stripe holds none of it */
+    if (!pis.length) return { short: 0 };
     const left = [];
     for (const pi of pis) {
       const p = await stripe.paymentIntents.retrieve(pi, { expand: ["latest_charge"] });
@@ -2546,6 +2551,58 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
     } catch (err) {
       console.error("balance paid:", err);
       res.status(500).json({ error: "Could not mark that balance paid." });
+    }
+  });
+
+  /* The whole fare came in another way - a bank transfer, cash, a card
+     machine (Aman, 23 Oct 2026, for ST-261022-AA3C). A confirmed or
+     requested booking becomes paid; its payment link is switched off so the
+     guest can't pay twice. Marked "manual:" in balance_pis like a balance
+     taken by hand, so a later refund knows Stripe never held the money.
+     Refused when Stripe shows the booking was paid by card after all. */
+  app.post("/admin/web-booking/paid-elsewhere", requireAdmin, async (req, res) => {
+    try {
+      const ref = String((req.body && req.body.ref) || "").trim();
+      const r = ref ? await getWebBooking(ref) : null;
+      if (!r) return res.status(404).json({ error: "No booking with that reference." });
+      if (r.status === "paid") return res.status(409).json({ error: "That booking is already marked paid." });
+      if (r.status !== "confirmed" && r.status !== "requested") {
+        return res.status(409).json({ error: `That booking was ${r.status} - there is nothing to pay.` });
+      }
+      if (stripe) {
+        const pi = await findPaymentIntent(r).catch((e) => { console.error("paid elsewhere: stripe check:", e.message); return undefined; });
+        if (pi === undefined) return res.status(503).json({ error: "Couldn't check Stripe just now, so it isn't marked yet - try again in a minute." });
+        if (pi) return res.status(409).json({ error: `Stripe shows ${ref} was paid by card (${pi}). Don't mark it paid another way - check the Stripe dashboard.` });
+      }
+      const how = String((req.body && req.body.how) || "").trim().slice(0, 120) || "paid another way";
+      const cents = r.total_cents || 0;
+      const pis = String(r.balance_pis || "").split(",").map((x) => x.trim()).filter(Boolean);
+      pis.push("manual:" + cents);
+      const up = await pool.query(
+        `UPDATE web_bookings SET status = 'paid', paid_at = now(), confirmed_at = COALESCE(confirmed_at, now()),
+           balance_cents = 0, balance_link_id = NULL, balance_link_url = NULL, balance_pis = $2, paid_note = $3
+         WHERE ref = $1 AND status IN ('confirmed', 'requested')`, [ref, pis.join(","), how]);
+      if (!up.rowCount) return res.status(409).json({ error: "That booking changed while you were looking at it - reload and check." });
+      await deactivatePaymentLink(ref).catch((e) => console.error("paid elsewhere: link off:", e.message));
+      const fresh = await getWebBooking(ref);
+      const b = rowToBooking(fresh);
+      const s = summaryForRow(fresh, b);
+      const notify = req.body && (req.body.notifyGuest === true || req.body.notifyGuest === "true");
+      let emailed = null;
+      if (notify && b.email && mailer) {
+        try { await emailGuestConfirmation(b, s, null); emailed = b.email; } catch (e) { console.error("paid elsewhere guest email:", e.message); }
+      }
+      if (mailer) mailer.sendMail({
+        from: `"Sky Transfers Website" <${process.env.GMAIL_USER}>`, to: BOOKINGS_EMAIL,
+        subject: `PAID another way: $${Math.round(cents / 100)} on ${ref} (${how}) - ${r.pickup} -> ${r.dropoff} (${r.pickup_date_text} ${r.pickup_time})`,
+        text: `${ref} was marked paid from the admin page: $${Math.round(cents / 100)}, ${how}. Its payment link is switched off.\n` +
+              (emailed ? `Guest sent a paid confirmation at ${emailed}.\n` : "Guest not emailed.\n") + `\n${s.text}\n`,
+      }).catch((e) => console.error("paid elsewhere copy:", e.message));
+      console.log("paid another way:", ref, "$" + Math.round(cents / 100), how);
+      res.json({ ok: true, ref, paid: Math.round(cents / 100), how, emailed });
+    } catch (err) {
+      console.error("paid elsewhere:", err);
+      res.status(500).json({ error: "Could not mark that booking paid." });
     }
   });
 
