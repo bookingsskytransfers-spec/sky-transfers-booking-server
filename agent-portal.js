@@ -74,6 +74,14 @@ module.exports = function installAgentPortal(ctx) {
   /* Inside 12 hours a card agency can still cancel online, at the card's
      charge: 50%, or 100% inside 6 hours. null once the pick-up has passed. */
   const lateFeePct = (h) => (h == null || h <= 0 ? null : h < card.CANCEL.halfHours ? 100 : h < card.CANCEL.freeHours ? 50 : 0);
+  /* Interstate (interstate.js, 26 Oct 2026): Sydney, Melbourne and Cairns at
+     partner DMCs' prices + 10%, for every agency, net. Such a booking has
+     rate_card "ix:<product>" and its own rules: 24 hours' notice, changes
+     close 24 hours out, and inside that a cancellation is charged in full. */
+  const ix = require("./interstate");
+  const cutoffOf = (a, bk) => (bk && ix.isIx(bk.rate_card) ? ix.CUTOFF_HOURS : cutoffFor(a));
+  const closedOf = (a, bk) => (bk && ix.isIx(bk.rate_card) ? ix.CLOSED_TEXT : closedFor(a));
+  const lateFeeOf = (a, bk, h) => (bk && ix.isIx(bk.rate_card) ? ix.lateFeePct(h) : onCard(a) ? lateFeePct(h) : null);
 
   /* One idempotent migration at boot. The ALTERs are separate and guarded so
      an instance running the previous version can be rolled forward without a
@@ -458,7 +466,7 @@ module.exports = function installAgentPortal(ctx) {
   /* The portal holds no rate tables of its own — it asks for the same places
      and the same fares the public site is quoting, so the two cannot drift. */
   app.get("/agent/places", requireAgent, (req, res) => {
-    res.json({ places: PLACES_FOR_AGENTS, vehicles: VEHICLES, rateCard: onCard(req.agent) ? card.publicCard() : null });
+    res.json({ places: PLACES_FOR_AGENTS, vehicles: VEHICLES, rateCard: onCard(req.agent) ? card.publicCard() : null, interstate: ix.publicList() });
   });
 
   /* ---- pricing: exactly what the public site charges --------------------
@@ -549,8 +557,61 @@ module.exports = function installAgentPortal(ctx) {
     return c;
   }
 
+  /* An interstate trip, as the page asks for it: {interstate: {product, dir,
+     hours, extra}, date, time, returnTrip, returnDate, returnTime, childSeats} */
+  function ixQuoteOf(b) {
+    const o = b.interstate && typeof b.interstate === "object" ? b.interstate : { product: b.interstate };
+    const isReturn = !!(b.returnTrip || b.returnDate);
+    return ix.quote({ product: o.product, dir: o.dir, hours: o.hours, extra: o.extra, date: b.date, time: b.time, seats: b.childSeats,
+                      isReturn, ret: { date: b.returnDate, time: b.returnTime } });
+  }
+  function ixBooking(b) {
+    const q = ixQuoteOf(b);
+    if (q.error) return { error: q.error };
+    b.pickup = q.ends.pickup; b.dropoff = q.ends.dropoff;
+    for (const f of ["vehicle", "date", "time", "name", "phone"]) {
+      if (!b[f]) return { error: "Please fill in every required field." };
+    }
+    const email = String(b.email || "").trim();
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return { error: "That passenger email doesn't look right." };
+    const v = q.vehicles.find((x) => x.vehicle === b.vehicle);
+    if (!v) return { error: "Choose one of the vehicles listed for that trip." };
+    const pax = parseInt(b.pax, 10) || 1;
+    if (pax > v.cap) return { error: `The ${v.name} takes up to ${v.cap} passengers - choose a bigger vehicle.` };
+    const h = hoursUntil(b.date, b.time);
+    if (h == null || h < ix.CUTOFF_HOURS) return { error: "Interstate trips need at least 24 hours' notice - call +61 481 437 772 for anything sooner." };
+    let ret = null;
+    if (q.legsCount === 2) {
+      const r = returnTripOf(b, null);
+      if (r.error) return { error: r.error };
+      if (!r.ret) return { error: "Please give both a date and a time for the return trip." };
+      ret = r.ret;
+    }
+    const sumOf = (bb) => ix.summary({ ...bb, pax, email: email || bb.agentEmail || BOOKINGS_EMAIL }, q, v, ret);
+    const s = sumOf(b);
+    const tag = `, ${q.cityName} ${q.state}, Australia`;
+    return {
+      fare: v.fare, priced: { stops: [], stopsExtra: 0, stopsKm: null }, seats: q.seats, trailer: false, summary: s,
+      totalCents: Math.round(s.total * 100), ret, hours: q.hours, email: email || null, stops: null,
+      clientRef: String(b.clientRef || "").trim().slice(0, 60) || null,
+      ends: JSON.stringify({ pickup: { suburb: q.ends.pickup, address: q.ends.pickup + tag },
+                             dropoff: { suburb: q.ends.dropoff, address: q.ends.dropoff + tag },
+                             ix: { product: q.product, dir: q.dir, hours: q.kind === "charter" ? q.hours : null, extra: q.extra } }),
+      commissionCents: 0, pct: 0, rateCard: "ix:" + q.product, cardLabel: q.cityName + " - " + q.label, resummarize: sumOf,
+      ix: { supplier: q.supplier, netCents: v.net, city: q.cityName }, pax,
+    };
+  }
+
   app.post("/agent/quote", requireAgent, async (req, res) => {
     try {
+      if (req.body && req.body.interstate) {
+        const q = ixQuoteOf(req.body);
+        if (q.error) return res.json({ quotable: false, message: q.error });
+        return res.json({ quotable: true, net: true, commissionPct: canMoney(req) ? 0 : null, kind: q.kind, hours: q.hours, interstate: true,
+          rateCard: { id: "ix:" + q.product, label: q.cityName + " - " + q.label, kind: "interstate" }, stops: 0,
+          vehicles: q.vehicles.map((v) => ({ vehicle: v.vehicle, name: v.name, cap: v.cap, bags: v.bags, fare: v.fare, total: v.total,
+            stopsExtra: 0, surcharge: v.notes, commission: canMoney(req) ? 0 : null })) });
+      }
       const body = { ...(req.body || {}) };
       if (onCard(req.agent)) applyService(body);
       const t = tripOf(body);
@@ -596,6 +657,7 @@ module.exports = function installAgentPortal(ctx) {
      booking made before that keeps its 10% when it is changed later. */
   const AGENT_FULL_RETURN_FROM = Date.parse("2026-10-23T06:00:00Z");
   async function priceBooking(b, pct, agent, opts) {
+    if (b.interstate) return ixBooking(b);
     const returnDiscount = !!(opts && opts.returnDiscount);
     const svc = onCard(agent) ? applyService(b) : null;
     if (b.service && !svc && onCard(agent)) return { error: "That rate card service isn't on the card any more - choose another, or call us." };
@@ -671,11 +733,17 @@ module.exports = function installAgentPortal(ctx) {
   const resummary = (b, p) => (p.resummarize ? p.resummarize(b)
     : bookingSummary(withStops({ ...b, email: p.email || b.agentEmail || BOOKINGS_EMAIL }, p.priced), p.fare, p.seats, p.trailer, p.ret));
   /* commission lines for the emails: a card booking has none */
-  const officeMoney = (p, pct, totalCents, commCents, what) => (p && p.rateCard
+  const ixOffice = (p) => (p && p.ix ? `PARTNER - book it with ${p.ix.supplier.name}${p.ix.supplier.phone ? ", " + p.ix.supplier.phone : ""}${p.ix.supplier.email ? ", " + p.ix.supplier.email : ""}\n` +
+    `Partner's price: ${money(p.ix.netCents)} (GST incl.) - our margin ${money(p.totalCents - p.ix.netCents)}. The agent never sees the partner or this price.\n` : "");
+  const officeMoney = (p, pct, totalCents, commCents, what) => (p && p.ix
+    ? `Invoice the agent the interstate price: ${money(totalCents)}${what || ""} (net - no commission)\n` + ixOffice(p)
+    : p && p.rateCard
     ? `Invoice the agent the rate card price: ${money(totalCents)}${what || ""} (net - no commission)\n`
     : `Invoice the agent the full fare: ${money(totalCents)}${what || ""}\n` +
       `Agent commission: ${pct}% = ${money(commCents)}, to their wallet - paid out separately\n`);
-  const agentMoney = (p, pct, totalCents, commCents, what) => (p && p.rateCard
+  const agentMoney = (p, pct, totalCents, commCents, what) => (p && p.ix
+    ? `This ${what || "booking"} is at your interstate net price, ${money(totalCents)}, and will appear on your monthly invoice at that price.\n\n`
+    : p && p.rateCard
     ? `This ${what || "booking"} is at your rate card price, ${money(totalCents)}, and will appear on your monthly invoice at that price.\n\n`
     : `Your commission on this ${what || "booking"}: ${money(commCents)} (${pct}%), added to your wallet and paid out to you separately.\n` +
       `This ${what === "tour" ? "tour's trips" : "booking"} will appear on your monthly invoice at the full fare, ${money(totalCents)}${what === "tour" ? " in all" : ""}.\n\n`);
@@ -714,14 +782,15 @@ module.exports = function installAgentPortal(ctx) {
   /* The agency's copy goes to the agency's own address, as it always has.
      A staff login with its own email also gets a copy - without the
      commission line if their login is bookings only. */
-  function agentCopies(req, subject, lead, body, moneyLines) {
+  function agentCopies(req, subject, lead, body, moneyLines, isInterstate) {
     if (!mailer) return;
     const send = (to, withMoney, hi) => mailer.sendMail({
       from: `"Sky Transfers" <${process.env.GMAIL_USER}>`, to, replyTo: BOOKINGS_EMAIL, subject,
       text: `Hi ${hi},\n\n${lead}\n\n${body}\n\n` + (withMoney ? moneyLines : "") +
         `You can download a passenger voucher, change or cancel in the portal up to ` +
-        `${cutoffFor(req.agent)} hours before pick-up.` +
-        (onCard(req.agent) ? " Inside 12 hours a cancellation is charged at 50% of the fare, inside 6 hours at 100%." : "") + `\n\nSky Transfers`,
+        `${isInterstate ? ix.CUTOFF_HOURS : cutoffFor(req.agent)} hours before pick-up.` +
+        (isInterstate ? " Inside 24 hours an interstate cancellation is charged in full."
+          : onCard(req.agent) ? " Inside 12 hours a cancellation is charged at 50% of the fare, inside 6 hours at 100%." : "") + `\n\nSky Transfers`,
     }).catch((e) => console.error("agent copy email:", e.message));
     if (req.agent.email) send(req.agent.email, true, req.agent.name);
     const mine = req.user && req.user.id && req.user.email ? String(req.user.email).trim() : "";
@@ -741,7 +810,7 @@ module.exports = function installAgentPortal(ctx) {
       await insertAgentBooking(pool, req, b, p, pct, null);
 
       notifyOffice(
-        `AGENT booking (${req.agent.code}): ${b.pickup} -> ${b.dropoff} (${b.date} ${b.time}) [${b.ref}]`,
+        `${p.ix ? "INTERSTATE " : ""}AGENT booking (${req.agent.code}): ${b.pickup} -> ${b.dropoff} (${b.date} ${b.time}) [${b.ref}]`,
         `AGENT BOOKING — ${req.agent.name} (${req.agent.code})\n` + (bookedByOf(req) ? `Booked by: ${bookedByOf(req)}\n` : "") +
         (p.clientRef ? `Agent reference: ${p.clientRef}\n` : "") + `\n${p.summary.text}\n\n` +
         /* Agencies are invoiced the FULL fare; commission sits in their wallet
@@ -752,7 +821,7 @@ module.exports = function installAgentPortal(ctx) {
       agentCopies(req, `Booking confirmed — ${b.ref} · Sky Transfers`,
         "Your booking is in and we'll confirm the chauffeur shortly.",
         (p.clientRef ? `Your reference: ${p.clientRef}\n` : "") + p.summary.text,
-        agentMoney(p, pct, p.totalCents, p.commissionCents));
+        agentMoney(p, pct, p.totalCents, p.commissionCents), !!p.ix);
 
       res.json({ ok: true, ref: b.ref, total: p.summary.total, commission: canMoney(req) ? p.commissionCents / 100 : null });
     } catch (err) {
@@ -841,7 +910,7 @@ module.exports = function installAgentPortal(ctx) {
       if (bk.card_paid_at) return { error: "This booking has been paid by card, so changes and cancellations go through us - call +61 481 437 772.", code: 409 };
       const iso = bk.pickup_date instanceof Date ? bk.pickup_date.toISOString().slice(0, 10) : String(bk.pickup_date);
       const h = hoursUntil(iso, bk.pickup_time);
-      if (h == null || h < cutoffFor(req.agent)) return { error: closedFor(req.agent), code: 400 };
+      if (h == null || h < cutoffOf(req.agent, bk)) return { error: closedOf(req.agent, bk), code: 400 };
     }
     return { booking: bk };
   }
@@ -849,16 +918,18 @@ module.exports = function installAgentPortal(ctx) {
   app.post("/agent/booking/cancel", requireAgent, async (req, res) => {
     try {
       const ref = String(req.body?.ref || "");
-      if (onCard(req.agent)) {
+      const peek = (await pool.query("SELECT rate_card FROM agent_bookings WHERE ref = $1 AND agent_code = $2", [ref, req.agent.code])).rows[0];
+      if (onCard(req.agent) || (peek && ix.isIx(peek.rate_card))) {
         const any = await loadOwnBooking(req, ref, { forChange: false });
         if (any.error) return res.status(any.code).json({ error: any.error });
         const bk0 = any.booking;
         const h0 = hoursUntil(isoOf(bk0.pickup_date), bk0.pickup_time);
-        const fee = lateFeePct(h0);
+        const isI = ix.isIx(bk0.rate_card);
+        const fee = lateFeeOf(req.agent, bk0, h0);
         if (bk0.status === "confirmed" && !bk0.card_paid_at && fee) {
           const feeCents = Math.round(bk0.total_cents * fee / 100);
           if (!req.body || req.body.acceptCharge !== true) {
-            return res.status(409).json({ error: `This is inside ${fee === 100 ? 6 : 12} hours of pick-up, so cancelling is charged at ${fee}% of the fare: ${money(feeCents)}.`,
+            return res.status(409).json({ error: `This is inside ${isI ? 24 : fee === 100 ? 6 : 12} hours of pick-up, so cancelling is charged at ${fee}% of the fare: ${money(feeCents)}.`,
               charge: { pct: fee, amount: feeCents / 100 } });
           }
           await pool.query(
@@ -870,7 +941,8 @@ module.exports = function installAgentPortal(ctx) {
             `LATE CANCELLATION by ${whoDid(req)} - ${Math.round(h0 * 10) / 10} hours before pick-up\n\n` +
             `Reference: ${bk0.ref}\nRoute: ${bk0.pickup} -> ${bk0.dropoff}\nWas: ${isoOf(bk0.pickup_date)} ${bk0.pickup_time}\n` +
             `Passenger: ${bk0.passenger_name}\nVehicle: ${bk0.vehicle}\n\n` +
-            `Rate card policy: ${fee}% of ${money(bk0.total_cents)} = ${money(feeCents)}, stays on their next invoice.\n` +
+            `${isI ? "Interstate policy" : "Rate card policy"}: ${fee}% of ${money(bk0.total_cents)} = ${money(feeCents)}, stays on their next invoice.\n` +
+            (isI ? `Tell the interstate partner it is cancelled (they will charge us in full inside 24 hours).\n` : "") +
             `It is off the dispatch board - take it off the driver if one was sent.\n`,
             req.agent
           );
@@ -1065,6 +1137,10 @@ module.exports = function installAgentPortal(ctx) {
       b.ref = old.ref;
       /* a rate card package stays that package unless the page says otherwise */
       if (old.rate_card && card.SERVICE[old.rate_card] && b.service == null) b.service = old.rate_card;
+      if (ix.isIx(old.rate_card) && !b.interstate) {
+        let was = null; try { was = old.ends ? JSON.parse(old.ends).ix : null; } catch (e) {}
+        b.interstate = was || { product: old.rate_card.slice(3) };
+      }
       const p = await priceBooking(b, pct, req.agent, { returnDiscount: Date.parse(old.created_at) < AGENT_FULL_RETURN_FROM });
       if (p.error) return res.status(400).json({ error: p.error });
 
@@ -1095,7 +1171,9 @@ module.exports = function installAgentPortal(ctx) {
         `WAS: ${old.pickup} -> ${old.dropoff}, ${old.vehicle}, ${wasDate} ${old.pickup_time}, ` +
         `${old.passenger_name}, total ${money(old.total_cents)}\n\n` +
         `NOW:\n${p.summary.text}\n\n` +
-        (p.rateCard ? `Invoice the agent the rate card price: ${money(p.totalCents)} (was ${money(old.total_cents)}) - net, no commission\n`
+        (p.ix ? `Invoice the agent the interstate price: ${money(p.totalCents)} (was ${money(old.total_cents)}) - net, no commission\n` + ixOffice(p) +
+          `Tell the interstate partner about the change.\n`
+          : p.rateCard ? `Invoice the agent the rate card price: ${money(p.totalCents)} (was ${money(old.total_cents)}) - net, no commission\n`
           : `Invoice the agent the full fare: ${money(p.totalCents)} (was ${money(old.total_cents)})\n` +
             `Commission now: ${pct}% = ${money(p.commissionCents)} (was ${money(old.commission_cents)}), to their wallet - paid out separately\n`),
         req.agent
@@ -1543,7 +1621,7 @@ module.exports = function installAgentPortal(ctx) {
     returnFlight: r.return_flight || "",
     hours: r.hire_hours || null,
     rateCard: r.rate_card || null,
-    rateCardKind: r.rate_card && card.SERVICE[r.rate_card] ? card.SERVICE[r.rate_card].kind : null,
+    rateCardKind: r.rate_card && card.SERVICE[r.rate_card] ? card.SERVICE[r.rate_card].kind : ix.isIx(r.rate_card) ? "interstate" : null,
     cancelFeePct: r.cancel_fee_pct || null,
     bookedBy: r.booked_by || "",
     changedBy: r.changed_by || "",
@@ -1593,9 +1671,10 @@ module.exports = function installAgentPortal(ctx) {
         bookings: rows.map((r) => {
           const b = bookingRow(r);
           const h = hoursUntil(b.date, b.time);
-          b.changeable = r.status === "confirmed" && !r.card_paid_at && h != null && h >= cutoffFor(req.agent);
-          /* a card agency can still cancel inside 12 hours, at the card's charge */
-          const fee = onCard(req.agent) && r.status === "confirmed" && !r.card_paid_at ? lateFeePct(h) : null;
+          b.changeable = r.status === "confirmed" && !r.card_paid_at && h != null && h >= cutoffOf(req.agent, r);
+          /* a card agency can still cancel inside 12 hours, at the card's
+             charge; an interstate trip inside 24 hours, charged in full */
+          const fee = r.status === "confirmed" && !r.card_paid_at ? lateFeeOf(req.agent, r, h) : null;
           if (fee) b.lateCancel = { pct: fee, amount: Math.round(r.total_cents * fee / 100) / 100 };
           b.trip = trips[b.ref] || null;
           if (b.tourRef) b.tourCount = tourCount[b.tourRef];
