@@ -14,8 +14,9 @@
  *
  * Only ever sent by the office pressing Send. Laid out like the website's
  * confirmation (same navy/gold sections, same footer), one section per trip.
- * It never shows a price, the account's name or the notes for the driver:
- * the trips may be an agency's work, and the money is the invoice's job.
+ * It never shows a price or the account's name: the trips may be an
+ * agency's work, and the money is the invoice's job. The job's notes ARE
+ * shown (Aman, 25 Oct 2026), so the form says so beside the notes box.
  * Base-14 Helvetica in the PDF covers WinAnsi only - "to", never arrows.
  */
 module.exports = function installTripConfirm(ctx) {
@@ -46,7 +47,7 @@ module.exports = function installTripConfirm(ctx) {
 
   const COLS = `ref, account, pickup, dropoff, vehicle, to_char(pickup_date, 'YYYY-MM-DD') AS d, pickup_time AS t,
     to_char(return_date, 'YYYY-MM-DD') AS rd, return_time AS rt, return_flight AS rf, hire_hours,
-    passenger_name, passenger_phone, passenger_email, flight, address, pax, child_seats, trailer, stops, status,
+    passenger_name, passenger_phone, passenger_email, flight, address, notes, pax, child_seats, trailer, stops, status,
     confirm_sent_at, confirm_sent_to`;
 
   /* "15:20" -> "3:20 pm" */
@@ -90,6 +91,7 @@ module.exports = function installTripConfirm(ctx) {
       ret ? ["Return journey", `${j.dropoff} back to ${j.pickup}`] : null,
       j.address ? ["Address / hotel", j.address] : null,
       extras ? ["Extras" + (ret ? " (each leg)" : ""), extras] : null,
+      j.notes ? ["Notes", String(j.notes)] : null,
     ].filter((r) => r && r[1] != null && String(r[1]) !== "");
   }
 
