@@ -1516,6 +1516,18 @@ try {
   console.error("Guest updates not mounted (bookings unaffected):", err.message);
 }
 
+/* One confirmation email for several account trips of the same guest
+   (dispatch.html, Account job tab). Sent only when the office presses Send.
+   Wrapped like everything above. */
+try {
+  require("./trip-confirm")({
+    app, pool: portal && portal.pool, requireAdmin: portal && portal.requireAdmin, mailer, BOOKINGS_EMAIL,
+    PDFDocument, COMPANY, HAS_LOGO, LOGO_PATH, REVIEW_URL, niceDate, guestAttachments,
+  });
+} catch (err) {
+  console.error("Trip confirmations not mounted (bookings unaffected):", err.message);
+}
+
 /* Phase 4 - import the upcoming Limo Anywhere bookings (dispatch.html Import
    tab, admin only). Wrapped like everything above. */
 try {
