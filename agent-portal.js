@@ -390,11 +390,13 @@ module.exports = function installAgentPortal(ctx) {
   const whoDid = (req) => (req.user && req.user.id ? `${req.user.name} at ` : "") + `${req.agent.name} (${req.agent.code})`;
   const bookedByOf = (req) => (req.user && req.user.id ? req.user.name : null);
 
+  const ADMIN_SESSION_MS = 7 * 24 * 3600 * 1000;
+  const adminPinVersion = () => crypto.createHmac("sha256", AGENT_SECRET).update("admin-pin:" + String(ADMIN_PIN || "")).digest("base64url").slice(0, 16);
   function requireAdmin(req, res, next) {
     if (!AGENTS_ON) return res.status(503).json({ error: "The agent portal is not configured on this server." });
     if (!ADMIN_PIN) return res.status(503).json({ error: "Admin access is not configured on this server." });
     const claim = readToken(bearer(req));
-    if (!claim || claim.role !== "admin") return res.status(401).json({ error: "Your admin session has expired." });
+    if (!claim || claim.role !== "admin" || claim.pv !== adminPinVersion()) return res.status(401).json({ error: "Your admin session has expired." });
     next();
   }
 
@@ -460,7 +462,9 @@ module.exports = function installAgentPortal(ctx) {
       return res.status(401).json({ error: "Wrong PIN." });
     }
     LOGIN_FAILS.delete("__admin__");
-    res.json({ token: signToken("__admin__", "admin", 4 * 3600 * 1000) });
+    /* A week, so the office signs in once (Aman, 26 Oct 2026). pv ties the
+       session to the PIN: changing ADMIN_PIN in Render signs every device out. */
+    res.json({ token: signToken("__admin__", "admin", ADMIN_SESSION_MS, { pv: adminPinVersion() }) });
   });
 
   /* The portal holds no rate tables of its own — it asks for the same places
