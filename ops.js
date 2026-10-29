@@ -169,6 +169,14 @@ module.exports = function installOps(ctx) {
       ALTER TABLE ops_jobs ADD COLUMN IF NOT EXISTS import_key TEXT;
       -- Stops along the way on an account job: a JSON list of addresses.
       ALTER TABLE ops_jobs ADD COLUMN IF NOT EXISTS stops TEXT;
+      -- Proof of arrival: where the driver's phone was when they pressed
+      -- "I'm on location", or why it couldn't say (arrive_geo: ok, denied,
+      -- unavailable, timeout). Office only - never on a driver, guest or
+      -- account page.
+      ALTER TABLE ops_dispatch ADD COLUMN IF NOT EXISTS arrive_lat NUMERIC(9,6);
+      ALTER TABLE ops_dispatch ADD COLUMN IF NOT EXISTS arrive_lng NUMERIC(9,6);
+      ALTER TABLE ops_dispatch ADD COLUMN IF NOT EXISTS arrive_acc INTEGER;
+      ALTER TABLE ops_dispatch ADD COLUMN IF NOT EXISTS arrive_geo TEXT;
       CREATE INDEX IF NOT EXISTS ops_jobs_import_key ON ops_jobs (import_key);
     `);
     /* The board reads web_bookings.stops. agent-portal.js adds that column
@@ -287,6 +295,9 @@ module.exports = function installOps(ctx) {
       l.vehicleLabel = l.vehicleId && vById.get(l.vehicleId) ? vById.get(l.vehicleId).label : null;
       l.times = d ? { assigned: d.assigned_at, accepted: d.accepted_at, onWay: d.on_way_at,
                       onLocation: d.on_location_at, pob: d.pob_at, done: d.done_at, declined: d.declined_at } : {};
+      l.arrival = d && d.arrive_geo ? { geo: d.arrive_geo,
+        lat: d.arrive_lat != null ? Number(d.arrive_lat) : null, lng: d.arrive_lng != null ? Number(d.arrive_lng) : null,
+        acc: d.arrive_acc != null ? d.arrive_acc : null } : null;
     }
     return legs;
   }
@@ -435,7 +446,11 @@ module.exports = function installOps(ctx) {
            declined_at = CASE WHEN $8 THEN NULL ELSE ops_dispatch.declined_at END,
            driver_paid_at = CASE WHEN $8 THEN NULL ELSE ops_dispatch.driver_paid_at END,
            guest_onway_at = CASE WHEN $8 THEN NULL ELSE ops_dispatch.guest_onway_at END,
-           guest_arrived_at = CASE WHEN $8 THEN NULL ELSE ops_dispatch.guest_arrived_at END`,
+           guest_arrived_at = CASE WHEN $8 THEN NULL ELSE ops_dispatch.guest_arrived_at END,
+           arrive_lat = CASE WHEN $8 THEN NULL ELSE ops_dispatch.arrive_lat END,
+           arrive_lng = CASE WHEN $8 THEN NULL ELSE ops_dispatch.arrive_lng END,
+           arrive_acc = CASE WHEN $8 THEN NULL ELSE ops_dispatch.arrive_acc END,
+           arrive_geo = CASE WHEN $8 THEN NULL ELSE ops_dispatch.arrive_geo END`,
         [ref, leg, driverId, vehicleId, pay, status, note, changedDriver]);
       await pool.query(`UPDATE ops_dispatch SET auto_assigned = $3 WHERE ref = $1 AND leg = $2`, [ref, leg, !!(auto && driverId)]);
       console.log("ops assign:", auto ? "(auto)" : "", ref, leg, "driver", driverId || "-", "vehicle", vehicleId || "-", status);
@@ -796,6 +811,19 @@ module.exports = function installOps(ctx) {
       await pool.query(
         `UPDATE ops_dispatch SET status = $3, ${col} = now(), updated_at = now() WHERE ref = $1 AND leg = $2 AND driver_id = $4`,
         [ref, leg, want, d.id]);
+      /* Proof of arrival, for a no-show dispute. The page asks the phone where
+         it is when the driver presses "I'm on location"; a refusal or a phone
+         that can't tell is recorded as such, and never stops the step. */
+      if (want === "on_location") {
+        const g = b.geo || {};
+        const lat = Number(g.lat), lng = Number(g.lng), acc = Number(g.acc);
+        const okGeo = Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180 && !(lat === 0 && lng === 0);
+        const why = okGeo ? "ok" : (["denied", "unavailable", "timeout", "unsupported"].includes(b.geoNote) ? b.geoNote : "unavailable");
+        await pool.query(
+          `UPDATE ops_dispatch SET arrive_lat = $3, arrive_lng = $4, arrive_acc = $5, arrive_geo = $6 WHERE ref = $1 AND leg = $2`,
+          [ref, leg, okGeo ? Math.round(lat * 1e6) / 1e6 : null, okGeo ? Math.round(lng * 1e6) / 1e6 : null,
+           okGeo && Number.isFinite(acc) && acc >= 0 ? Math.min(Math.round(acc), 100000) : null, why]);
+      }
       if (want === "declined") {
         const { rows: dr } = await pool.query(`SELECT declined_ids FROM ops_dispatch WHERE ref = $1 AND leg = $2`, [ref, leg]);
         const ids = new Set(String((dr[0] && dr[0].declined_ids) || "").split(",").filter(Boolean));
@@ -826,6 +854,11 @@ module.exports = function installOps(ctx) {
     .then(() => console.log("Ops ready (dispatch board, drivers, vehicles)"))
     .catch((e) => console.error("Ops setup failed:", e.message));
 
-  return { on: true, boardFor, linkFor, initOpsSchema, legsOf, markConflicts, driverFromToken, allDrivers, allVehicles, bneToday, addDays,
-           assignLeg, legExists, sourceRows, hooks };
+  const api = { on: true, boardFor, linkFor, initOpsSchema, legsOf, markConflicts, driverFromToken, allDrivers, allVehicles, bneToday, addDays,
+           assignLeg, legExists, sourceRows, attachDispatch, hooks };
+  /* Read-only job view for an account's own staff (account-view.js). Its
+     own try, so a fault there can never take the board down. */
+  try { api.accountView = require("./account-view")(ctx, api); }
+  catch (e) { console.error("Account view not mounted:", e.message); }
+  return api;
 };

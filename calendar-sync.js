@@ -137,7 +137,11 @@ module.exports = function calendarSync(ctx) {
   const cleanName = (s) => String(s || "").replace(/\(.*?\)/g, "").split(/\s+[—–-]\s+|,|;/)[0].replace(PHONE, "").trim().slice(0, 120);
 
   function mapEvent(ev, known) {
-    const d = ev.description, L = labels(d), checks = [];
+    /* checks put a job on "Check"; notes are things to fill in later that
+       don't stop it being dispatched - no price (the invoice draft shows
+       "$0 - no price" in red), or no pax when the vehicle is known. 50 of 76
+       calendar jobs were on Check, mostly for those two (Aman, 29 Oct 2026). */
+    const d = ev.description, L = labels(d), checks = [], notes = [];
     /* "07:15 KIFF & Culture - ...", "06:00-14:30 BusCharter ...": the time
        at the front is the office's note, not part of the name */
     const tm = /^\s*(\d{1,2})[:.](\d{2})(?:\s*[-–]\s*\d{1,2}[:.]\d{2})?\s+/.exec(ev.summary);
@@ -192,7 +196,6 @@ module.exports = function calendarSync(ctx) {
     /* "(3 Pax)", "(10-11 pax, ...)" - the larger number of a range */
     const paxM = /\b(\d+)(?:\s*[-–]\s*(\d+))?\s*pax\b/i.exec(s) || /(\d+)/.exec(first(L.pax, (v) => /\d/.test(v)) || "");
     j.pax = paxM ? Math.min(Math.max(+(paxM[2] || paxM[1]), 1), 60) : 1;
-    if (!paxM) checks.push("number of passengers not given");
 
     /* the vehicle */
     const vLab = first(L.vehicle);
@@ -211,6 +214,9 @@ module.exports = function calendarSync(ctx) {
     else if (VEHICLES.indexOf(j.vehicle) === -1) checks.push(`vehicle "${j.vehicle}" isn't one of our classes - assign it by hand`);
     const many = /\b(\d+)\s*x\s+[a-z]/i.exec(vLab + " " + s) || /\b(\d+)\s+vehicles\b/i.exec(s + " " + d);
     if (many && +many[1] > 1) checks.push(`needs ${many[1]} vehicles - the board holds it as one job; add the others by hand`);
+    /* With a vehicle the driver knows what to bring; without one the office
+       has to choose, and the pax is what it chooses by. */
+    if (!paxM) (j.vehicle ? notes : checks).push("number of passengers not given");
 
     /* money, flight, extras */
     const priceTxt = first(L.price, (v) => /\d/.test(v)) || (/\(\s*\$\s?([\d,]+(?:\.\d{1,2})?)\s*\)/.exec(s) || [])[1] || "";
@@ -220,7 +226,7 @@ module.exports = function calendarSync(ctx) {
        the price of this one */
     const per = /\$\s?([\d,]+(?:\.\d{1,2})?)\s*(?:aud\s*)?(?:per|a|each)\s+(run|trip|day|leg|transfer|way|movement)\b/i.exec(String(priceTxt));
     const MANY = /\b(runs|trips|legs|days|nights|transfers|movements|assignment)\b/i;
-    if (j.priceCents == null) checks.push("no price");
+    if (j.priceCents == null) notes.push("no price - add it before invoicing");
     else if (per) {
       const one = Math.round(+per[1].replace(/,/g, "") * 100);
       if (one !== j.priceCents) checks.push(`the calendar gives a total and $${(one / 100).toFixed(2)} per ${per[2].toLowerCase()} - the per-${per[2].toLowerCase()} price is used`);
@@ -253,7 +259,7 @@ module.exports = function calendarSync(ctx) {
     if (!j.phone && !j.account) checks.push("no passenger phone");
     const st = /\bST-\d{6}-[A-Z0-9]{4}\b/.exec(s + " " + d + " " + ev.location);
     j.stRef = st ? st[0] : null;
-    return { job: j, checks };
+    return { job: j, checks, notes };
   }
   /* The fields the office sees change on, in a fixed order. */
   const FIELDS = [["date", "date"], ["time", "time"], ["pickup", "pick-up"], ["dropoff", "drop-off"], ["vehicle", "vehicle"], ["pax", "pax"],
@@ -355,6 +361,7 @@ module.exports = function calendarSync(ctx) {
         if (j.stRef) m.checks.unshift(`the event names ${j.stRef}, which isn't in the system`);
         if (j.web) m.checks.unshift("marked WEB in the calendar but no matching website booking was found");
         const note = `From the Google Calendar: "${title}".` + (m.checks.length ? " Check: " + m.checks.join("; ") + "." : "") +
+          ((m.notes || []).length ? " To add: " + m.notes.join("; ") + "." : "") +
           (ev.description ? "\n\n" + ev.description.slice(0, 1500) : "");
         let ref = null;
         for (let i = 0; i < 5 && !ref; i++) {
@@ -503,7 +510,7 @@ module.exports = function calendarSync(ctx) {
       if (hit) { rows.push(Object.assign(base, { action: "link", ref: hit.ref })); continue; }
       if (j.stRef) m.checks.unshift(`names ${j.stRef}, not in the system`);
       rows.push(Object.assign(base, { action: "create", account: j.account, from: j.pickup, to: j.dropoff, vehicle: j.vehicle, pax: j.pax,
-        name: j.name, phone: j.phone, price: j.priceCents != null ? j.priceCents / 100 : null, checks: m.checks }));
+        name: j.name, phone: j.phone, price: j.priceCents != null ? j.priceCents / 100 : null, checks: m.checks, notes: m.notes || [] }));
     }
     rows.sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time));
     return { events: all.length, rows };
@@ -531,6 +538,7 @@ module.exports = function calendarSync(ctx) {
       if (j.stRef) m.checks.unshift(`the event names ${j.stRef}, which isn't in the system`);
       if (j.web) m.checks.unshift("marked WEB in the calendar but no matching website booking was found");
       const note = `From the Google Calendar: "${title}".` + (m.checks.length ? " Check: " + m.checks.join("; ") + "." : "") +
+          ((m.notes || []).length ? " To add: " + m.notes.join("; ") + "." : "") +
         (ev.description ? "\n\n" + ev.description.slice(0, 1500) : "");
       await pool.query(
         `UPDATE ops_jobs SET account = $2, account_ref = $3, pickup = $4, dropoff = $5, vehicle = $6, pickup_date = $7, pickup_time = $8,
