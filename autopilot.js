@@ -133,6 +133,8 @@ module.exports = function installAutopilot(ctx) {
     /* Phase 3, guest-updates.js: emails (and later WhatsApp) to the guest -
        driver assigned the evening before, on the way, arrived. */
     guestOn: false, guestNoticeAt: "19:00", guestAgentAccount: false, guestWhatsApp: false,
+    /* review-requests.js: one Google review request after the trip */
+    reviewOn: false, reviewDelayH: 2, reviewSince: null,
   };
   async function getSettings() {
     const { rows } = await pool.query(`SELECT value FROM ops_settings WHERE key = 'autopilot'`);
@@ -144,12 +146,17 @@ module.exports = function installAutopilot(ctx) {
     const b = patch || {}, next = Object.assign({}, cur);
     const bool = (k) => { if (k in b) next[k] = b[k] === true || b[k] === "true"; };
     ["dispatchOn", "closeOn", "autoCloseStarted", "invoicesOn", "digestOn", "intakeOn", "calOn", "aiOn",
-     "guestOn", "guestAgentAccount", "guestWhatsApp"].forEach(bool);
+     "guestOn", "guestAgentAccount", "guestWhatsApp", "reviewOn"].forEach(bool);
     for (const k of ["dispatchAt", "invoiceAt", "digestAt", "guestNoticeAt"]) if (k in b) { const t = hhmm(b[k]); if (!t) throw { code: 400, message: "Times are 24-hour, like 18:00." }; next[k] = t; }
     if ("closeAfterHours" in b) {
       const h = parseInt(b.closeAfterHours, 10);
       if (!(h >= 1 && h <= 12)) throw { code: 400, message: "Chase unclosed jobs after 1 to 12 hours." };
       next.closeAfterHours = h;
+    }
+    if ("reviewDelayH" in b) {
+      const h = parseInt(b.reviewDelayH, 10);
+      if (!(h >= 1 && h <= 24)) throw { code: 400, message: "Ask for a review 1 to 24 hours after the trip." };
+      next.reviewDelayH = h;
     }
     if ("alertTo" in b) {
       const a = String(b.alertTo || "").trim().slice(0, 200);
@@ -160,6 +167,8 @@ module.exports = function installAutopilot(ctx) {
        first run can't re-enter a week of bookings already typed in. */
     if (next.intakeOn && !cur.intakeOn) next.intakeSince = new Date(nowMs()).toISOString();
     if (next.aiOn && !cur.aiOn) next.aiSince = new Date(nowMs()).toISOString();
+    /* Only trips finished after review requests are switched on are asked. */
+    if (next.reviewOn && !cur.reviewOn) next.reviewSince = new Date(nowMs()).toISOString();
     await pool.query(
       `INSERT INTO ops_settings (key, value, updated_at) VALUES ('autopilot', $1, now())
        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`, [JSON.stringify(next)]);
