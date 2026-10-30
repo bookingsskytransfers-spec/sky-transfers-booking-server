@@ -91,7 +91,10 @@ const recordBooking = (b, s, status) => {
 };
 const LOGO_PATH = path.join(__dirname, "logo.png");
 const HAS_LOGO = fs.existsSync(LOGO_PATH);
-const REVIEW_URL = "https://www.google.com/maps?cid=9657905201752242057";
+/* Opens the "write a review" box straight away (place ID of the Google
+   Business Profile, checked 31 Oct 2026); the old maps?cid link opened the
+   profile and left the guest to find the button. */
+const REVIEW_URL = "https://search.google.com/local/writereview?placeid=ChIJsUu5rbsTkWsRiffWeJzFB4Y";
 
 const app = express();
 app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
@@ -1514,6 +1517,18 @@ try {
   if (guest && guest.on && portal && typeof portal.setTripStatus === "function") portal.setTripStatus(guest.tripStatus);
 } catch (err) {
   console.error("Guest updates not mounted (bookings unaffected):", err.message);
+}
+
+/* Google review request after the trip (review-requests.js) - one email to
+   direct passengers, once per address. Off until switched on in the Autopilot
+   tab. Wrapped like everything above. */
+try {
+  require("./review-requests")({
+    app, pool: portal && portal.pool, requireAdmin: portal && portal.requireAdmin,
+    ops, autopilot, mailer, BOOKINGS_EMAIL, REVIEW_URL,
+  });
+} catch (err) {
+  console.error("Review requests not mounted (bookings unaffected):", err.message);
 }
 
 /* One confirmation email for several account trips of the same guest
