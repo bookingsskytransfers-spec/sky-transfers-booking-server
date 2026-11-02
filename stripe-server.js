@@ -998,8 +998,24 @@ app.post("/charter-enquiry", async (req, res) => {
     });
 
     /* Acknowledgement only if they gave an address; the charter form does not
-       require one. No promise here that is not already on the page. */
-    if (b.email) {
+       require one. No promise here that is not already on the page.
+       Enquiries from funeral-transport.html come from families arranging a
+       funeral, so theirs is worded for that rather than as a "charter
+       enquiry" (2 Nov 2026). The office copy above is left unchanged. */
+    const funeral = /^funeral/i.test(String(b.occasion || ""));
+    if (b.email && funeral) {
+      await mailer.sendMail({
+        from: `"Sky Transfers" <${process.env.GMAIL_USER}>`,
+        to: b.email,
+        replyTo: BOOKINGS_EMAIL,
+        subject: `We have your details — Sky Transfers · ${b.ref}`,
+        text:
+          `Dear ${b.name},\n\nThank you for getting in touch. We have your details and will contact you ` +
+          `shortly to confirm the vehicles, the times and a fixed price.\n\n${text}\n\n` +
+          `If anything is urgent, please call +61 481 437 772 at any time.\n\n` +
+          `Sky Transfers\nwww.skytransfers.com.au`,
+      });
+    } else if (b.email) {
       await mailer.sendMail({
         from: `"Sky Transfers" <${process.env.GMAIL_USER}>`,
         to: b.email,
