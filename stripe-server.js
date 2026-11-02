@@ -136,9 +136,9 @@ const BM_OOL_SUBURB = {}; Object.keys(BM_OOL_ZONE).forEach((z) => { BM_OOL_ZONE[
    per hub because OOL→Byron and BNE→Byron are not the same drive.
    Held with the page's LD_LIVE flag off: until that flips, the booking form
    never offers these destinations, so these tables are simply unreachable. */
-const LD_ZONE = {"SC1":["Caloundra","Golden Beach","Pelican Waters","Currimundi","Wurtulla","Warana","Buddina","Minyama"],"SC2":["Mooloolaba","Alexandra Headland","Maroochydore","Cotton Tree","Sunshine Coast Airport (MCY)","Buderim","Sippy Downs","Mountain Creek","Kuluin"],"SC3":["Coolum Beach","Peregian Beach","Peregian Springs","Marcoola","Mudjimba","Twin Waters","Yaroomba"],"SC4":["Noosa Heads","Noosaville","Noosa Junction","Sunshine Beach","Sunrise Beach","Tewantin","Doonan","Eumundi"],"TWB":["Toowoomba","East Toowoomba","North Toowoomba","South Toowoomba","Harristown","Darling Heights","Centenary Heights","Rangeville","Middle Ridge","Kearneys Spring","Wilsonton","Wilsonton Heights","Rockville","Harlaxton","Mount Lofty","Mount Kynoch","Prince Henry Heights","Redwood","Cranley","Glenvale","Torrington","Drayton","Cotswold Hills","Top Camp","Athol","Charlton","Wellcamp","Westbrook","Highfields","Blue Mountain Heights","Kleinton","Gowrie Junction","Meringandan West","Hodgson Vale","Vale View","Preston"],"BYR":["Byron Bay","Suffolk Park","Ewingsdale","Bangalow","Broken Head"]};
-const LD_BNE_RATES = {"SC1":[280,295,305,320,330,430,495],"SC2":[305,320,335,345,360,470,545],"SC3":[330,345,360,375,390,505,590],"SC4":[375,395,410,425,440,580,675],"TWB":[395,415,430,450,465,605,705],"BYR":[450,475,495,510,530,695,810]};
-const LD_OOL_RATES = {"BYR":[220,235,245,260,270,365,425]};
+const LD_ZONE = {"SC1":["Caloundra","Golden Beach","Pelican Waters","Currimundi","Wurtulla","Warana","Buddina","Minyama"],"SC2":["Mooloolaba","Alexandra Headland","Maroochydore","Cotton Tree","Sunshine Coast Airport (MCY)","Buderim","Sippy Downs","Mountain Creek","Kuluin"],"SC3":["Coolum Beach","Peregian Beach","Peregian Springs","Marcoola","Mudjimba","Twin Waters","Yaroomba"],"SC4":["Noosa Heads","Noosaville","Noosa Junction","Sunshine Beach","Sunrise Beach","Tewantin","Doonan","Eumundi"],"TWB":["Toowoomba","East Toowoomba","North Toowoomba","South Toowoomba","Harristown","Darling Heights","Centenary Heights","Rangeville","Middle Ridge","Kearneys Spring","Wilsonton","Wilsonton Heights","Rockville","Harlaxton","Mount Lofty","Mount Kynoch","Prince Henry Heights","Redwood","Cranley","Glenvale","Torrington","Drayton","Cotswold Hills","Top Camp","Athol","Charlton","Wellcamp","Westbrook","Highfields","Blue Mountain Heights","Kleinton","Gowrie Junction","Meringandan West","Hodgson Vale","Vale View","Preston"],"BYR":["Byron Bay","Suffolk Park","Ewingsdale","Bangalow","Broken Head"],"AZ":["Beerwah"]};
+const LD_BNE_RATES = {"SC1":[280,295,305,320,330,430,495],"SC2":[305,320,335,345,360,470,545],"SC3":[330,345,360,375,390,505,590],"SC4":[375,395,410,425,440,580,675],"TWB":[395,415,430,450,465,605,705],"BYR":[450,475,495,510,530,695,810],"AZ":[235,250,260,275,285,370,430]};
+const LD_OOL_RATES = {"BYR":[220,235,245,260,270,365,425],"AZ":[425,450,470,485,505,670,785]};
 const LD_SUBURB = {}; Object.keys(LD_ZONE).forEach((z) => { LD_ZONE[z].forEach((s) => { LD_SUBURB[s] = z; }); });
 const OOL = "Gold Coast Airport (OOL)", BNE = "Brisbane Airport (BNE)";
 const CRUISE = "Brisbane Cruise Terminal (Pinkenba)", CRUISE_EXTRA = 25;
@@ -1418,7 +1418,7 @@ try {
     app,
     requireAdmin: portal && portal.requireAdmin,
     VEHICLES, VEHICLE_ALIASES, QUOTE_ONLY,
-    SUBURBS, BM_SUBURB, LD_SUBURB,
+    SUBURBS, BM_SUBURB, LD_SUBURB, LD_BNE_RATES, LD_OOL_RATES,
     HUB_NAMES: [OOL, BNE, CRUISE],
   });
 } catch (err) {
