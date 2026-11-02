@@ -3291,5 +3291,10 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
      is handed out so other modules can sit behind the same admin login rather
      than growing a second path that accepts the PIN. */
   /* pool goes to ops.js (the dispatch board), which reads these same tables. */
-  return { saveWebBooking, actionLinks, findOpenWebBooking, requireAdmin, getWebBooking, rowToBooking, summaryForRow, settleBalance, settleDeposit, pool, setTripStatus, requireAgent, requireAgentAccounts, settleAgentCard };
+  /* The sign-in pieces, so affiliates.js signs its people in exactly the way
+     agents are - same PIN hashing, same throttle, same token - rather than
+     with a second copy that drifts. */
+  const auth = AGENTS_ON ? { signToken, readToken, bearer, pinMatches, makePinHash, newPin, loginLocked, noteLoginFail,
+    clearFails: (k) => LOGIN_FAILS.delete(k) } : null;
+  return { saveWebBooking, actionLinks, findOpenWebBooking, requireAdmin, getWebBooking, rowToBooking, summaryForRow, settleBalance, settleDeposit, pool, setTripStatus, requireAgent, requireAgentAccounts, settleAgentCard, auth };
 };

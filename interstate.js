@@ -296,7 +296,7 @@ function publicList() {
     })),
     rules: ["Prices are your net rate - no commission - and include GST.",
       "Book at least 24 hours ahead. Changes close 24 hours before pick-up; inside 24 hours a cancellation is charged in full.",
-      "Night and public-holiday surcharges are added to the price automatically."],
+      "Our partners' own night and public-holiday charges in those cities are included in the price shown."],
   };
 }
 

@@ -185,6 +185,9 @@ module.exports = function installOps(ctx) {
        schema above. */
     await pool.query(`ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS stops TEXT`)
       .catch((e) => console.error("ops: web_bookings.stops:", e.message));
+    /* and the referral code (affiliates.js adds it too) */
+    await pool.query(`ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS aff_code TEXT`)
+      .catch((e) => console.error("ops: web_bookings.aff_code:", e.message));
     /* Agent bookings gained a return leg, hours and the agency's own
        reference (agent-portal.js adds them too); same reasoning. */
     await pool.query(`
@@ -205,7 +208,7 @@ module.exports = function installOps(ctx) {
     to_char(pickup_date, 'YYYY-MM-DD') AS d, pickup_time AS t,
     to_char(return_date, 'YYYY-MM-DD') AS rd, return_time AS rt, return_flight AS rf,
     hire_hours, passenger_name, passenger_phone, passenger_email, flight, address, notes,
-    pax, child_seats, trailer, total_cents, status, balance_cents, stops`;
+    pax, child_seats, trailer, total_cents, status, balance_cents, stops, aff_code`;
   const AGENT_COLS = `a.ref, a.pickup, a.dropoff, a.vehicle,
     to_char(a.pickup_date, 'YYYY-MM-DD') AS d, a.pickup_time AS t,
     a.passenger_name, a.passenger_phone, a.passenger_email, a.flight, a.address, a.notes,
@@ -246,6 +249,7 @@ module.exports = function installOps(ctx) {
       balance: r.balance_cents ? r.balance_cents / 100 : 0,
       isReturn: hasRet,
       needsReview: !!r.needs_review, sourceNote: r.source_note || "",
+      referral: r.aff_code || null,
     };
     const out = [{ ...base, leg: "out", date: r.d, time: r.t, from: r.pickup, to: r.dropoff, flight: r.flight || "", stops: stopList(r.stops) }];
     if (hasRet) out.push({ ...base, stops: [], leg: "ret", date: r.rd, time: r.rt, from: r.dropoff, to: r.pickup, flight: r.rf || "" });

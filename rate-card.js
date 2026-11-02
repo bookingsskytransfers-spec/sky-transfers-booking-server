@@ -15,10 +15,10 @@
  *    card's 10% luxury surcharge. The 21-seat mini bus is bookable on the
  *    card only (Aman: "also make 21 Seater bookable"); the 18-seat Sprinter
  *    has no card price and stays quote only.
- *  - Surcharges (Aman: added automatically): +15% for a pick-up from 10 pm to
- *    5 am, +25% on 25 and 26 December and 1 January, each leg on its own time.
- *    The night one is the card's "Night transfers": it isn't added to hire by
- *    the hour or a charter. Sundays and public holidays: nothing.
+ *  - Surcharges (Aman: added automatically): +25% on 25 and 26 December and
+ *    1 January, each leg on its own date. Sundays and public holidays: nothing.
+ *    The card's +15% "Night transfers" was taken off on 3 Nov 2026 (Aman): Sky
+ *    Transfers charges no after-hours or night surcharge, agents included.
  *  - Cancellation (Aman: the card's policy): free 12 hours or more before;
  *    50% within 12 hours; 100% within 6 hours. See agent-portal.js.
  *  - "Holt Street Wharf" is the cruise terminal place (Pinkenba) - the place
@@ -37,7 +37,7 @@ const VEH = {
   "Mercedes Sprinter 10-Seater": [2, 100], "Mercedes Sprinter 14-Seater": [3, 100], [MINIBUS]: [4, 100],
 };
 const VEHICLES = Object.keys(VEH);
-const NIGHT = 15, FESTIVE = 25;
+const FESTIVE = 25;
 const FESTIVE_DAYS = ["12-25", "12-26", "01-01"];
 const CANCEL = { freeHours: 12, halfHours: 6 };
 const CLOSED_TEXT = "Changes close 12 hours before pick-up. Inside 12 hours a cancellation is charged at 50% of the fare, " +
@@ -89,8 +89,6 @@ module.exports = function rateCard(opts) {
   const base = (p, vehicle) => { const v = VEH[vehicle]; return v && p[v[0]] != null ? Math.round(p[v[0]] * v[1] / 100) : null; };
   function surchargeOf(date, time, night) {
     let pct = 0; const notes = [];
-    const m = /^(\d{1,2}):(\d{2})/.exec(String(time || ""));
-    if (night && m) { const min = +m[1] * 60 + +m[2]; if (min >= 22 * 60 || min < 5 * 60) { pct += NIGHT; notes.push("night +15%"); } }
     if (/^\d{4}-\d{2}-\d{2}$/.test(String(date || "")) && FESTIVE_DAYS.indexOf(String(date).slice(5)) !== -1) { pct += FESTIVE; notes.push("festive +25%"); }
     return { pct, notes };
   }
@@ -192,7 +190,7 @@ module.exports = function rateCard(opts) {
       routes: ROUTES.map((r) => ({ id: r.id, label: r.label, p: r.p })),
       services: SERVICES.map((s) => ({ id: s.id, group: s.group, kind: s.kind, label: s.label, hours: s.hours || null, from: s.from || null, park: s.park || null, p: s.p })),
       hourly: HOURLY,
-      surcharges: ["Night transfers +15% (pick-ups 10 pm to 5 am)", "25 & 26 December and 1 January +25%", "Luxury Sedan and Luxury Minivan +10%"],
+      surcharges: ["25 & 26 December and 1 January +25%", "Luxury Sedan and Luxury Minivan +10%"],
       cancel: ["Free 12 hours or more before pick-up", "50% within 12 hours", "100% within 6 hours or a no-show"],
     };
   }

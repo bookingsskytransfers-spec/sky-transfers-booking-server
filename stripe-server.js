@@ -82,6 +82,8 @@ const BOOKINGS_EMAIL = process.env.BOOKINGS_EMAIL || "info@skytransfers.com.au";
 let portal = null;
 /* ops.js (dispatch) and billing.js (invoices, pay sheet), mounted at the end. */
 let ops = null, billing = null;
+/* affiliates.js (the referral programme), mounted at the end. */
+let affiliates = null;
 const recordBooking = (b, s, status) => {
   if (!portal || !portal.saveWebBooking) return Promise.resolve();
   /* Always resolves. Callers may await it for ordering, but a database
@@ -908,6 +910,11 @@ app.post("/request-booking", async (req, res) => {
        links, and the row has to exist by the time anyone presses one. This
        still swallows its own errors. */
     await recordBooking(full, s, "requested");
+    /* A referral (Recheck: affiliate programme). Unknown or inactive codes are
+       ignored without a word to the guest; only the office email says who
+       referred it. Never allowed to stop the booking. */
+    const aff = affiliates ? await affiliates.resolve(b.referral, b.referralStored, b).catch(() => null) : null;
+    if (aff) await affiliates.tagBooking(b.ref, aff, b);
     const actions = portal && portal.actionLinks ? portal.actionLinks(b.ref) : null;
     const pdf = await bookingPdf(full, s).catch((e) => { console.error("PDF failed:", e.message); return null; });
 
@@ -918,7 +925,7 @@ app.post("/request-booking", async (req, res) => {
       replyTo: b.email,
       subject: `NEW Booking request: ${b.pickup} -> ${b.dropoff} (${b.date} ${b.time}) [${b.ref}]`,
       text: (mismatch ? `!! ${mismatch.note}\n\n` : "") +
-        `NEW BOOKING REQUEST — Sky Transfers website\n\n${s.text}`,
+        `NEW BOOKING REQUEST — Sky Transfers website\n\n` + (aff ? affiliates.officeLine(aff) + "\n" : "") + s.text,
       html: actions ? dispatchHtml(s, actions) : undefined,
       attachments: pdf ? [{ filename: "SkyTransfers-Booking.pdf", content: pdf }] : [],
     });
@@ -1073,6 +1080,8 @@ app.post("/create-checkout", async (req, res) => {
        guarded here is the same one the emails and the database will show. */
     const summary = bookingSummary({ ...b, ref }, fare, seats, trailer, ret);
     const quotedGuard = quoteCheck(b, summary.total);
+    /* resolved now, so only a valid code reaches the webhook */
+    const aff = affiliates ? await affiliates.resolve(b.referral, b.referralStored, b).catch(() => null) : null;
     if (quotedGuard && quotedGuard.total > quotedGuard.quoted) {
       if (mailer) {
         mailer.sendMail({
@@ -1186,6 +1195,7 @@ app.post("/create-checkout", async (req, res) => {
         pu_address: String(b.pickupAddress || "").slice(0, 300),
         do_address: String(b.dropoffAddress || "").slice(0, 300),
         notes: String(b.notes || "").slice(0, 450),
+        affiliate: aff ? aff.code : "",
       },
       success_url: process.env.SUCCESS_URL || "https://www.skytransfers.com.au/?booking=confirmed",
       cancel_url: process.env.CANCEL_URL || "https://www.skytransfers.com.au/?booking=cancelled",
@@ -1351,12 +1361,13 @@ app.post("/stripe-webhook", async (req, res) => {
         .replace(/^Return fare: .*\n/m, "")
         .replace(/TOTAL: \$\d+/, `TOTAL: $${total} (PAID)`) };
       const pdf = await bookingPdf(b, s).catch((e) => { console.error("PDF failed:", e.message); return null; });
+      const aff = affiliates && m.affiliate ? await affiliates.resolve(m.affiliate, null, b).catch(() => null) : null;
       if (mailer) {
         await mailer.sendMail({
           from: `"Sky Transfers Website" <${process.env.GMAIL_USER}>`,
           to: BOOKINGS_EMAIL, replyTo: b.email,
           subject: `PAID booking: ${b.pickup} -> ${b.dropoff} (${b.date} ${b.time}) [${b.ref}]`,
-          text: `PAID BOOKING — Sky Transfers website (Stripe)\n\n${s.text}`,
+          text: `PAID BOOKING — Sky Transfers website (Stripe)\n\n` + (aff ? affiliates.officeLine(aff) + "\n" : "") + s.text,
           attachments: pdf ? [{ filename: "SkyTransfers-Booking.pdf", content: pdf }] : [],
         });
         if (b.email) await mailer.sendMail({
@@ -1370,7 +1381,7 @@ app.post("/stripe-webhook", async (req, res) => {
           attachments: guestAttachments(pdf),
         });
       }
-      recordBooking(b, s, "paid");
+      recordBooking(b, s, "paid").then(() => aff && affiliates.tagBooking(b.ref, aff, b));
       postToZapier(b, s);
     }
     res.json({ received: true });
@@ -1411,6 +1422,18 @@ if (!portal || typeof portal.saveWebBooking !== "function") {
   console.error("FATAL-ISH: agent-portal returned no saveWebBooking - website bookings will NOT be recorded");
 } else {
   console.log("Website booking recorder wired up");
+}
+/* The referral programme (affiliates.js). Wrapped like everything after it:
+   a referral is worth a commission, never a lost booking. */
+try {
+  if (portal && portal.auth) {
+    affiliates = require("./affiliates")({
+      app, pool: portal.pool, requireAdmin: portal.requireAdmin, mailer, BOOKINGS_EMAIL, auth: portal.auth,
+      prices: { seat: CHILD_SEAT_PRICE, trailer: TRAILER_PRICE },
+    });
+  }
+} catch (err) {
+  console.error("Affiliates not mounted (bookings unaffected):", err.message);
 }
 /* The real fare for the Google Ads purchase conversion. Without it every
    booking reports as the conversion action's $1 default. */
