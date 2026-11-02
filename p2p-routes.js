@@ -26,12 +26,12 @@ module.exports = function installP2P(ctx) {
   const {
     app, requireAdmin,
     VEHICLES, VEHICLE_ALIASES, QUOTE_ONLY,
-    SUBURBS, BM_SUBURB, LD_SUBURB, HUB_NAMES,
+    SUBURBS, BM_SUBURB, LD_SUBURB, LD_BNE_RATES, LD_OOL_RATES, HUB_NAMES,
   } = ctx;
 
   const fares = require("./p2p-fare")({
     VEHICLES, VEHICLE_ALIASES, QUOTE_ONLY,
-    SUBURBS, BM_SUBURB, LD_SUBURB, HUB_NAMES,
+    SUBURBS, BM_SUBURB, LD_SUBURB, LD_BNE_RATES, LD_OOL_RATES, HUB_NAMES,
   });
   /* Injectable so the tests can drive every answer Google can give without a
      key and without the network. */

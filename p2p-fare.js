@@ -67,10 +67,26 @@ const OUTER_LOADING = 25;
 const GC_OUTER_ZONES = new Set(["H"]);
 const BM_OUTER_ZONES = new Set(["BW4", "BW5", "BN3", "BN4"]);
 
+/* Day-trip destinations (2 Nov 2026): a regional zone that people visit from
+   a hotel rather than fly into - Australia Zoo at Beerwah. Approved by Aman:
+   Brisbane city to the zoo costs the same as Brisbane Airport to it, the whole
+   Gold Coast costs the same as Gold Coast Airport to it, and the Sunshine
+   Coast hotels are on the Gold Coast ladder by distance. Northside suburbs
+   closer than BRISBANE_LADDER_KM stay on the Brisbane ladder, which is
+   cheaper there; past BRISBANE_FLAT_KM (the far south and west) it is quoted
+   by hand, because one flat fare would undercharge them. The fares
+   themselves are the zone's LD_BNE_RATES / LD_OOL_RATES row, so they cannot
+   drift from the airport fares the suburb page publishes. */
+const DAY_TRIP_ZONES = new Set(["AZ"]);
+const SUNSHINE_COAST_ZONES = new Set(["SC1", "SC2", "SC3", "SC4"]);
+const BRISBANE_LADDER_KM = 65;
+const BRISBANE_FLAT_KM = 95;
+
 module.exports = function makeP2PFare(tables) {
   const {
     VEHICLES, VEHICLE_ALIASES, QUOTE_ONLY,
     SUBURBS, BM_SUBURB, LD_SUBURB, HUB_NAMES,
+    LD_BNE_RATES = {}, LD_OOL_RATES = {},
   } = tables;
 
   const hubs = new Set(HUB_NAMES);
@@ -93,6 +109,36 @@ module.exports = function makeP2PFare(tables) {
       if (BM_SUBURB[s] && BM_OUTER_ZONES.has(BM_SUBURB[s])) return OUTER_LOADING;
     }
     return 0;
+  }
+
+  /* One end in a day-trip zone and the other somewhere we price from. */
+  function dayTrip(a, b) {
+    const za = LD_SUBURB[a], zb = LD_SUBURB[b];
+    if (DAY_TRIP_ZONES.has(za) && !DAY_TRIP_ZONES.has(zb)) return { zone: za, other: b };
+    if (DAY_TRIP_ZONES.has(zb) && !DAY_TRIP_ZONES.has(za)) return { zone: zb, other: a };
+    return null;
+  }
+
+  function dayTripQuote({ zone, other }, km, vi, adder) {
+    const d = Number(km);
+    if (!Number.isFinite(d) || d <= 0) return { fare: null, reason: "no_distance" };
+    const dist = Math.round(d * 10) / 10;
+    const flat = (rates, why) => (rates && rates[vi] != null)
+      ? { fare: rates[vi], reason: null, region: why, km: dist }
+      : { fare: null, reason: "outside_banded_area" };
+    if (SUBURBS[other]) return flat(LD_OOL_RATES[zone], "day_trip_gc");
+    if (BM_SUBURB[other]) {
+      if (dist > BRISBANE_FLAT_KM) return { fare: null, reason: "over_max_km" };
+      if (dist > BRISBANE_LADDER_KM) return flat(LD_BNE_RATES[zone], "day_trip_bne");
+      const row = LADDERS.bne.find(([max]) => dist <= max);
+      return { fare: row[1] + adder, reason: null, region: "bne", band: row[0], base: row[1], adder, loading: 0, km: dist };
+    }
+    if (SUNSHINE_COAST_ZONES.has(LD_SUBURB[other])) {
+      if (dist > MAX_KM) return { fare: null, reason: "over_max_km" };
+      const row = LADDERS.gc.find(([max]) => dist <= max);
+      return { fare: row[1] + adder, reason: null, region: "gc", band: row[0], base: row[1], adder, loading: 0, km: dist };
+    }
+    return { fare: null, reason: "outside_banded_area" };
   }
 
   /* Returns { fare, reason, ... }. fare is a whole number of AUD, or null when
@@ -120,6 +166,9 @@ module.exports = function makeP2PFare(tables) {
        to resolve a coordinate within a few km of a terminal to that hub name,
        since this check can only see the name it is given. */
     if (hubs.has(a) || hubs.has(b)) return { fare: null, reason: "airport_leg_use_computeFare" };
+
+    const trip = dayTrip(a, b);
+    if (trip) return dayTripQuote(trip, km, vi, adder);
 
     const region = regionOf(a, b);
     if (!region) return { fare: null, reason: "outside_banded_area" };

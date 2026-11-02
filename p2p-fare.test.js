@@ -48,6 +48,7 @@ const p2p = makeP2PFare({
   },
   QUOTE_ONLY: new Set(["Mercedes Sprinter 18-Seater"]),
   SUBURBS, BM_SUBURB, LD_SUBURB,
+  LD_BNE_RATES: table("LD_BNE_RATES"), LD_OOL_RATES: table("LD_OOL_RATES"),
   HUB_NAMES: [OOL, BNE, CRUISE],
 });
 
@@ -266,6 +267,36 @@ if (fs.existsSync(faresPath)) {
      To run this cross-check:
        curl -O https://www.skytransfers.com.au/fares.json                     */
   console.log("  (skipped - no fares.json beside the tests; see the note in the source)");
+}
+
+/* ------------------------------------------- day trips to Australia Zoo */
+section("Australia Zoo (Beerwah) day trips");
+{
+  const AZB = table("LD_BNE_RATES").AZ, AZO = table("LD_OOL_RATES").AZ;
+  ok(LD_SUBURB["Beerwah"] === "AZ", "Beerwah is the AZ zone in stripe-server.js");
+  ok(Array.isArray(AZB) && AZB.length === 7 && Array.isArray(AZO) && AZO.length === 7, "AZ has a 7-vehicle row for both airports");
+  for (let i = 0; i < 7; i++) {
+    eq(p2p.fare({ pickupSuburb: "Brisbane CBD", dropoffSuburb: "Beerwah", km: 85.0, vehicle: VEHICLES[i] }), AZB[i],
+      "Brisbane CBD (85 km) -> zoo in a " + VEHICLES[i] + " = the Brisbane Airport fare");
+    eq(p2p.fare({ pickupSuburb: "Beerwah", dropoffSuburb: "Surfers Paradise", km: 152.8, vehicle: VEHICLES[i] }), AZO[i],
+      "zoo -> Surfers (153 km) in a " + VEHICLES[i] + " = the Gold Coast Airport fare");
+  }
+  eq(p2p.fare({ pickupSuburb: "Coomera", dropoffSuburb: "Beerwah", km: 120, vehicle: "Sedan" }), AZO[0], "northern Gold Coast is the same flat Gold Coast fare");
+  eq(p2p.fare({ pickupSuburb: "Caloundra", dropoffSuburb: "Beerwah", km: 21.6, vehicle: "Sedan" }), 110, "Caloundra 21.6 km = Gold Coast ladder $110");
+  eq(p2p.fare({ pickupSuburb: "Mooloolaba", dropoffSuburb: "Beerwah", km: 28.0, vehicle: "People Mover" }), 135, "Mooloolaba 28 km People Mover = 110 + 25");
+  eq(p2p.fare({ pickupSuburb: "Maroochydore", dropoffSuburb: "Beerwah", km: 32.8, vehicle: "Sedan" }), 125, "Maroochydore 32.8 km = $125");
+  eq(p2p.fare({ pickupSuburb: "Noosa Heads", dropoffSuburb: "Beerwah", km: 68.9, vehicle: "Sedan" }), 225, "Noosa 68.9 km = $225");
+  eq(p2p.quote({ pickupSuburb: "Noosa Heads", dropoffSuburb: "Beerwah", km: 90, vehicle: "Sedan" }).reason, "over_max_km", "Sunshine Coast past 85 km is quoted by hand");
+  eq(p2p.fare({ pickupSuburb: "Caboolture", dropoffSuburb: "Beerwah", km: 30, vehicle: "Sedan" }), 125, "a close northside suburb stays on the Brisbane ladder (30 km = $125)");
+  eq(p2p.fare({ pickupSuburb: "Caboolture", dropoffSuburb: "Beerwah", km: 65, vehicle: "Sedan" }), 185, "65.0 km is still the ladder");
+  eq(p2p.fare({ pickupSuburb: "Caboolture", dropoffSuburb: "Beerwah", km: 65.1, vehicle: "Sedan" }), AZB[0], "past 65 km it is the flat Brisbane fare");
+  eq(p2p.quote({ pickupSuburb: "Springwood", dropoffSuburb: "Beerwah", km: 105, vehicle: "Sedan" }).reason, "over_max_km", "far south Brisbane (105 km) is quoted by hand");
+  eq(p2p.quote({ pickupSuburb: "Toowoomba", dropoffSuburb: "Beerwah", km: 160, vehicle: "Sedan" }).reason, "outside_banded_area", "Toowoomba -> zoo is not banded");
+  eq(p2p.quote({ pickupSuburb: "Byron Bay", dropoffSuburb: "Beerwah", km: 240, vehicle: "Sedan" }).reason, "outside_banded_area", "Byron -> zoo is not banded");
+  eq(p2p.quote({ pickupSuburb: BNE, dropoffSuburb: "Beerwah", km: 75, vehicle: "Sedan" }).reason, "airport_leg_use_computeFare", "the airport leg still goes to the zone table");
+  eq(p2p.quote({ pickupSuburb: "Beerwah", dropoffSuburb: "Brisbane CBD", km: 1, vehicle: "Sedan" }).fare, 85, "the page's dry run (km 1) is priceable, so the distance gets fetched");
+  eq(p2p.quote({ pickupSuburb: "Beerwah", dropoffSuburb: "Brisbane CBD", km: 85, vehicle: "Mercedes Sprinter 18-Seater" }).reason, "vehicle_quoted_by_hand", "the 18-seater stays quote-only");
+  eq(p2p.fare({ pickupSuburb: "Caloundra", dropoffSuburb: "Mooloolaba", km: 12, vehicle: "Sedan" }), null, "Sunshine Coast <-> Sunshine Coast is still not banded");
 }
 
 console.log("\n" + (fail === 0 ? "ALL PASS" : "FAILURES") + ": " + pass + " passed, " + fail + " failed");
