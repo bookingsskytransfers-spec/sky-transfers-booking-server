@@ -1360,7 +1360,7 @@ module.exports = function installAgentPortal(ctx) {
         y += 14;
         [
           "Meet & greet — your chauffeur waits at arrivals with a name board",
-          "Flight tracking with 30 minutes' free airport waiting (60 min international at BNE)",
+          "Flight tracking with 30 minutes' free airport waiting (60 min international)",
           "Private vehicle — never shared, never a shuttle",
           "24/7 dispatch on +61 481 437 772",
         ].forEach((t) => {
