@@ -53,13 +53,29 @@ function parseTime(s) {
   return String(h).padStart(2, "0") + ":" + String(min).padStart(2, "0");
 }
 
-function parseVehicle(s, classes) {
+/* pax, when given, sizes a Sprinter the booking doesn't size itself. */
+function parseVehicle(s, classes, pax) {
   const t = String(s || "").toLowerCase();
-  const map = [[/sprinter.*18|18.?seat|mini ?coach/, "Mercedes Sprinter 18-Seater"], [/sprinter.*14|14.?seat|1[2-4][ -]?seat/, "Mercedes Sprinter 14-Seater"],
-    [/sprinter.*10|10.?seat|1[01][ -]?seat/, "Mercedes Sprinter 10-Seater"], [/v.?class|luxury (mini)?van|lux(ury)? people/, "Luxury Minivan"],
-    [/lux(ury)? sedan|lexus|executive|prestige/, "Luxury Sedan"], [/people ?mover|minivan|carnival|van|7 ?seat/, "People Mover"],
+  const ok = (cls) => (!classes || classes.includes(cls) ? cls : "");
+  const sized = [[/sprinter.*18|18.?seat/, "Mercedes Sprinter 18-Seater"], [/sprinter.*14|14.?seat|1[2-4][ -]?seat/, "Mercedes Sprinter 14-Seater"],
+    [/sprinter.*10|10.?seat|1[01][ -]?seat/, "Mercedes Sprinter 10-Seater"]];
+  for (const [re, cls] of sized) if (re.test(t) && ok(cls)) return cls;
+  /* "Sprinter 16 Seater", "Luxury Minibus (13-15 Seats)", "14 Pax Mini
+     Coach", or a bare "Sprinter" with the pax known: the smallest Sprinter
+     that seats them all. Over 18 is a coach or a bigger bus - not one of
+     ours, so it stays as written. A Sprinter of no known size is left for
+     the office, never read as the "van" in "Sprinter van" (Aman, 3 Nov 2026). */
+  if (/sprinter|mini ?bus|mini ?coach/.test(t)) {
+    const m = /(\d{1,2})\s*(?:[-–]|to)?\s*(\d{1,2})?\s*(?:pax|seats?|seater|passengers?)\b/.exec(t);
+    const need = Math.max(m ? +m[1] : 0, +pax > 0 ? +pax : 0);
+    if (need) return ok(need <= 10 ? "Mercedes Sprinter 10-Seater" : need <= 14 ? "Mercedes Sprinter 14-Seater" : need <= 18 ? "Mercedes Sprinter 18-Seater" : "");
+    /* "Mini Coach" was the 18-seater's old name */
+    return /mini ?coach/.test(t) ? ok("Mercedes Sprinter 18-Seater") : "";
+  }
+  const map = [[/v.?class|luxury (mini)?van|lux(ury)? people/, "Luxury Minivan"],
+    [/lux(ury)? sedan|lexus|executive|prestige/, "Luxury Sedan"], [/people ?mover|minivan|carnival|van|\b7 ?seat/, "People Mover"],
     [/suv/, "SUV"], [/sedan|car\b|standard/, "Sedan"]];
-  for (const [re, cls] of map) if (re.test(t) && (!classes || classes.includes(cls))) return cls;
+  for (const [re, cls] of map) if (re.test(t) && ok(cls)) return cls;
   return "";
 }
 

@@ -68,6 +68,10 @@ module.exports = function installOps(ctx) {
      SQL that every Postgres and every test double reads the same way. */
   const inList = (n) => Array.from({ length: n }, (_, i) => "$" + (i + 1)).join(", ");
   const minutesOf = (t) => { const m = /^(\d{1,2}):(\d{2})/.exec(String(t || "")); return m ? +m[1] * 60 + +m[2] : null; };
+  /* Clears Checks that have been answered and fills in vehicle types the
+     job's own words give (board-tidy.js). Never throws into a request. */
+  const tidy = require("./board-tidy")({ pool, VEHICLES, bneToday });
+  const retidy = (ref) => tidy.vehicles([ref]).then(() => tidy.recheck([ref])).catch((e) => console.error("board tidy:", e.message));
 
   /* ---- schema ------------------------------------------------------------ */
   async function initOpsSchema() {
@@ -178,6 +182,15 @@ module.exports = function installOps(ctx) {
       ALTER TABLE ops_dispatch ADD COLUMN IF NOT EXISTS arrive_acc INTEGER;
       ALTER TABLE ops_dispatch ADD COLUMN IF NOT EXISTS arrive_geo TEXT;
       CREATE INDEX IF NOT EXISTS ops_jobs_import_key ON ops_jobs (import_key);
+      -- Road minutes between two addresses, for the clash warnings: looked
+      -- up once per pair (Google Routes, no traffic) and kept, as roads
+      -- don't move.
+      CREATE TABLE IF NOT EXISTS ops_route_minutes (
+        pair      TEXT PRIMARY KEY,
+        minutes   INTEGER,
+        km        NUMERIC(8,1),
+        looked_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
     `);
     /* The board reads web_bookings.stops. agent-portal.js adds that column
        too, but this must not depend on which module's setup ran first. A
@@ -306,15 +319,74 @@ module.exports = function installOps(ctx) {
     return legs;
   }
 
-  /* A warning, never a block: the office knows things the board does not,
-     like a short CBD hop that genuinely fits before an airport run. A
-     transfer is assumed to hold the car for two hours; hourly hire for its
-     hours plus half an hour either side. */
-  function markConflicts(legs) {
-    const span = (l) => {
-      const s = Date.parse(l.date + "T00:00:00Z") / 60000 + (minutesOf(l.time) || 0);
-      return [s, s + (l.hours ? l.hours * 60 + 30 : 120)];
+  /* ---- road minutes, for the clash warnings ----------------------------------
+     The same Routes lookup the point-to-point fares use (no traffic), keyed
+     on a plain spelling of each address and kept in ops_route_minutes, so a
+     pair is only ever looked up once. The board never waits on Google: what
+     isn't known yet is fetched in the background and used from the next
+     refresh, and until then the old two-hour rule applies. */
+  const roads = ctx.routeDistance || require("./route-distance")();
+  const place = (a) => String(a || "").replace(/\[[^\]]*\]|\([^)]*\)/g, " ").replace(/\s+/g, " ").trim().slice(0, 160);
+  const pairOf = (a, b) => (place(a) && place(b) ? (place(a) + "|" + place(b)).toLowerCase() : null);
+  const lookingUp = new Set();
+  const failedAt = new Map();
+  async function routeMinutes(pairs) {
+    const want = [...new Set(pairs.filter(Boolean))], got = new Map();
+    for (let i = 0; i < want.length; i += 200) {
+      const part = want.slice(i, i + 200);
+      const { rows } = await pool.query(`SELECT pair, minutes FROM ops_route_minutes WHERE pair IN (${inList(part.length)})`, part)
+        .catch(() => ({ rows: [] }));
+      for (const r of rows) got.set(r.pair, r.minutes);
+    }
+    return got;
+  }
+  /* A few at a time, never the same pair twice at once, and a pair Google
+     couldn't answer is left alone for six hours. */
+  async function fillRoutes(items) {
+    if (!roads.enabled) return 0;
+    let n = 0;
+    const seen = new Set();
+    for (const { pair, a, b } of items) {
+      if (n >= 25) break;
+      if (seen.has(pair) || lookingUp.has(pair) || (failedAt.get(pair) || 0) > Date.now() - 6 * 3600e3) continue;
+      seen.add(pair); lookingUp.add(pair);
+      try {
+        const r = await roads.distance({ address: place(a) }, { address: place(b) });
+        if (r && r.minutes != null) {
+          await pool.query(
+            `INSERT INTO ops_route_minutes (pair, minutes, km, looked_at) VALUES ($1, $2, $3, now())
+             ON CONFLICT (pair) DO UPDATE SET minutes = EXCLUDED.minutes, km = EXCLUDED.km, looked_at = now()`,
+            [pair, r.minutes, r.km]);
+          n++;
+        } else failedAt.set(pair, Date.now());
+      } catch (e) { failedAt.set(pair, Date.now()); }
+      finally { lookingUp.delete(pair); }
+    }
+    return n;
+  }
+
+  /* A warning, never a block: the office knows things the board does not.
+     With road times known, a transfer holds the driver from pick-up through
+     the free wait at an airport or the cruise terminal (30 min, 60 for an
+     international arrival), the drive and 10 minutes to unload; then they
+     need the drive to the next pick-up. Back-to-back runs that fit are no
+     longer flagged - in October most of the 37 warnings were runs 45-105
+     minutes apart (Aman, 3 Nov 2026). Without road times, and for hourly
+     hire, the old rule: a transfer holds the car two hours, hourly hire its
+     hours plus half an hour. Two finished jobs are never a clash. */
+  function markConflicts(legs, minutes) {
+    const mins = minutes instanceof Map ? minutes : new Map();
+    const startOf = (l) => Date.parse(l.date + "T00:00:00Z") / 60000 + (minutesOf(l.time) || 0);
+    const waitAt = (l) => (/international|\bintl\b/i.test(l.from) ? 60 : /airport|\bbne\b|\bool\b|terminal/i.test(l.from) ? 30 : 0);
+    const clock = (m) => { const x = ((m % 1440) + 1440) % 1440; return String(Math.floor(x / 60)).padStart(2, "0") + ":" + String(x % 60).padStart(2, "0"); };
+    /* when the driver can be at cur's pick-up, or null if the board can't tell */
+    const freeFor = (prev, cur) => {
+      if (prev.hours) return null;
+      const trip = mins.get(pairOf(prev.from, prev.to)), hop = mins.get(pairOf(prev.to, cur.from));
+      if (trip == null || hop == null) return null;
+      return startOf(prev) + waitAt(prev) + trip + 10 + hop;
     };
+    const oldEnd = (l) => startOf(l) + (l.hours ? l.hours * 60 + 30 : 120);
     for (const l of legs) l.conflicts = [];
     for (const field of ["driverId", "vehicleId"]) {
       const groups = new Map();
@@ -323,18 +395,40 @@ module.exports = function installOps(ctx) {
         groups.get(l[field]).push(l);
       }
       for (const list of groups.values()) {
-        list.sort((a, b) => span(a)[0] - span(b)[0]);
+        list.sort((a, b) => startOf(a) - startOf(b));
         for (let i = 1; i < list.length; i++) {
           const prev = list[i - 1], cur = list[i];
-          if (span(cur)[0] < span(prev)[1]) {
+          if (prev.status === "done" && cur.status === "done") continue;
+          const free = freeFor(prev, cur);
+          if (free != null ? startOf(cur) < free : startOf(cur) < oldEnd(prev)) {
             const what = field === "driverId" ? "Driver" : "Vehicle";
-            cur.conflicts.push(`${what} also on ${prev.ref} at ${prev.time}`);
+            cur.conflicts.push(`${what} also on ${prev.ref} at ${prev.time}` + (free != null ? ` - free about ${clock(free)}` : ""));
             prev.conflicts.push(`${what} also on ${cur.ref} at ${cur.time}`);
           }
         }
       }
     }
     return legs;
+  }
+  /* The pairs the clash check reads: each trip, and the hop to the same
+     driver's or car's next pick-up that day or the next. */
+  function pairsFor(legs) {
+    const out = [];
+    const at = (l) => l.date + " " + (l.time || "");
+    for (const field of ["driverId", "vehicleId"]) {
+      const groups = new Map();
+      for (const l of legs) if (l[field] && l.status !== "declined") { if (!groups.has(l[field])) groups.set(l[field], []); groups.get(l[field]).push(l); }
+      for (const list of groups.values()) {
+        list.sort((a, b) => at(a).localeCompare(at(b)));
+        for (let i = 1; i < list.length; i++) {
+          const prev = list[i - 1], cur = list[i];
+          if (prev.hours || (prev.date !== cur.date && prev.date !== addDays(cur.date, -1))) continue;
+          out.push({ pair: pairOf(prev.from, prev.to), a: prev.from, b: prev.to, date: cur.date });
+          out.push({ pair: pairOf(prev.to, cur.from), a: prev.to, b: cur.from, date: cur.date });
+        }
+      }
+    }
+    return out.filter((x) => x.pair);
   }
 
   async function allDrivers() {
@@ -363,7 +457,12 @@ module.exports = function installOps(ctx) {
     const disp = refs.length ? (await pool.query(`SELECT * FROM ops_dispatch WHERE ref IN (${inList(refs.length)})`, refs)).rows : [];
     const drivers = await allDrivers(), vehicles = await allVehicles();
     attachDispatch(legs, disp, drivers, vehicles);
-    markConflicts(legs);
+    const pairs = pairsFor(legs);
+    const minutes = pairs.length ? await routeMinutes(pairs.map((p) => p.pair)) : new Map();
+    markConflicts(legs, minutes);
+    /* only the coming days are worth a lookup - not a month of history */
+    const soon = pairs.filter((p) => !minutes.has(p.pair) && p.date >= bneToday(-1) && p.date <= bneToday(30));
+    if (soon.length) fillRoutes(soon).catch((e) => console.error("route minutes:", e.message));
     legs.sort((a, b) => (a.date + (a.time || "")).localeCompare(b.date + (b.time || "")) || a.ref.localeCompare(b.ref));
     return { legs, drivers, vehicles };
   }
@@ -458,6 +557,8 @@ module.exports = function installOps(ctx) {
         [ref, leg, driverId, vehicleId, pay, status, note, changedDriver]);
       await pool.query(`UPDATE ops_dispatch SET auto_assigned = $3 WHERE ref = $1 AND leg = $2`, [ref, leg, !!(auto && driverId)]);
       console.log("ops assign:", auto ? "(auto)" : "", ref, leg, "driver", driverId || "-", "vehicle", vehicleId || "-", status);
+      /* a driver and car can answer a Check */
+      if (job.source === "account") await retidy(ref);
       return { status, job };
     }
   }
@@ -516,6 +617,7 @@ module.exports = function installOps(ctx) {
         [ref, leg, status]);
       console.log("ops status (office):", ref, leg, status);
       if (hooks.step) hooks.step({ ref, leg, status }).catch((e) => console.error("guest update:", e.message));
+      if (status === "done") await retidy(ref);
       res.json({ ok: true });
     } catch (err) {
       console.error("ops status:", err);
@@ -836,6 +938,7 @@ module.exports = function installOps(ctx) {
       }
       console.log("driver status:", d.name, ref, leg, cur.status, "->", want);
       if (hooks.step) hooks.step({ ref, leg, status: want }).catch((e) => console.error("guest update:", e.message));
+      if (want === "done") await retidy(ref);
       /* A driver turning a job down needs a human straight away. */
       if (want === "declined" && mailer) {
         const job = await legExists(ref, leg);
@@ -856,10 +959,13 @@ module.exports = function installOps(ctx) {
 
   initOpsSchema()
     .then(() => console.log("Ops ready (dispatch board, drivers, vehicles)"))
+    /* the jobs already on the board, once per start: vehicles first, as a
+       class read from the notes answers a vehicle Check */
+    .then(() => tidy.vehicles().then(() => tidy.recheck()).catch((e) => console.error("board tidy:", e.message)))
     .catch((e) => console.error("Ops setup failed:", e.message));
 
   const api = { on: true, boardFor, linkFor, initOpsSchema, legsOf, markConflicts, driverFromToken, allDrivers, allVehicles, bneToday, addDays,
-           assignLeg, legExists, sourceRows, attachDispatch, hooks };
+           assignLeg, legExists, sourceRows, attachDispatch, hooks, tidy, fillRoutes };
   /* Read-only job view for an account's own staff (account-view.js). Its
      own try, so a fault there can never take the board down. */
   try { api.accountView = require("./account-view")(ctx, api); }
