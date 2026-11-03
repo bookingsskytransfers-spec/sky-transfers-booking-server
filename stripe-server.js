@@ -466,7 +466,7 @@ function confirmationContent(b, s) {
     "Free changes and cancellation up to 24 hours before the start time.",
   ] : (isHubPlace(b.pickup) || isHubPlace(b.dropoff)) ? [
     "Meet & greet: at the airport your chauffeur waits in arrivals with a name board.",
-    "We track your flight. 30 minutes' free waiting after landing (60 minutes international at BNE).",
+    "We track your flight. 30 minutes' free waiting after landing (60 minutes for international arrivals).",
     "Free changes and cancellation up to 24 hours before pick-up.",
   ] : [
     "A private car and chauffeur - never shared, never a shuttle.",
