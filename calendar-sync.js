@@ -207,8 +207,17 @@ module.exports = function calendarSync(ctx) {
     const vWords = /seat|coach|bus|van|sprinter|limo|sedan|suv|v-?class|wagon|minivan|car\b/i.test(vRaw) && vRaw.length <= 40;
     /* BusCharter always books the 21-seat minibus (Aman, 21 Oct 2026). */
     const busCharter = /bus\s*charter/i.test((j.account || "") + " " + s + " " + first(L.account));
+    /* the pax sizes a plain "Sprinter"; the notes give the vehicle only when
+       one line, and only one, talks about a vehicle and names one of ours
+       ("5 passengers, Luxury Minivan.") - notes weighing up a coach and a
+       fallback name none. Not "car park" or "caravan"; not child seats. */
+    const sizeBy = paxM ? j.pax : null;
+    const talk = d.split(/\r?\n/).filter((x) => /sprinter|seat|v.?class|minivan|people ?mover|\bsuv\b|\bsedan\b|lexus|coach|\bbus\b|minibus/i.test(x) &&
+      !/child|baby|booster|infant/i.test(x) && !NOT_GIVEN.test(x));
+    const inNotes = talk.length === 1 && !/\+|\bor\b|fallback|instead|alternative/i.test(talk[0]) ? parseVehicle(talk[0], VEHICLES) : "";
     j.vehicle = busCharter ? "21 Seat Mini Bus"
-      : parseVehicle(vLab, VEHICLES) || parseVehicle(vParen, VEHICLES) || parseVehicle(body.join(" "), VEHICLES) || (vWords ? vRaw.slice(0, 80) : "");
+      : parseVehicle(vLab, VEHICLES, sizeBy) || parseVehicle(vParen, VEHICLES, sizeBy) || parseVehicle(body.join(" "), VEHICLES, sizeBy) ||
+        inNotes || (vWords ? vRaw.slice(0, 80) : "");
     if (busCharter) { /* known, assigned by hand as always */ }
     else if (!j.vehicle) checks.push(vRaw ? "vehicle unclear - see the calendar notes" : "no vehicle given");
     else if (VEHICLES.indexOf(j.vehicle) === -1) checks.push(`vehicle "${j.vehicle}" isn't one of our classes - assign it by hand`);
@@ -247,7 +256,9 @@ module.exports = function calendarSync(ctx) {
     if (j.hours && !/bus\s*charter/i.test((j.account || "") + " " + s)) checks.push(`by the hour: ${j.hours} h, from the calendar's ${Math.round(mins / 6) / 10} h`);
 
     if (/\b(time )?tbc\b|\bto be confirmed\b/i.test(s)) checks.push("the calendar says something is still TBC");
-    if (!j.name) checks.push("no passenger name");
+    /* the same rule as the phone below: an agency's job is theirs to name,
+       and the board shouldn't wait on it (Aman, 3 Nov 2026) */
+    if (!j.name) (j.account ? notes : checks).push(j.account ? "passenger name not given" : "no passenger name");
     /* put in the calendar by the AI inbox reader (inbox-ai.js): always a Check */
     if (/^Source: Sky Transfers AI inbox reader/m.test(d)) {
       checks.push("read from an email by the AI - check it against the email");
