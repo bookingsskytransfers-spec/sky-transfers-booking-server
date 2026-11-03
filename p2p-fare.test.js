@@ -274,7 +274,7 @@ section("Australia Zoo (Beerwah) day trips");
 {
   const AZB = table("LD_BNE_RATES").AZ, AZO = table("LD_OOL_RATES").AZ;
   ok(LD_SUBURB["Beerwah"] === "AZ", "Beerwah is the AZ zone in stripe-server.js");
-  ok(Array.isArray(AZB) && AZB.length === 7 && Array.isArray(AZO) && AZO.length === 7, "AZ has a 7-vehicle row for both airports");
+  ok(Array.isArray(AZB) && AZB.length === 8 && Array.isArray(AZO) && AZO.length === 8, "AZ has an 8-vehicle row (18-seater included) for both airports");
   for (let i = 0; i < 7; i++) {
     eq(p2p.fare({ pickupSuburb: "Brisbane CBD", dropoffSuburb: "Beerwah", km: 85.0, vehicle: VEHICLES[i] }), AZB[i],
       "Brisbane CBD (85 km) -> zoo in a " + VEHICLES[i] + " = the Brisbane Airport fare");
