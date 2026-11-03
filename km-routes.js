@@ -71,7 +71,6 @@ module.exports = function installKm(ctx) {
   }
   const fareAt = (km, hub, vehicle) => {
     const name = VEHICLE_ALIASES[vehicle] || vehicle;
-    if (QUOTE_ONLY.has(name)) return null;
     const vi = VEHICLES.indexOf(name);
     if (vi === -1) return null;
     const f = kmFare(km, vi);

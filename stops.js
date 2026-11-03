@@ -65,7 +65,6 @@ module.exports = function makeStops(ctx) {
   }
   const priceFor = (km, vehicle) => {
     const name = VEHICLE_ALIASES[vehicle] || vehicle;
-    if (QUOTE_ONLY.has(name)) return null;
     const vi = VEHICLES.indexOf(name);
     if (vi === -1 || PER_KM[vi] == null) return null;
     return km < 0.5 ? 0 : r5(km * PER_KM[vi]);
