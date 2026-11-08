@@ -5,9 +5,12 @@
  * Competitors in the map pack have 100-2,700 reviews to our 31; a review
  * from every finished trip is the one thing that moves that.
  *
- *   When     reviewDelayH hours (2 by default) after the driver presses
- *            Done, between 08:00 and 20:00 Brisbane - a trip finished at
- *            11 pm is asked the next morning. Never more than 3 days late.
+ *   When     reviewDelayH hours (2 by default) after the driver or the
+ *            office presses Done, between 08:00 and 20:00 Brisbane - a trip
+ *            finished at 11 pm is asked the next morning. Never more than 3
+ *            days late. reviewDelayH 0 = "straight away" (8 Nov 2026): the
+ *            email goes the moment Done is pressed, not on the next 10-minute
+ *            pass.
  *   Who      direct passengers only: website bookings and office jobs with
  *            no account. Agent and account passengers are someone else's
  *            customers. A return trip is asked after the return, not the
@@ -78,7 +81,8 @@ module.exports = function installReviewRequests(ctx) {
     const n = bne();
     if (n.min < SEND_FROM || n.min >= SEND_TO) return { sent: 0, quiet: true };
     const since = s.reviewSince ? new Date(s.reviewSince).getTime() : nowMs();
-    const delay = (s.reviewDelayH || 2) * 3600e3;
+    /* A minute's grace: done_at is the database clock, nowMs() this server's. */
+    const delay = (s.reviewDelayH == null ? 2 : s.reviewDelayH) * 3600e3 - 60e3;
     const board = await ops.boardFor(ops.addDays(n.date, -3), n.date);
     const due = board.legs.filter((l) => {
       const done = l.status === "done" && l.times && l.times.done ? new Date(l.times.done).getTime() : NaN;
@@ -104,13 +108,24 @@ module.exports = function installReviewRequests(ctx) {
     }
     return { sent };
   }
-  let running = false;
+  let running = false, again = false;
   async function tick() {
-    if (running) return; running = true;
-    try { const s = await autopilot.getSettings(); if (s.reviewOn && mailer) await reviewPass(s); }
+    if (running) { again = true; return; } running = true;
+    try {
+      do { again = false; const s = await autopilot.getSettings(); if (s.reviewOn && mailer) await reviewPass(s); } while (again);
+    }
     catch (e) { console.error("review pass:", e.message); }
     finally { running = false; }
   }
+
+  /* Done pressed (driver page or dispatch board): run a pass now rather than
+     waiting for the timer. Chained after guest-updates' hook, never instead. */
+  const prevStep = ops.hooks && ops.hooks.step;
+  if (ops.hooks) ops.hooks.step = (x) => {
+    const p = prevStep ? Promise.resolve().then(() => prevStep(x)) : Promise.resolve();
+    if (x && x.status === "done") setTimeout(() => tick(), ctx.noTimer ? 0 : 3e3);
+    return p;
+  };
 
   /* ---- office: a sample -------------------------------------------------------- */
   const { requireAdmin } = ctx;
