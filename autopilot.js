@@ -155,7 +155,7 @@ module.exports = function installAutopilot(ctx) {
     }
     if ("reviewDelayH" in b) {
       const h = parseInt(b.reviewDelayH, 10);
-      if (!(h >= 1 && h <= 24)) throw { code: 400, message: "Ask for a review 1 to 24 hours after the trip." };
+      if (!(h >= 0 && h <= 24)) throw { code: 400, message: "Ask for a review straight away or 1 to 24 hours after the trip." };
       next.reviewDelayH = h;
     }
     if ("alertTo" in b) {
