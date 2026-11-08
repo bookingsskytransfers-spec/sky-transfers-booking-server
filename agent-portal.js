@@ -362,6 +362,8 @@ module.exports = function installAgentPortal(ctx) {
       "SELECT code, name, email, commission_pct, active, rate_card FROM agents WHERE code = $1", [claim.code]);
     if (!rows.length || !rows[0].active) return res.status(401).json({ error: "This account is no longer active." });
     req.agent = rows[0];
+    /* A booking sent by the agency's own system (booking-api.js) */
+    req.via = claim.via === "API" ? "API" : null;
     /* A staff login is re-checked on every request, so switching someone off
        or resetting their PIN takes effect at once, not when the token expires. */
     if (claim.uid) {
@@ -387,8 +389,8 @@ module.exports = function installAgentPortal(ctx) {
     }).catch((err) => { console.error("agent auth:", err); res.status(500).json({ error: "Could not check your sign-in just now." }); });
   }
   /* "Jane Smith at Nexus Travel (NEXUS)" for a staff login, else the agency. */
-  const whoDid = (req) => (req.user && req.user.id ? `${req.user.name} at ` : "") + `${req.agent.name} (${req.agent.code})`;
-  const bookedByOf = (req) => (req.user && req.user.id ? req.user.name : null);
+  const whoDid = (req) => (req.user && req.user.id ? `${req.user.name} at ` : req.via ? "API, " : "") + `${req.agent.name} (${req.agent.code})`;
+  const bookedByOf = (req) => (req.user && req.user.id ? req.user.name : req.via || null);
 
   const ADMIN_SESSION_MS = 7 * 24 * 3600 * 1000;
   const adminPinVersion = () => crypto.createHmac("sha256", AGENT_SECRET).update("admin-pin:" + String(ADMIN_PIN || "")).digest("base64url").slice(0, 16);

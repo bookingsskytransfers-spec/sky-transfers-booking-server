@@ -1404,6 +1404,11 @@ app.listen(port, () => console.log(`Sky Transfers payment server on :${port}`));
    sits at the end of the file. Needs DATABASE_URL and AGENT_SECRET; without
    them it switches itself off and everything above carries on unchanged.
    --------------------------------------------------------------------- */
+/* Every place an agency can be priced to - the portal's list, and the booking API's. */
+const AGENT_PLACES = [OOL, BNE, CRUISE]
+  .concat(Object.keys(SUBURBS).sort())
+  .concat(Object.keys(BM_SUBURB).sort())
+  .concat(Object.keys(LD_SUBURB).sort());
 portal = require("./agent-portal")({
   app, stripe, computeFare, VEHICLES, leadTimeShortfall, LEAD_TIME_ERROR,
   makeRef, bookingSummary, mailer, BOOKINGS_EMAIL,
@@ -1413,10 +1418,7 @@ portal = require("./agent-portal")({
      point-to-point module mounted further down. */
   bookingPdf, bookingEmailHtml, guestAttachments, fareForBooking, returnLeg, hourlyHours, normaliseAddresses, COMPANY,
   HUB_NAMES: [OOL, BNE, CRUISE],
-  PLACES_FOR_AGENTS: [OOL, BNE, CRUISE]
-    .concat(Object.keys(SUBURBS).sort())
-    .concat(Object.keys(BM_SUBURB).sort())
-    .concat(Object.keys(LD_SUBURB).sort()),
+  PLACES_FOR_AGENTS: AGENT_PLACES,
 });
 /* Loud on purpose. When the portal handed back the wrong thing, bookings
    stopped being recorded and absolutely nothing said so - no row, no error,
@@ -1425,6 +1427,16 @@ if (!portal || typeof portal.saveWebBooking !== "function") {
   console.error("FATAL-ISH: agent-portal returned no saveWebBooking - website bookings will NOT be recorded");
 } else {
   console.log("Website booking recorder wired up");
+}
+/* The booking API for travel partners' own systems (booking-api.js): every
+   request goes through the agent portal's own routes. Wrapped like the rest. */
+try {
+  if (portal && portal.auth) {
+    require("./booking-api")({ app, pool: portal.pool, auth: portal.auth, requireAdmin: portal.requireAdmin,
+      VEHICLES, PLACES: AGENT_PLACES, HUBS: [OOL, BNE, CRUISE] });
+  }
+} catch (err) {
+  console.error("Booking API not mounted (bookings unaffected):", err.message);
 }
 /* The referral programme (affiliates.js). Wrapped like everything after it:
    a referral is worth a commission, never a lost booking. */
