@@ -266,7 +266,13 @@ function computeFare(pickup, dropoff, vehicle) {
 }
 
 /* ---- minimum notice ----------------------------------------------------
-   Six hours, matching the booking form and the FAQ. Enforced here as well as
+   Two hours for the public website since 11 Nov 2026 (it was six) - a trial
+   Aman asked for "until it gets busy", to see whether short-notice bookings
+   come in; the booking form and the FAQ say the same. Agents, the partner
+   portal and the booking API keep six (AGENT_LEAD_HOURS): their terms and
+   the developer guide promise that, and nobody asked to change them.
+   To go back to six for the website, change MIN_LEAD_HOURS here and the
+   wording on the site together. Enforced here as well as
    in the page because the page can be bypassed and because a fare quoted for
    a trip we cannot staff is worse than no quote at all.
    This box runs in Singapore, so local time is useless: Brisbane is UTC+10
@@ -274,19 +280,21 @@ function computeFare(pickup, dropoff, vehicle) {
    A missing or unparseable date is left alone — the form marks both fields
    required, and rejecting a booking over a date format is worse than taking
    it and letting dispatch see it. */
-const MIN_LEAD_HOURS = 6;
+const MIN_LEAD_HOURS = 2;
+const AGENT_LEAD_HOURS = 6;
 const BNE_OFFSET_MS = 10 * 3600 * 1000;
-function leadTimeShortfall(dateStr, timeStr) {
+function leadTimeShortfall(dateStr, timeStr, minHours = MIN_LEAD_HOURS) {
   const d = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateStr || "");
   const t = /^(\d{1,2}):(\d{2})/.exec(timeStr || "");
   if (!d || !t) return null;
   const when = Date.UTC(+d[1], +d[2] - 1, +d[3], +t[1], +t[2]) - BNE_OFFSET_MS;
   const hours = (when - Date.now()) / 3600000;
-  return hours >= MIN_LEAD_HOURS ? null : hours;
+  return hours >= minHours ? null : hours;
 }
-const LEAD_TIME_ERROR =
-  `Online bookings need ${MIN_LEAD_HOURS} hours' notice (Brisbane time). ` +
+const leadTimeErrorFor = (h) =>
+  `Online bookings need ${h} hours' notice (Brisbane time). ` +
   "For a pick-up sooner than that please call +61 481 437 772 — we take same-day transfers whenever a vehicle is free.";
+const LEAD_TIME_ERROR = leadTimeErrorFor(MIN_LEAD_HOURS);
 
 // ---- Booking reference: ST-YYMMDD-XXXX (no confusable characters) ----
 function makeRef(dateStr) {
@@ -1410,7 +1418,9 @@ const AGENT_PLACES = [OOL, BNE, CRUISE]
   .concat(Object.keys(BM_SUBURB).sort())
   .concat(Object.keys(LD_SUBURB).sort());
 portal = require("./agent-portal")({
-  app, stripe, computeFare, VEHICLES, leadTimeShortfall, LEAD_TIME_ERROR,
+  app, stripe, computeFare, VEHICLES,
+  /* agents and the booking API keep six hours' notice (see MIN_LEAD_HOURS) */
+  leadTimeShortfall: (d, t) => leadTimeShortfall(d, t, AGENT_LEAD_HOURS), LEAD_TIME_ERROR: leadTimeErrorFor(AGENT_LEAD_HOURS),
   makeRef, bookingSummary, mailer, BOOKINGS_EMAIL,
   /* So the office can book for a guest, or send a confirmation again, with
      the same branded email and PDF the website sends - not a second version
