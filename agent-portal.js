@@ -2247,7 +2247,12 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
 
       await setWebStatus(r.ref, "confirmed");
 
-      if (mailer && r.passenger_email) {
+      if (r.deposit_pct && mailer && r.passenger_email) {
+        /* a deposit booking: the branded confirmation, which asks for the deposit only */
+        const row = await getWebBooking(r.ref);
+        const b = rowToBooking(row);
+        await emailGuestConfirmation(b, summaryForRow(row, b), payUrl);
+      } else if (mailer && r.passenger_email) {
         await mailer.sendMail({
           from: `"Sky Transfers" <${process.env.GMAIL_USER}>`,
           to: r.passenger_email, replyTo: BOOKINGS_EMAIL,
@@ -2566,6 +2571,70 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
     } catch (err) {
       console.error("resend confirmation:", err);
       res.status(500).json({ error: "Could not send that confirmation." });
+    }
+  });
+
+  /* ---- confirm a website request against a deposit (11 Nov 2026) ----------
+     Until now only a booking the office typed in could take a deposit. A
+     guest who asked online and wants to secure the trip with part of the fare
+     (ST-270215-J6F7, a booking for next year) had no way through: the Confirm
+     button in the dispatch email always sends a link for the whole amount.
+     This turns a requested or confirmed, unpaid website booking into a
+     deposit booking - the same shape the office-made ones have, so the
+     webhook, the balance link, cancel and amend already understand it - and
+     emails the guest the confirmation with the deposit link. Any link for
+     the full fare is switched off. Pressed again with the same percentage it
+     re-sends the same link; with a different one it replaces it. */
+  app.post("/admin/web-booking/deposit", requireAdmin, async (req, res) => {
+    try {
+      if (!mailer) return res.status(500).json({ error: "Email is not configured on the server." });
+      if (!stripe) return res.status(503).json({ error: "Payments are not configured, so a deposit link cannot be made." });
+      const b0 = req.body || {};
+      const ref = String(b0.ref || "").trim();
+      const r = ref ? await getWebBooking(ref) : null;
+      if (!r) return res.status(404).json({ error: "No booking with that reference." });
+      if (r.status === "paid") return res.status(409).json({ error: "That booking is already paid." });
+      if (r.status !== "requested" && r.status !== "confirmed") return res.status(409).json({ error: `That booking was ${r.status} — there is nothing to take a deposit on.` });
+      const depPct = depositPctOf(b0.depositPct == null || b0.depositPct === "" ? 20 : b0.depositPct);
+      if (!depPct) return res.status(400).json({ error: `The deposit has to be between ${DEPOSIT_MIN}% and ${DEPOSIT_MAX}% of the total.` });
+      const dc = depositCents(r.total_cents, depPct);
+      if (dc <= 0 || dc >= (r.total_cents || 0)) return res.status(400).json({ error: "That total is too small to split into a deposit - send a normal payment link instead." });
+      const to = String(b0.to || "").trim() || r.passenger_email || "";
+      if (to && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) return res.status(400).json({ error: "That doesn't look like an email address." });
+
+      const same = r.deposit_pct === depPct && !!r.payment_link_url;
+      if (!same) {
+        await pool.query(
+          `UPDATE web_bookings SET deposit_pct = $2, payment_link_id = NULL, payment_link_url = NULL, link_seq = link_seq + 1
+            WHERE ref = $1 AND status IN ('requested', 'confirmed')`, [ref, depPct]);
+        if (r.payment_link_id) {
+          await stripe.paymentLinks.update(r.payment_link_id, { active: false,
+            inactive_message: "This booking now takes a deposit. Please use the link in your latest email, or call +61 481 437 772." })
+            .catch((e) => console.error("deposit: old link:", e.message));
+        }
+      }
+      await setWebStatus(ref, "confirmed");
+      const row = await getWebBooking(ref);
+      const payUrl = await paymentUrlFor(row);
+      const b = rowToBooking(row);
+      if (to) b.email = to;
+      const s = summaryForRow(row, b);
+      let emailed = null;
+      if (b.email) { await emailGuestConfirmation(b, s, payUrl); emailed = b.email; }
+      mailer.sendMail({
+        from: `"Sky Transfers Website" <${process.env.GMAIL_USER}>`,
+        to: BOOKINGS_EMAIL, replyTo: row.passenger_email || undefined,
+        subject: `CONFIRMED with a ${depPct}% deposit ($${s.depositDue}): ${row.pickup} -> ${row.dropoff} [${ref}]`,
+        text: `Confirmed from the admin page against a deposit.\n\n${s.text}\n\nDeposit link ($${s.depositDue}, ${depPct}%): ${payUrl}\n` +
+              (emailed ? `Emailed to ${emailed}.\n` : "No email address on the booking - send the link yourself.\n") +
+              (r.payment_link_id && !same ? "The earlier payment link has been switched off.\n" : "") +
+              `\nThe $${s.total - s.depositDue} balance is NOT requested automatically - send it from the admin page (Web bookings > Send balance link) when you're ready.\n`,
+      }).catch((e) => console.error("deposit office copy:", e.message));
+      console.log("website booking confirmed with deposit:", ref, depPct + "%", "$" + s.depositDue, emailed ? "emailed" : "no guest email", same ? "(same link)" : "");
+      res.json({ ok: true, ref, total: s.total, deposit: s.depositDue, depositPct: depPct, balance: s.total - s.depositDue, payUrl, emailed, resent: same });
+    } catch (err) {
+      console.error("web booking deposit:", err);
+      res.status(500).json({ error: "Could not set up that deposit." });
     }
   });
 
