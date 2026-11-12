@@ -53,10 +53,19 @@ function parseTime(s) {
   return String(h).padStart(2, "0") + ":" + String(min).padStart(2, "0");
 }
 
+/* Classes the dispatch board knows that the website does not sell (12 Nov
+   2026): the 21-seat mini bus (the same name the agent rate card uses) and
+   the 53-seat coach. They are only ever returned to a caller whose own class
+   list contains them - the board and the calendar reader - so the website,
+   the fare tables and the email reader keep reading the eight they sell. */
+const MINIBUS = "21 Seat Mini Bus", COACH = "Coach";
+const FLEET_EXTRA = [MINIBUS, COACH];
+
 /* pax, when given, sizes a Sprinter the booking doesn't size itself. */
 function parseVehicle(s, classes, pax) {
   const t = String(s || "").toLowerCase();
   const ok = (cls) => (!classes || classes.includes(cls) ? cls : "");
+  const has = (cls) => !!classes && classes.includes(cls);
   const sized = [[/sprinter.*18|18.?seat/, "Mercedes Sprinter 18-Seater"], [/sprinter.*14|14.?seat|1[2-4][ -]?seat/, "Mercedes Sprinter 14-Seater"],
     [/sprinter.*10|10.?seat|1[01][ -]?seat/, "Mercedes Sprinter 10-Seater"]];
   for (const [re, cls] of sized) if (re.test(t) && ok(cls)) return cls;
@@ -68,9 +77,21 @@ function parseVehicle(s, classes, pax) {
   if (/sprinter|mini ?bus|mini ?coach/.test(t)) {
     const m = /(\d{1,2})\s*(?:[-–]|to)?\s*(\d{1,2})?\s*(?:pax|seats?|seater|passengers?)\b/.exec(t);
     const need = Math.max(m ? +m[1] : 0, +pax > 0 ? +pax : 0);
+    /* 19 to 21 is the mini bus, when the words say mini bus or state the seats;
+       a bare "Sprinter" for 20 people is still left for the office */
+    if (need > 18 && need <= 21 && has(MINIBUS) && (/mini ?bus/.test(t) || (m && +m[1] >= 19))) return MINIBUS;
     if (need) return ok(need <= 10 ? "Mercedes Sprinter 10-Seater" : need <= 14 ? "Mercedes Sprinter 14-Seater" : need <= 18 ? "Mercedes Sprinter 18-Seater" : "");
     /* "Mini Coach" was the 18-seater's old name */
     return /mini ?coach/.test(t) ? ok("Mercedes Sprinter 18-Seater") : "";
+  }
+  /* "21 seater"; then the coach, only when the words name a vehicle - "53
+     seater coach", "45 pax coach", "48 seat bus", or a label that is just
+     "Coach" - never the "coach" in "Coach Terminal" or "coach bay 3". */
+  if (has(MINIBUS) && /\b(19|2[01])[ -]?(seats?|seater)\b/.test(t)) return MINIBUS;
+  if (has(COACH)) {
+    const big = /\b(\d{2})[ -]?(?:seats?|seater|pax)\s+(?:luxury\s+|full[- ]?size\s+)?(?:coach|bus)\b/.exec(t);
+    if ((big && +big[1] >= 22) || /\b5[0-7][ -]?(seats?|seater)\b/.test(t) ||
+        /^\s*(\d+\s*x\s*)?((full[- ]?size|large|luxury|big)\s+)?coach(\s+bus)?\s*$/.test(t)) return COACH;
   }
   const map = [[/v.?class|luxury (mini)?van|lux(ury)? people/, "Luxury Minivan"],
     [/lux(ury)? sedan|lexus|executive|prestige/, "Luxury Sedan"], [/people ?mover|minivan|carnival|van|\b7 ?seat/, "People Mover"],
@@ -141,4 +162,4 @@ function parseBookingEmail({ subject, text, classes }) {
   return { ok: true, job: j, checks };
 }
 
-module.exports = { parseBookingEmail, parseDate, parseTime, parseVehicle, KEYS };
+module.exports = { parseBookingEmail, parseDate, parseTime, parseVehicle, KEYS, FLEET_EXTRA };
