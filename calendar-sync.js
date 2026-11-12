@@ -28,6 +28,8 @@ const { parseVehicle, KEYS } = require("./intake-parse");
 
 module.exports = function calendarSync(ctx) {
   const { app, pool, requireAdmin, makeRef, VEHICLES, logEvent, alert, nowMs, BOARD } = ctx;
+  /* the classes a job's vehicle is read as: the board's, which add the mini bus and the coach */
+  const FLEET = ctx.FLEET_CLASSES || VEHICLES;
   const fetchIcs = typeof ctx.fetchIcs === "function" ? ctx.fetchIcs : async () => {
     const r = await fetch(process.env.GCAL_ICS_URL, { headers: { "user-agent": "SkyTransfers-dispatch/1" } });
     if (!r.ok) throw new Error("the calendar address answered " + r.status);
@@ -214,13 +216,13 @@ module.exports = function calendarSync(ctx) {
     const sizeBy = paxM ? j.pax : null;
     const talk = d.split(/\r?\n/).filter((x) => /sprinter|seat|v.?class|minivan|people ?mover|\bsuv\b|\bsedan\b|lexus|coach|\bbus\b|minibus/i.test(x) &&
       !/child|baby|booster|infant/i.test(x) && !NOT_GIVEN.test(x));
-    const inNotes = talk.length === 1 && !/\+|\bor\b|fallback|instead|alternative/i.test(talk[0]) ? parseVehicle(talk[0], VEHICLES) : "";
+    const inNotes = talk.length === 1 && !/\+|\bor\b|fallback|instead|alternative/i.test(talk[0]) ? parseVehicle(talk[0], FLEET) : "";
     j.vehicle = busCharter ? "21 Seat Mini Bus"
-      : parseVehicle(vLab, VEHICLES, sizeBy) || parseVehicle(vParen, VEHICLES, sizeBy) || parseVehicle(body.join(" "), VEHICLES, sizeBy) ||
+      : parseVehicle(vLab, FLEET, sizeBy) || parseVehicle(vParen, FLEET, sizeBy) || parseVehicle(body.join(" "), FLEET, sizeBy) ||
         inNotes || (vWords ? vRaw.slice(0, 80) : "");
     if (busCharter) { /* known, assigned by hand as always */ }
     else if (!j.vehicle) checks.push(vRaw ? "vehicle unclear - see the calendar notes" : "no vehicle given");
-    else if (VEHICLES.indexOf(j.vehicle) === -1) checks.push(`vehicle "${j.vehicle}" isn't one of our classes - assign it by hand`);
+    else if (FLEET.indexOf(j.vehicle) === -1) checks.push(`vehicle "${j.vehicle}" isn't one of our classes - assign it by hand`);
     const many = /\b(\d+)\s*x\s+[a-z]/i.exec(vLab + " " + s) || /\b(\d+)\s+vehicles\b/i.exec(s + " " + d);
     if (many && +many[1] > 1) checks.push(`needs ${many[1]} vehicles - the board holds it as one job; add the others by hand`);
     /* With a vehicle the driver knows what to bring; without one the office

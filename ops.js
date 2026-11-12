@@ -29,6 +29,10 @@
  */
 module.exports = function installOps(ctx) {
   const { app, pool, requireAdmin, VEHICLES, makeRef, mailer, BOOKINGS_EMAIL } = ctx;
+  /* What a fleet vehicle or a board job can be: the website's classes plus the
+     two the board alone knows - the 21-seat mini bus and the 53-seat coach
+     (12 Nov 2026). Nothing here prices or sells them. */
+  const FLEET_CLASSES = (VEHICLES || []).concat(require("./intake-parse").FLEET_EXTRA.filter((c) => !(VEHICLES || []).includes(c)));
   if (!app || !pool || typeof requireAdmin !== "function") {
     console.log("Ops off (needs the agent portal's database and admin login)");
     return { on: false };
@@ -70,7 +74,7 @@ module.exports = function installOps(ctx) {
   const minutesOf = (t) => { const m = /^(\d{1,2}):(\d{2})/.exec(String(t || "")); return m ? +m[1] * 60 + +m[2] : null; };
   /* Clears Checks that have been answered and fills in vehicle types the
      job's own words give (board-tidy.js). Never throws into a request. */
-  const tidy = require("./board-tidy")({ pool, VEHICLES, bneToday });
+  const tidy = require("./board-tidy")({ pool, VEHICLES: FLEET_CLASSES, bneToday });
   const retidy = (ref) => tidy.vehicles([ref]).then(() => tidy.recheck([ref])).catch((e) => console.error("board tidy:", e.message));
 
   /* ---- schema ------------------------------------------------------------ */
@@ -495,7 +499,7 @@ module.exports = function installOps(ctx) {
       if (to < from) to = from;
       if (to > addDays(from, 31)) to = addDays(from, 31);
       const b = await boardFor(from, to);
-      res.json({ from, to, today: bneToday(0), jobs: b.legs, drivers: b.drivers, vehicles: b.vehicles, vehicleClasses: VEHICLES || [] });
+      res.json({ from, to, today: bneToday(0), jobs: b.legs, drivers: b.drivers, vehicles: b.vehicles, vehicleClasses: FLEET_CLASSES });
     } catch (err) {
       console.error("ops jobs:", err);
       res.status(500).json({ error: "Could not load the jobs." });
@@ -748,7 +752,7 @@ module.exports = function installOps(ctx) {
       const b = req.body || {};
       const label = txt(b.label, 120);
       if (!label) return res.status(400).json({ error: "Give the vehicle a name, e.g. \"Kia Carnival - white\"." });
-      const cls = (VEHICLES || []).includes(b.class) ? b.class : "";
+      const cls = FLEET_CLASSES.includes(b.class) ? b.class : "";
       const vals = [label, cls, txt(b.rego, 20) || null, b.seats ? int(b.seats, 1, 60, null) : null,
         b.ownerDriverId ? int(b.ownerDriverId, 1, 1e9, null) : null,
         isoDate(b.regoExpiry), isoDate(b.insuranceExpiry), isoDate(b.serviceDue),
@@ -964,7 +968,7 @@ module.exports = function installOps(ctx) {
     .then(() => tidy.vehicles().then(() => tidy.recheck()).catch((e) => console.error("board tidy:", e.message)))
     .catch((e) => console.error("Ops setup failed:", e.message));
 
-  const api = { on: true, boardFor, linkFor, initOpsSchema, legsOf, markConflicts, driverFromToken, allDrivers, allVehicles, bneToday, addDays,
+  const api = { on: true, fleetClasses: FLEET_CLASSES, boardFor, linkFor, initOpsSchema, legsOf, markConflicts, driverFromToken, allDrivers, allVehicles, bneToday, addDays,
            assignLeg, legExists, sourceRows, attachDispatch, hooks, tidy, fillRoutes };
   /* Read-only job view for an account's own staff (account-view.js). Its
      own try, so a fault there can never take the board down. */

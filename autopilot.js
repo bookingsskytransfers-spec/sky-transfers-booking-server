@@ -206,7 +206,8 @@ module.exports = function installAutopilot(ctx) {
   }
 
   /* The Google Calendar, read on every pass when it is switched on. */
-  const cal = require("./calendar-sync")({ app, pool, requireAdmin, makeRef, VEHICLES, logEvent, alert, nowMs, BOARD, fetchIcs: ctx.fetchIcs });
+  /* the calendar reader reads the board's classes (mini bus and coach too); the email reader below keeps the website's */
+  const cal = require("./calendar-sync")({ app, pool, requireAdmin, makeRef, VEHICLES, FLEET_CLASSES: (ops && ops.fleetClasses) || VEHICLES, logEvent, alert, nowMs, BOARD, fetchIcs: ctx.fetchIcs });
   const inbox = require("./inbox-ai")({ pool, logEvent, alert, nowMs, BOARD, VEHICLES, claim, insertOnce, senderVerified,
     fetch: ctx.aiFetch, anthropic: ctx.anthropic });
 
