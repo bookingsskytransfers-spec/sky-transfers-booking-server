@@ -636,7 +636,19 @@ function bookingEmailHtml(b, s) {
         <tr><td style="${cellL}background:#F6EED9;padding-top:12px;padding-bottom:12px;">Total (AUD, GST incl.)</td>
             <td style="${cellR}background:#F6EED9;font:700 22px Arial,sans-serif;color:#141D30;">$${c.total}</td></tr>
         <tr><td style="${cellL}">Status</td><td style="${cellR}font-weight:700;color:${c.state === "paid" ? "#1E7F4F" : c.state === "request" ? "#68707F" : "#9C6A0E"};">${esc(c.status)}</td></tr>`;
-  const greeting = c.state === "deposit_due"
+  /* s.updated: the office changed the date, time or passenger details and the
+     price stayed as it was - say what changed, not "payment received" again. */
+  const upd = s.updated ? `Your booking has been updated: ${esc(s.updated)}. ` : "";
+  const greeting = upd
+    ? upd + (c.state === "deposit_due"
+        ? `The price is unchanged. Pay the $${s.depositDue} deposit below to secure it — this link replaces the earlier one. Your updated confirmation is attached.`
+        : paid && s.balance
+        ? (s.payUrl ? `The price is unchanged. The $${s.balance} balance can still be paid below. Your updated confirmation is attached.`
+                    : `The price is unchanged: $${s.total - s.balance} is paid and the $${s.balance} balance is paid later — we'll send you a secure link for it. Your updated confirmation is attached.`)
+        : paid
+        ? "The price is unchanged and there is nothing more to pay. Your updated confirmation is attached."
+        : "The price is unchanged. Your updated confirmation is attached" + (s.payUrl ? " — pay below to secure it; this link replaces the earlier one." : "."))
+    : c.state === "deposit_due"
     ? `Your booking is confirmed. Pay the $${s.depositDue} deposit below to secure it — the $${s.total - s.depositDue} balance is paid later, and we'll send you a link for it. Your printable confirmation is attached.`
     : c.state === "deposit_paid"
     ? (s.payUrl ? `Thank you for your deposit. The $${s.balance} balance for your booking can now be paid below. Your confirmation is attached.`

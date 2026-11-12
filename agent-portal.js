@@ -2347,7 +2347,12 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
     /* a deposit booking: deposit due, deposit paid, or its balance link */
     const dep = s.deposit && !s.refund ? (s.depositDue && !b.paid ? "due" : b.paid && s.balance ? (payUrl ? "balance" : "paid") : null) : null;
     const paidSoFar = s.balance ? s.total - s.balance : 0;
-    const subject = dep === "due" ? `Booking confirmed — $${s.depositDue} deposit to pay — Sky Transfers · ${b.ref}`
+    /* s.updated: an office amendment that left the price alone (what changed, in words) */
+    const upd = s.updated ? `Your booking has been updated: ${s.updated}.` : "";
+    const subject = upd ? (dep === "due" ? `Booking updated — $${s.depositDue} deposit to pay — Sky Transfers · ${b.ref}`
+                          : s.balance && payUrl ? `Booking updated — $${s.balance} balance to pay — Sky Transfers · ${b.ref}`
+                          : `Booking updated — Sky Transfers · ${b.ref}`)
+                  : dep === "due" ? `Booking confirmed — $${s.depositDue} deposit to pay — Sky Transfers · ${b.ref}`
                   : dep === "balance" ? `Balance due — $${s.balance} — Sky Transfers · ${b.ref}`
                   : dep === "paid" ? `Booking confirmed — deposit paid — Sky Transfers · ${b.ref}`
                   : s.balance ? `Booking updated — $${s.balance} balance to pay — Sky Transfers · ${b.ref}`
@@ -2355,7 +2360,19 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
                   : b.paid ? `Booking confirmed & paid — Sky Transfers · ${b.ref}`
                   : b.confirmed ? `Booking confirmed — Sky Transfers · ${b.ref}`
                   : `Booking request received — Sky Transfers · ${b.ref}`;
-    const opening = dep === "due"
+    const opening = upd
+      ? upd + " " + (dep === "due"
+          ? `The price is unchanged. To secure the booking, please pay the $${s.depositDue} deposit (${s.depositPct}% of the $${s.total} total) here - this link replaces the earlier one:\n${payUrl || ""}\n\n` +
+            `The $${s.total - s.depositDue} balance is paid later - we'll send you a link for it. Your updated confirmation is attached.`
+          : s.balance && payUrl
+          ? `The price is unchanged. The $${s.balance} balance can still be paid securely here:\n${payUrl}\n\nYour updated confirmation is attached.`
+          : s.balance
+          ? `The price is unchanged: $${paidSoFar} is paid and the $${s.balance} balance is paid later - we'll send you a secure link for it. Your updated confirmation is attached.`
+          : b.paid
+          ? "The price is unchanged and there is nothing more to pay. Your updated confirmation is attached."
+          : "The price is unchanged. Your updated confirmation is attached" +
+            (payUrl ? `, and you can pay securely here - this link replaces the earlier one:\n${payUrl}` : "."))
+      : dep === "due"
       ? `Your booking is confirmed. To secure it, please pay the $${s.depositDue} deposit (${s.depositPct}% of the $${s.total} total) here:\n${payUrl || ""}\n\n` +
         `The $${s.total - s.depositDue} balance is paid later - we'll send you a link for it. Your printable confirmation is attached.`
       : dep === "balance"
@@ -2385,10 +2402,63 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
     });
   }
 
+  /* ---- an office amendment that leaves the price alone (12 Nov 2026) ------
+     Changing a pick-up time used to re-price the whole booking from today's
+     fare table and send the guest the "confirmed and paid" email again with
+     a fare breakdown. The price is built from the route, the vehicle, child
+     seats, the trailer, a return leg, stops and hire hours - nothing else -
+     so when none of those moved the stored total stands: no pricing, no
+     refund, no balance link, and the guest is told what changed. */
+  const flat = (v) => String(v == null ? "" : v).trim().replace(/\s+/g, " ").toLowerCase();
+  const stopKey = (x) => (Array.isArray(x && x.stops) ? x.stops : [])
+    .map((st) => flat(st && (st.address || st.suburb))).filter(Boolean).join("|");
+  /* the street addresses as a set, so a booking from before the two ends were
+     stored separately compares equal to the same address in either box */
+  const addrKey = (x) => {
+    const parts = [flat(x && x.pickupAddress), flat(x && x.dropoffAddress)].filter(Boolean);
+    return (parts.length ? parts : [flat(x && x.address)].filter(Boolean)).sort().join("|");
+  };
+  function samePriceInputs(was, b) {
+    return was.pickup === b.pickup && was.dropoff === b.dropoff && was.vehicle === b.vehicle
+      && (parseInt(was.childSeats, 10) || 0) === (parseInt(b.childSeats, 10) || 0)
+      && !!was.trailer === !!b.trailer
+      && !!was.returnDate === !!b.returnDate
+      && (hoursOf(was) || 0) === (hoursOf(b) || 0)
+      && stopKey(was) === stopKey(b)
+      /* stops are priced by the extra distance, which starts from the addresses */
+      && (!stopKey(was) || addrKey(was) === addrKey(b));
+  }
+  const niceDate = (iso) => {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso || ""));
+    if (!m) return String(iso || "-");
+    const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]));
+    return ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][d.getUTCDay()] + " " + (+m[3]) + " " +
+      ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][+m[2] - 1] + " " + m[1];
+  };
+  /* What the guest would notice, in plain words. Only dates, times and the
+     head count are quoted; anything the office typed is named, not repeated. */
+  function amendChanges(was, b) {
+    const t5 = (v) => String(v || "").slice(0, 5) || "-";
+    const out = [];
+    if (was.date !== b.date) out.push(`pick-up date changed from ${niceDate(was.date)} to ${niceDate(b.date)}`);
+    if (t5(was.time) !== t5(b.time)) out.push(`pick-up time changed from ${t5(was.time)} to ${t5(b.time)}`);
+    if (was.returnDate && b.returnDate) {
+      if (was.returnDate !== b.returnDate) out.push(`return date changed from ${niceDate(was.returnDate)} to ${niceDate(b.returnDate)}`);
+      if (t5(was.returnTime) !== t5(b.returnTime)) out.push(`return pick-up time changed from ${t5(was.returnTime)} to ${t5(b.returnTime)}`);
+    }
+    if (flat(was.flight) !== flat(b.flight)) out.push("flight details updated");
+    if (flat(was.returnFlight) !== flat(b.returnFlight)) out.push("return flight details updated");
+    if ((parseInt(was.pax, 10) || 1) !== (parseInt(b.pax, 10) || 1)) out.push(`passengers changed from ${parseInt(was.pax, 10) || 1} to ${parseInt(b.pax, 10) || 1}`);
+    if (flat(was.name) !== flat(b.name) || flat(was.phone) !== flat(b.phone) || flat(was.email) !== flat(b.email)) out.push("contact details updated");
+    if (addrKey(was) !== addrKey(b)) out.push("address updated");
+    if (flat(was.notes) !== flat(b.notes)) out.push("notes updated");
+    return out;
+  }
+
   /* The office form, parsed, validated and priced - shared by create and
      amend so the two can never disagree about what a valid booking is.
      Sends the refusal itself and returns null when the form is not usable. */
-  async function parseOfficeBooking(b0, res) {
+  async function parseOfficeBooking(b0, res, keepPrice) {
     const b = {
       pickup: String(b0.pickup || "").trim(), dropoff: String(b0.dropoff || "").trim(),
       vehicle: String(b0.vehicle || "").trim(), date: isoDate(b0.date), time: hhmm(b0.time),
@@ -2442,6 +2512,13 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
     }
     const override = Math.round(Number(b0.overrideTotal));
     const hasOverride = Number.isFinite(override) && override > 0;
+    /* An amendment that changed nothing the price is built from: the stored
+       total stands, so there is nothing to price - and an agreed price or an
+       older fare is never swapped for today's list price by a time change.
+       Typing a total in the override box still wins. */
+    if (!hasOverride && typeof keepPrice === "function" && keepPrice(b)) {
+      return { b, ret, fare: null, override, hasOverride, priceKept: true };
+    }
     /* The two ends must be places we price - a suburb or airport from the
        list - unless the office is naming its own total. A street address
        belongs in the exact-address field, not here. */
@@ -2783,25 +2860,40 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
       if (r.status === "cancelled") return res.status(409).json({ error: "That booking was cancelled — make a new booking instead." });
       const wasPaid = r.status === "paid";
       const manual = b0.manualMoney === true || b0.manualMoney === "true";
-      const parsed = await parseOfficeBooking(b0, res);
+      const was = rowToBooking(r);
+      const parsed = await parseOfficeBooking(b0, res, (nb) => r.total_cents > 0 && samePriceInputs(was, nb));
       if (!parsed) return;
       const { b, ret, fare, override, hasOverride } = parsed;
+      /* true when only the date, time, flight, passengers, contact details,
+         address or notes changed - see samePriceInputs */
+      const priceKept = parsed.priceKept === true;
+      const changes = amendChanges(was, b);
       b.ref = ref;
       b.paid = wasPaid;
       b.confirmed = r.status === "confirmed" || wasPaid;
-      const s = bookingSummary(b, hasOverride ? 0 : fare, b.childSeats, b.trailer, ret);
-      if (hasOverride) s.total = override;
-      s.text = s.text
-        .replace(/^Fare: \$0 (one-way|for \d+ hours.*)\n/m, "")
-        .replace(/^Return fare: \$0 .*\n/m, "")
-        .replace(/TOTAL: \$\d+/, "TOTAL: $" + s.total + (wasPaid ? " (PAID)" : hasOverride ? " (agreed price)" : ""));
+      let s;
+      if (priceKept) {
+        /* the stops keep what was charged for them */
+        const j = stopsOf(r);
+        if (j) { b.stops = j.list; b.stopsExtra = j.extra || 0; b.stopsKm = j.km; }
+        /* the row's own total, balance and deposit - never a recomputation */
+        s = summaryForRow(r, b);
+        if (changes.length) s.updated = changes.join("; ");
+      } else {
+        s = bookingSummary(b, hasOverride ? 0 : fare, b.childSeats, b.trailer, ret);
+        if (hasOverride) s.total = override;
+        s.text = s.text
+          .replace(/^Fare: \$0 (one-way|for \d+ hours.*)\n/m, "")
+          .replace(/^Return fare: \$0 .*\n/m, "")
+          .replace(/TOTAL: \$\d+/, "TOTAL: $" + s.total + (wasPaid ? " (PAID)" : hasOverride ? " (agreed price)" : ""));
+      }
       const wasCents = r.total_cents || 0;
       const oldLink = wasPaid ? null : (r.payment_link_id || null);
-      const newCents = Math.round(s.total * 100);
+      const newCents = priceKept ? wasCents : Math.round(s.total * 100);
       /* What the guest has actually paid: the old total less any balance
          still outstanding from an earlier amendment. */
       const paidCents = wasPaid ? wasCents - (r.balance_cents || 0) : 0;
-      const diff = wasPaid ? newCents - paidCents : 0;
+      const diff = priceKept ? 0 : wasPaid ? newCents - paidCents : 0;
       let refundId = null;
       if (wasPaid && diff < 0 && !manual) {
         if (!stripe) return res.status(503).json({ error: "Payments are not configured, so the difference cannot be refunded automatically.", needsManual: true });
@@ -2825,7 +2917,9 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
            address = $11, notes = $12, pax = $13, child_seats = $14, trailer = $15,
            total_cents = $16, return_date = $17, return_time = $18, return_flight = $19,
            stops = $20, hire_hours = $21, pu_address = $22, do_address = $23,
-           balance_cents = 0, balance_link_id = NULL, balance_link_url = NULL, deposit_pct = $24` +
+           deposit_pct = $24` +
+        /* A change that left the price alone leaves a balance owing, and its link, alone too. */
+        (priceKept ? "" : ", balance_cents = 0, balance_link_id = NULL, balance_link_url = NULL") +
         /* An unpaid booking's link is replaced; a paid one keeps its payment history. */
         (wasPaid ? "" : ", payment_link_id = NULL, payment_link_url = NULL, link_seq = link_seq + 1") +
         ` WHERE ref = $1`,
@@ -2835,7 +2929,7 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
          b.pickupAddress || null, b.dropoffAddress || null, depPct]);
 
       /* An earlier balance link, if any, is now wrong - switch it off. */
-      if (r.balance_link_id && stripe) {
+      if (r.balance_link_id && stripe && !priceKept) {
         await stripe.paymentLinks.update(r.balance_link_id, { active: false,
           inactive_message: "This booking has been updated again. Please use the link in your latest email, or call +61 481 437 772." })
           .catch((e) => console.error("amend: old balance link:", e.message));
@@ -2847,7 +2941,10 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
         }).catch((e) => console.error("amend: old link:", e.message));
       }
       let payUrl = null;
-      if (wasPaid && depPct && diff > 0 && !manual && !r.balance_link_id) {
+      if (priceKept && wasPaid) {
+        /* no money moved: a balance already asked for keeps the link it has */
+        payUrl = balanceUrlFor(r);
+      } else if (wasPaid && depPct && diff > 0 && !manual && !r.balance_link_id) {
         /* A deposit booking whose balance has not been asked for yet: the new
            balance is recorded, and asking for it stays the office's call. */
         await pool.query(`UPDATE web_bookings SET balance_cents = $2 WHERE ref = $1`, [ref, diff]);
@@ -2865,7 +2962,7 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
       } else if (b.confirmed && stripe) {
         payUrl = await paymentUrlFor(await getWebBooking(ref)).catch((e) => { console.error("amend pay link:", e.message); return null; });
       }
-      if (depPct) addDeposit(s, { total_cents: newCents, deposit_pct: depPct, balance_link_url: s.balance && payUrl ? payUrl : null }, wasPaid);
+      if (depPct && !priceKept) addDeposit(s, { total_cents: newCents, deposit_pct: depPct, balance_link_url: s.balance && payUrl ? payUrl : null }, wasPaid);
       /* A request that is not confirmed yet is not re-sent: confirming it is
          still the dispatch email's job, and that email carries the new figures. */
       let emailed = null;
@@ -2876,6 +2973,8 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
         subject: `OFFICE amended: ${b.pickup} -> ${b.dropoff} (${b.date} ${b.time}) [${ref}] now $${s.total}` +
                  (s.refund ? ` ($${s.refund} refunded)` : s.balance && payUrl ? ` ($${s.balance} balance link sent)` : s.balance ? ` ($${s.balance} balance owing)` : ""),
         text: `OFFICE AMENDMENT - changed from the admin page\nWas $${Math.round(wasCents / 100)}, now $${s.total}.\n` +
+              (priceKept ? `Changed: ${changes.length ? changes.join("; ") : "nothing the guest would notice"}.\n` +
+                           "Price not touched: only the date, time or passenger details changed, so nothing was re-priced, refunded or charged.\n" : "") +
               (s.refund ? `Refunded $${s.refund} to the guest's card (Stripe ${refundId}).\n` : "") +
               (s.balance && payUrl ? `Guest emailed a link for the $${s.balance} balance.\n`
                 : s.balance ? `$${s.balance} balance owing - not asked for yet; send the balance link from the admin page when ready.\n` : "") +
@@ -2884,10 +2983,11 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
               (payUrl && !s.balance ? `\nNew payment link: ${payUrl}\n` : "") + (oldLink ? "The previous payment link has been switched off.\n" : ""),
       }).catch((e) => console.error("office amend copy:", e.message));
       console.log("office booking amended:", ref, "$" + Math.round(wasCents / 100), "->", "$" + s.total,
-        s.refund ? "refunded $" + s.refund : s.balance ? "balance $" + s.balance : wasPaid && manual ? "manual money" : "", emailed ? "emailed" : "no guest email");
+        priceKept ? "price kept" : s.refund ? "refunded $" + s.refund : s.balance ? "balance $" + s.balance : wasPaid && manual ? "manual money" : "", emailed ? "emailed" : "no guest email");
       res.json({ ok: true, ref, total: s.total, was: Math.round(wasCents / 100), emailed, payUrl, status: r.status,
                  refunded: s.refund || 0, balance: s.balance || 0, balanceLink: !!(s.balance && payUrl),
-                 deposit: s.depositDue || 0, depositPct: depPct || null, manual: wasPaid && manual && diff !== 0 });
+                 deposit: s.depositDue || 0, depositPct: depPct || null, manual: wasPaid && manual && diff !== 0,
+                 priceKept, changes });
     } catch (err) {
       console.error("office amend:", err);
       res.status(500).json({ error: "Could not change that booking." });
