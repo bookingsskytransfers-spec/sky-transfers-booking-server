@@ -42,6 +42,15 @@ module.exports = function installReviewRequests(ctx) {
   /* Website bookings, and office jobs with no account ("Direct"). */
   const direct = (l) => l.source === "web" || (l.source === "account" && (!l.account || l.account === "Direct"));
   const SEND_FROM = 8 * 60, SEND_TO = 20 * 60;
+  /* Scheduled pick-up as epoch ms. l.date is YYYY-MM-DD and l.time HH:MM on the
+     board, both Brisbane local; Queensland has no daylight saving, so +10:00 holds
+     all year. Returns -Infinity when the board has no usable date or time, so a
+     malformed leg falls back to Done alone rather than silently blocking every
+     review request. */
+  const schedMs = (l) => {
+    const t = Date.parse(String(l.date) + "T" + String(l.time || "").slice(0, 5) + ":00+10:00");
+    return Number.isNaN(t) ? -Infinity : t;
+  };
 
   pool.query(`CREATE TABLE IF NOT EXISTS ops_review_asks (
       email   TEXT PRIMARY KEY,
@@ -86,7 +95,16 @@ module.exports = function installReviewRequests(ctx) {
     const board = await ops.boardFor(ops.addDays(n.date, -3), n.date);
     const due = board.legs.filter((l) => {
       const done = l.status === "done" && l.times && l.times.done ? new Date(l.times.done).getTime() : NaN;
-      return done >= since && nowMs() - done >= delay && nowMs() - done <= 3 * 864e5 &&
+      /* The pick-up time is a floor on the request. Done can be pressed before the
+         trip has run - a job tidied early, or a whole morning cleared in one go -
+         and on 15 Nov 2026 that thanked a passenger three minutes before her 13:00
+         pick-up. Waiting for whichever is later, Done or the pick-up itself, means
+         an early Done only defers the email instead of thanking someone for a trip
+         that has not happened. A genuinely early finish still gets asked, just not
+         before the booking says the car was due. */
+      const ready = Math.max(done, schedMs(l));
+      return done >= since && nowMs() - ready >= delay && nowMs() >= schedMs(l) &&
+        nowMs() - done <= 3 * 864e5 &&
         direct(l) && !!emailOf(l) && !(l.isReturn && l.leg === "out");
     });
     let sent = 0;
