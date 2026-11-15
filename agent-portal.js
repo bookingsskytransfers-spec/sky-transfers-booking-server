@@ -394,13 +394,26 @@ module.exports = function installAgentPortal(ctx) {
 
   const ADMIN_SESSION_MS = 7 * 24 * 3600 * 1000;
   const adminPinVersion = () => crypto.createHmac("sha256", AGENT_SECRET).update("admin-pin:" + String(ADMIN_PIN || "")).digest("base64url").slice(0, 16);
+  /* Office staff logins and the activity log (office-staff.js, 15 Nov 2026).
+     A session with no uid is the main login; one with a uid is a staff login,
+     good only while that login is on and its PIN has not been reset. Either
+     way req.staff says who is asking, and everything that is not a plain read
+     is written to the log when it finishes. */
+  const office = AGENTS_ON ? require("./office-staff")({ app, pool, pinMatches, makePinHash, adminPin: () => ADMIN_PIN }) : null;
   function requireAdmin(req, res, next) {
     if (!AGENTS_ON) return res.status(503).json({ error: "The agent portal is not configured on this server." });
     if (!ADMIN_PIN) return res.status(503).json({ error: "Admin access is not configured on this server." });
     const claim = readToken(bearer(req));
     if (!claim || claim.role !== "admin" || claim.pv !== adminPinVersion()) return res.status(401).json({ error: "Your admin session has expired." });
-    next();
+    if (!claim.uid) { req.staff = office.ownerOf(); office.track(req, res); return next(); }
+    office.userFor(claim).then(
+      (u) => {
+        if (!u) return res.status(401).json({ error: "Your admin session has expired." });
+        req.staff = u; office.track(req, res); next();
+      },
+      (err) => { console.error("admin auth:", err); res.status(500).json({ error: "Could not check your sign-in just now." }); });
   }
+  if (office) office.routes(requireAdmin);
 
   const agentPct = (a) => Number(a.commission_pct);
   const commissionOf = (totalCents, pct) => Math.round(totalCents * pct / 100);
@@ -450,7 +463,7 @@ module.exports = function installAgentPortal(ctx) {
     }
   });
 
-  app.post("/admin/login", (req, res) => {
+  app.post("/admin/login", async (req, res) => {
     if (!AGENTS_ON) return res.status(503).json({ error: "The agent portal is not configured on this server." });
     if (!ADMIN_PIN) return res.status(503).json({ error: "Admin access is not configured on this server." });
     const pin = String(req.body?.pin || "").trim();
@@ -460,13 +473,24 @@ module.exports = function installAgentPortal(ctx) {
     const a = Buffer.from(pin);
     const b = Buffer.from(ADMIN_PIN);
     if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
-      noteLoginFail("__admin__");
-      return res.status(401).json({ error: "Wrong PIN." });
+      /* not the main PIN - one of the staff? (office-staff.js) */
+      let u = null;
+      try { u = pin ? await office.signIn(pin) : null; }
+      catch (err) { console.error("admin login:", err); return res.status(500).json({ error: "Could not sign you in just now." }); }
+      if (!u) {
+        noteLoginFail("__admin__");
+        return res.status(401).json({ error: "Wrong PIN." });
+      }
+      LOGIN_FAILS.delete("__admin__");
+      office.record({ id: u.id, name: u.name }, "Signed in", { path: "/admin/login" });
+      return res.json({ token: signToken("__admin__", "admin", ADMIN_SESSION_MS, { pv: adminPinVersion(), uid: u.id, upv: u.pinVer }),
+                        user: { name: u.name, role: "staff" } });
     }
     LOGIN_FAILS.delete("__admin__");
+    office.record(office.ownerOf(), "Signed in", { path: "/admin/login" });
     /* A week, so the office signs in once (Aman, 26 Oct 2026). pv ties the
        session to the PIN: changing ADMIN_PIN in Render signs every device out. */
-    res.json({ token: signToken("__admin__", "admin", ADMIN_SESSION_MS, { pv: adminPinVersion() }) });
+    res.json({ token: signToken("__admin__", "admin", ADMIN_SESSION_MS, { pv: adminPinVersion() }), user: { name: office.OWNER, role: "owner" } });
   });
 
   /* The portal holds no rate tables of its own — it asks for the same places
