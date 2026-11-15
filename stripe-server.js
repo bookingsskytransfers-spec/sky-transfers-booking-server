@@ -605,6 +605,15 @@ function bookingPdf(b, s) {
 
 // ---- Branded HTML email (guest-facing) ----
 function esc(t) { return String(t == null ? "" : t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+/* A guest greeting that can never read "Hi undefined". The branded HTML body
+   has always guarded the name; the plain-text bodies beside it did not, so a
+   booking that reached here without a passenger_name greeted the customer with
+   the word "undefined". The 20 Oct 2026 guard above catches a payment carrying
+   no booking metadata at all, which was the cause of all 13 of those emails
+   between 28 Sep and 18 Oct - this covers the narrower case of a booking that
+   has a route but no name. Full name kept, as the plain-text bodies have always
+   used it; only the empty case changes. */
+const hi = (n) => { const t = String(n == null ? "" : n).trim(); return t ? "Hi " + t : "Hi there"; };
 
 /* The same sections as the PDF (20 Oct 2026), built from the same
    confirmationContent so the two always agree. Tables and inline styles only,
@@ -959,7 +968,7 @@ app.post("/request-booking", async (req, res) => {
       replyTo: BOOKINGS_EMAIL,
       subject: `Booking request received — Sky Transfers · ${b.ref}`,
       text:
-        `Hi ${b.name},\n\nThanks for your booking request with Sky Transfers.\n\n${s.text}\n\n` +
+        `${hi(b.name)},\n\nThanks for your booking request with Sky Transfers.\n\n${s.text}\n\n` +
         `This is a request, not a confirmed booking yet — we'll reply shortly (usually within the hour) to confirm your chauffeur.\n\n` +
         `Need anything in the meantime? Call or text +61 481 437 772.\n\n` +
         `Sky Transfers — Gold Coast & Brisbane airport transfers\nwww.skytransfers.com.au`,
@@ -1052,7 +1061,7 @@ app.post("/charter-enquiry", async (req, res) => {
         replyTo: BOOKINGS_EMAIL,
         subject: `Charter enquiry received — Sky Transfers · ${b.ref}`,
         text:
-          `Hi ${b.name},\n\nThanks for your charter enquiry — we have it.\n\n${text}\n\n` +
+          `${hi(b.name)},\n\nThanks for your charter enquiry — we have it.\n\n${text}\n\n` +
           `We will come back with a written all-inclusive price — driver, fuel, tolls and GST — ` +
           `usually within the hour.\n\nNeed it sooner? Call or text +61 481 437 772.\n\n` +
           `Sky Transfers — Gold Coast & Brisbane charters\nwww.skytransfers.com.au`,
@@ -1297,7 +1306,7 @@ app.post("/stripe-webhook", async (req, res) => {
           if (rb.email) await mailer.sendMail({
             from: `"Sky Transfers" <${process.env.GMAIL_USER}>`, to: rb.email, replyTo: BOOKINGS_EMAIL,
             subject: `Deposit received — booking confirmed — Sky Transfers · ${ref}`,
-            text: `Hi ${rb.name},\n\nThank you - we've received your $${got} deposit and your booking is confirmed. ` +
+            text: `${hi(rb.name)},\n\nThank you - we've received your $${got} deposit and your booking is confirmed. ` +
                   `The $${rs.balance || 0} balance is paid later; we'll send you a secure link for it. Your printable confirmation is attached.\n\n${rs.text}\n\n` +
                   `Free changes to 24 hours before pick-up: reply to this email or call +61 481 437 772.\n\nSky Transfers — Gold Coast & Brisbane airport transfers\nwww.skytransfers.com.au`,
             html: bookingEmailHtml(rb, rs), attachments: guestAttachments(rpdf),
@@ -1323,7 +1332,7 @@ app.post("/stripe-webhook", async (req, res) => {
           if (rb.email) await mailer.sendMail({
             from: `"Sky Transfers" <${process.env.GMAIL_USER}>`, to: rb.email, replyTo: BOOKINGS_EMAIL,
             subject: `Balance received — fully paid — Sky Transfers · ${ref}`,
-            text: `Hi ${rb.name},\n\nThank you - we've received $${got} and your ${row.deposit_pct ? "" : "updated "}booking is now fully paid. Your confirmation is attached.\n\n${rs.text}\n\nSky Transfers — Gold Coast & Brisbane airport transfers\nwww.skytransfers.com.au`,
+            text: `${hi(rb.name)},\n\nThank you - we've received $${got} and your ${row.deposit_pct ? "" : "updated "}booking is now fully paid. Your confirmation is attached.\n\n${rs.text}\n\nSky Transfers — Gold Coast & Brisbane airport transfers\nwww.skytransfers.com.au`,
             html: bookingEmailHtml(rb, rs), attachments: guestAttachments(rpdf),
           });
         }
@@ -1397,7 +1406,7 @@ app.post("/stripe-webhook", async (req, res) => {
           from: `"Sky Transfers" <${process.env.GMAIL_USER}>`,
           to: b.email, replyTo: BOOKINGS_EMAIL,
           subject: `Booking confirmed & paid — Sky Transfers · ${b.ref}`,
-          text: `Hi ${b.name},\n\nPayment received — your ${hourlyHours(b) ? "booking" : "transfer"} is confirmed. Your printable confirmation is attached.\n\n${s.text}\n\n` +
+          text: `${hi(b.name)},\n\nPayment received — your ${hourlyHours(b) ? "booking" : "transfer"} is confirmed. Your printable confirmation is attached.\n\n${s.text}\n\n` +
             (hourlyHours(b) ? "Your chauffeur will be at the pick-up at the time above. " : "We track your flight and your chauffeur meets you with a name board. ") +
             `Free changes to 24 hours before pick-up: reply to this email or call +61 481 437 772.\n\nSky Transfers — Gold Coast & Brisbane airport transfers\nwww.skytransfers.com.au`,
           html: bookingEmailHtml(b, s),
