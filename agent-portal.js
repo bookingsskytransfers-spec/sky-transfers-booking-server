@@ -364,6 +364,25 @@ module.exports = function installAgentPortal(ctx) {
     req.agent = rows[0];
     /* A booking sent by the agency's own system (booking-api.js) */
     req.via = claim.via === "API" ? "API" : null;
+    /* The office working for this agency (admin "Book for this agent", 17 Nov
+       2026): a two-hour session from /admin/agent/act-as. It can do what the
+       agency's own main login can, at the agency's own prices and rules. It
+       is good only while the office sign-in behind it is: the admin PIN has
+       not changed, and a staff login is still on with the same PIN. What it
+       changes is written to the office activity log against that person, and
+       the booking says "Booked by: Sky Transfers office". */
+    if (claim.office) {
+      const o = claim.office;
+      const gone = () => res.status(401).json({ error: "This office session has ended — open the agent's booking page again from the admin page." });
+      if (!office || !ADMIN_PIN || o.pv !== adminPinVersion()) return gone();
+      const staff = o.uid ? await office.userFor({ uid: o.uid, upv: o.upv }) : office.ownerOf();
+      if (!staff) return gone();
+      req.staff = staff;
+      req.via = staff.owner ? "Sky Transfers office" : `Sky Transfers office (${staff.name})`;
+      req.user = { id: null, name: rows[0].name, email: rows[0].email, role: "owner", office: staff.name };
+      office.track(req, res, { agent: rows[0].code });
+      return next();
+    }
     /* A staff login is re-checked on every request, so switching someone off
        or resetting their PIN takes effect at once, not when the token expires. */
     if (claim.uid) {
@@ -389,7 +408,7 @@ module.exports = function installAgentPortal(ctx) {
     }).catch((err) => { console.error("agent auth:", err); res.status(500).json({ error: "Could not check your sign-in just now." }); });
   }
   /* "Jane Smith at Nexus Travel (NEXUS)" for a staff login, else the agency. */
-  const whoDid = (req) => (req.user && req.user.id ? `${req.user.name} at ` : req.via ? "API, " : "") + `${req.agent.name} (${req.agent.code})`;
+  const whoDid = (req) => (req.user && req.user.id ? `${req.user.name} at ` : req.via ? req.via + ", " : "") + `${req.agent.name} (${req.agent.code})`;
   const bookedByOf = (req) => (req.user && req.user.id ? req.user.name : req.via || null);
 
   const ADMIN_SESSION_MS = 7 * 24 * 3600 * 1000;
@@ -414,6 +433,27 @@ module.exports = function installAgentPortal(ctx) {
       (err) => { console.error("admin auth:", err); res.status(500).json({ error: "Could not check your sign-in just now." }); });
   }
   if (office) office.routes(requireAdmin);
+
+  /* Book for an agent (17 Nov 2026). Any office login may open an agency's
+     booking page; the session lasts two hours and is tied to that office
+     sign-in (see requireAgent). */
+  const ACT_AS_MS = 2 * 3600 * 1000;
+  app.post("/admin/agent/act-as", requireAdmin, async (req, res) => {
+    try {
+      const code = String(req.body?.code || "").trim().toUpperCase();
+      if (!code) return res.status(400).json({ error: "Choose the agent." });
+      const { rows } = await pool.query("SELECT code, name, active FROM agents WHERE code = $1", [code]);
+      const a = rows[0];
+      if (!a) return res.status(404).json({ error: "No agent with that code." });
+      if (!a.active) return res.status(400).json({ error: `${a.name} is switched off — switch the agent on before booking for them.` });
+      const s = req.staff || {};
+      const token = signToken(a.code, "agent", ACT_AS_MS, { office: { pv: adminPinVersion(), uid: s.id || null, upv: s.id ? s.pinVer : null } });
+      res.json({ ok: true, token, code: a.code, name: a.name, hours: ACT_AS_MS / 3600000 });
+    } catch (err) {
+      console.error("act as agent:", err);
+      res.status(500).json({ error: "Could not open that agent's booking page just now." });
+    }
+  });
 
   const agentPct = (a) => Number(a.commission_pct);
   const commissionOf = (totalCents, pct) => Math.round(totalCents * pct / 100);
@@ -1693,7 +1733,7 @@ module.exports = function installAgentPortal(ctx) {
       rows.forEach((r) => { if (r.tour_ref) tourCount[r.tour_ref] = (tourCount[r.tour_ref] || 0) + 1; });
       res.json({
         agent: { code: req.agent.code, name: req.agent.name, commissionPct: money_ ? agentPct(req.agent) : null },
-        user: { name: req.user.name, role: req.user.role, canMoney: money_, canManage: canManage(req) },
+        user: { name: req.user.name, role: req.user.role, canMoney: money_, canManage: canManage(req), office: req.user.office || undefined },
         wallet: money_ ? { earned: earned / 100, paid: paid / 100, balance: (earned - paid) / 100 } : null,
         changeCutoffHours: cutoffFor(req.agent),
         rateCard: onCard(req.agent),
