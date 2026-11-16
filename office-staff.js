@@ -43,6 +43,16 @@ const LABELS = {
   "/admin/agent/staff/add": "Added an agency staff login",
   "/admin/agent/staff/update": "Changed an agency staff login",
   "/admin/agent/staff/pin": "Reset an agency staff PIN",
+  /* the office working in the agent portal for an agency (17 Nov 2026) */
+  "/admin/agent/act-as": "Opened an agent's booking page",
+  "/agent/book": "Booked for an agent",
+  "/agent/tour": "Booked a tour for an agent",
+  "/agent/booking/update": "Amended an agent's booking",
+  "/agent/booking/cancel": "Cancelled an agent's booking",
+  "/agent/booking/pay-link": "Made a payment link on an agent's booking",
+  "/agent/team/add": "Added an agency staff login",
+  "/agent/team/update": "Changed an agency staff login",
+  "/agent/team/pin": "Reset an agency staff PIN",
   "/admin/api-key": "Made an API key",
   "/admin/api-key/revoke": "Revoked an API key",
   "/admin/affiliate": "Saved a referral partner",
@@ -84,7 +94,7 @@ const LABELS = {
   "/ops/import/la": "Imported jobs",
 };
 /* Posts that change nothing: previews and drafts. */
-const NOT_CHANGES = new Set(["/autopilot/inbox-ai/preview", "/ops/confirm/pdf", "/ops/invoice/draft"]);
+const NOT_CHANGES = new Set(["/autopilot/inbox-ai/preview", "/ops/confirm/pdf", "/ops/invoice/draft", "/agent/quote"]);
 /* What is kept from what was sent, and from what came back. */
 const IN_KEYS = ["leg", "status", "code", "id", "driverPay", "amount", "how", "paid", "active", "date", "time",
   "returnDate", "returnTime", "pickup", "dropoff", "vehicle", "account", "partyKey", "from", "to", "cycle", "reset", "action"];
@@ -124,7 +134,7 @@ module.exports = function officeStaff({ app, pool, pinMatches, makePinHash, admi
     .catch((e) => console.error("Office staff setup failed:", e.message));
 
   const ownerOf = () => ({ id: null, name: OWNER, owner: true });
-  const staffOf = (u) => ({ id: u.id, name: u.name, owner: false });
+  const staffOf = (u) => ({ id: u.id, name: u.name, owner: false, pinVer: Number(u.pin_ver) });
 
   /* ---- the log -------------------------------------------------------- */
   async function record(staff, action, o) {
@@ -144,11 +154,13 @@ module.exports = function officeStaff({ app, pool, pinMatches, makePinHash, admi
     catch { return ""; }
   }
 
-  async function describe(path, body, out, status) {
+  async function describe(path, body, out, status, extra) {
     const b = plain(body), o = plain(out);
     const ok = status < 400;
     const ref = one(b.ref || o.ref || (Array.isArray(b.refs) ? b.refs.filter(simple).join(", ") : ""), 160);
     const bits = [];
+    /* done in the agent portal for an agency: say which */
+    if (extra && extra.agent) bits.push("agent: " + one(extra.agent, 30));
     if (!ok) bits.push("NOT DONE" + (simple(o.error) ? ": " + one(o.error, 160) : ` (${status})`));
     if (Array.isArray(o.changes) && o.changes.length) bits.push(o.changes.filter(simple).join("; "));
     if (o.priceKept === true) bits.push("price unchanged");
@@ -175,7 +187,7 @@ module.exports = function officeStaff({ app, pool, pinMatches, makePinHash, admi
 
   /* Called by requireAdmin once it knows who is asking. Reads are not
      logged; everything else is, when the response has gone. */
-  function track(req, res) {
+  function track(req, res, extra) {
     if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") return;
     const path = String(req.baseUrl || "") + String(req.path || "");
     if (NOT_CHANGES.has(path)) return;
@@ -185,7 +197,7 @@ module.exports = function officeStaff({ app, pool, pinMatches, makePinHash, admi
     res.on("finish", () => {
       const b = plain(req.body);
       if (b.dryRun === true || b.dryRun === "true") return;
-      describe(path, req.body, out, res.statusCode)
+      describe(path, req.body, out, res.statusCode, extra)
         .then((d) => record(req.staff, LABELS[path] || `${req.method} ${path}`, { path, ref: d.ref, detail: d.detail, ok: d.ok }))
         .catch((e) => console.error("office activity:", e.message));
     });
