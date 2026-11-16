@@ -2323,8 +2323,16 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
   const isoDate = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || "")) ? String(v) : "";
   const hhmm = (v) => /^\d{1,2}:\d{2}/.test(String(v || "")) ? String(v).slice(0, 5) : "";
 
+  /* The office can book the two board-only classes as well - the 21-seat mini
+     bus and the 53-seat coach, added to the board 12 Nov 2026. Neither has a
+     rate table, so every pricing path returns null for them (computeFare bails
+     on vi === -1) and the office is told to type the agreed total in the
+     override box, exactly as charter work already behaves. No fare is ever
+     guessed. requireAdmin keeps them off the website and out of the agent
+     portal, which is what "board-only" was protecting. */
   app.get("/admin/places", requireAdmin, (req, res) => {
-    res.json({ places: PLACES_FOR_AGENTS, vehicles: VEHICLES });
+    const extra = require("./intake-parse").FLEET_EXTRA.filter((c) => !VEHICLES.includes(c));
+    res.json({ places: PLACES_FOR_AGENTS, vehicles: VEHICLES.concat(extra) });
   });
 
   /* A web_bookings row in the shape the website's email and PDF expect. */
