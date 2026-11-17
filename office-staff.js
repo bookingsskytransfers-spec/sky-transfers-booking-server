@@ -87,6 +87,8 @@ const LABELS = {
   "/ops/invoice/send": "Sent an invoice",
   "/ops/invoice/paid": "Marked an invoice paid or unpaid",
   "/ops/invoice/void": "Voided an invoice",
+  "/ops/invoice/amend": "Voided an invoice to amend it",
+  "/ops/invoice/restore": "Put an amended invoice back as it was",
   "/ops/cal/apply": "Applied a calendar change",
   "/ops/cal/keep": "Kept a job as it was (calendar change set aside)",
   "/ops/cal/reread": "Re-read a calendar job",
@@ -98,7 +100,7 @@ const NOT_CHANGES = new Set(["/autopilot/inbox-ai/preview", "/ops/confirm/pdf", 
 /* What is kept from what was sent, and from what came back. */
 const IN_KEYS = ["leg", "status", "code", "id", "driverPay", "amount", "how", "paid", "active", "date", "time",
   "returnDate", "returnTime", "pickup", "dropoff", "vehicle", "account", "partyKey", "from", "to", "cycle", "reset", "action"];
-const OUT_KEYS = ["was", "now", "total", "balance", "refunded", "settled", "deleted", "imported", "trips", "created", "emailed"];
+const OUT_KEYS = ["number", "replaces", "was", "now", "total", "balance", "refunded", "settled", "deleted", "imported", "trips", "created", "emailed"];
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
 
 const one = (v, n) => String(v == null ? "" : v).replace(/\s+/g, " ").trim().slice(0, n || 120);
@@ -184,6 +186,10 @@ module.exports = function officeStaff({ app, pool, pinMatches, makePinHash, admi
       /* "emailed" comes back as true or as the address it went to: only that it was sent is kept */
       if (k === "emailed") { if (v) bits.push("guest emailed"); continue; }
       if (safe(v)) bits.push(`${k}: ${one(v, 40)}`);
+    }
+    if (ok && plain(o.invoice).number) {
+      bits.push("invoice: " + one(o.invoice.number, 30) + (o.invoice.replaces ? " (replaces " + one(o.invoice.replaces, 30) + ")" : "") +
+        (simple(o.invoice.total) ? ", $" + one(o.invoice.total, 12) : ""));
     }
     if (ok && !ref && simple(o.id) && !("id" in b)) bits.push(`new id: ${one(o.id, 20)}`);
     return { ref, detail: bits.join("; "), ok };
