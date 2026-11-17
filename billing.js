@@ -526,6 +526,41 @@ module.exports = function installBilling(ctx) {
   }
 
   /* ================= office routes: accounts ================= */
+  /* Deleting an account (18 Nov 2026). An account with history is never
+     deleted - its jobs and invoices point at it - so it is set to Inactive.
+     One that has never had a job (cancelled ones count) or an invoice (void
+     ones count) can go, with its job-view link and invoice schedule. */
+  async function accountUse() {
+    const jobs = {}, invoices = {};
+    (await pool.query(`SELECT lower(account) AS k, COUNT(*) AS n FROM ops_jobs WHERE account IS NOT NULL GROUP BY lower(account)`)).rows
+      .forEach((x) => { jobs[x.k] = Number(x.n); });
+    (await pool.query(`SELECT party_key AS k, COUNT(*) AS n FROM ops_invoices WHERE party_type = 'account' GROUP BY party_key`)).rows
+      .forEach((x) => { invoices[x.k] = Number(x.n); });
+    return { jobs, invoices };
+  }
+  function whyKeepAccount(a, use) {
+    const j = use.jobs[String(a.name || "").toLowerCase()] || 0, i = use.invoices[String(a.id)] || 0;
+    if (j) return `it has ${j} job${j === 1 ? "" : "s"} on record`;
+    if (i) return `it has ${i} invoice${i === 1 ? "" : "s"} on record`;
+    return "";
+  }
+  app.post("/ops/account/delete", requireAdmin, async (req, res) => {
+    try {
+      const a = await getAccount(int((req.body || {}).id, 1, 1e9, 0));
+      if (!a) return res.status(404).json({ error: "No such account." });
+      const why = whyKeepAccount(a, await accountUse());
+      if (why) return res.status(409).json({ error: `${a.name} can't be deleted: ${why}. Set it to Inactive instead.` });
+      await pool.query(`DELETE FROM ops_view_links WHERE account_id = $1`, [a.id]).catch(() => {});
+      await pool.query(`DELETE FROM ops_bill_schedules WHERE party_type = 'account' AND party_key = $1`, [String(a.id)]).catch(() => {});
+      await pool.query(`DELETE FROM ops_accounts WHERE id = $1`, [a.id]);
+      console.log("account deleted:", a.name);
+      res.json({ ok: true, id: a.id, name: a.name });
+    } catch (err) {
+      console.error("account delete:", err);
+      res.status(500).json({ error: "Could not delete that account." });
+    }
+  });
+
   app.get("/ops/billing", requireAdmin, async (req, res) => {
     try {
       const t = today();
@@ -551,9 +586,12 @@ module.exports = function installBilling(ctx) {
       const open = (type, key) => invs.filter((i) => i.party_type === type && i.party_key === key)
         .reduce((a, i) => { a.open += i.total_cents; if (i.due < t) a.overdue += i.total_cents; return a; }, { open: 0, overdue: 0 });
       const known = new Set(accounts.map((a) => a.name.toLowerCase()));
+      const use = await accountUse();
       const out = accounts.map((a) => {
         const u = ub.get(a.name.toLowerCase()) || { count: 0, cents: 0 }, o = open("account", String(a.id));
         return { type: "account", key: String(a.id), id: a.id, name: a.name, email: a.billing_email, contact: a.contact, abn: a.abn,
+                 /* never used, so it can be deleted outright (18 Nov 2026) */
+                 canDelete: !whyKeepAccount(a, use), keepReason: whyKeepAccount(a, use) || undefined,
                  address: a.address, phone: a.phone || "", terms: a.terms_days, notes: a.notes, active: a.active, intakeFrom: a.intake_from || "",
                  unbilledCount: u.count, unbilled: u.cents / 100, open: o.open / 100, overdue: o.overdue / 100 };
       }).concat(agents.map((g) => {
