@@ -1790,6 +1790,57 @@ module.exports = function installAgentPortal(ctx) {
   });
 
   /* ---- admin ------------------------------------------------------------ */
+  /* Deleting an agent (18 Nov 2026). An agent with history is never deleted:
+     its bookings, its wallet and its invoices point at it, so it is suspended
+     instead. One that has never had a booking or an invoice - a test entry, a
+     typo - can go, with its staff logins, API keys and invoice schedule. An
+     agent listed in AGENT_SEED is made again at every start, so deleting it
+     would not last; that one is refused too. */
+  function seededCodes() {
+    try {
+      const l = JSON.parse(process.env.AGENT_SEED || "[]");
+      return new Set((Array.isArray(l) ? l : []).map((a) => String((a && a.code) || "").trim().toUpperCase()).filter(Boolean));
+    } catch { return new Set(); }
+  }
+  async function agentUse() {
+    const count = async (sql) => {
+      const m = {};
+      try { (await pool.query(sql)).rows.forEach((x) => { m[x.k] = Number(x.n); }); } catch (e) { /* that table is another module's and may not exist */ }
+      return m;
+    };
+    return {
+      bookings: await count("SELECT agent_code AS k, COUNT(*) AS n FROM agent_bookings GROUP BY agent_code"),
+      invoices: await count("SELECT party_key AS k, COUNT(*) AS n FROM ops_invoices WHERE party_type = 'agent' GROUP BY party_key"),
+      seeded: seededCodes(),
+    };
+  }
+  function whyKeepAgent(code, use) {
+    if (use.bookings[code]) return `it has ${use.bookings[code]} booking${use.bookings[code] === 1 ? "" : "s"} on record`;
+    if (use.invoices[code]) return `it has ${use.invoices[code]} invoice${use.invoices[code] === 1 ? "" : "s"} on record`;
+    if (use.seeded.has(code)) return "it is in the server's start-up list (AGENT_SEED), so it would be made again at the next restart";
+    return "";
+  }
+  app.post("/admin/agent/delete", requireAdmin, async (req, res) => {
+    try {
+      const code = String(req.body?.code || "").trim().toUpperCase();
+      const a = (await pool.query("SELECT code, name FROM agents WHERE code = $1", [code])).rows[0];
+      if (!a) return res.status(404).json({ error: "No agent with that code." });
+      const why = whyKeepAgent(a.code, await agentUse());
+      if (why) return res.status(409).json({ error: `${a.name} can't be deleted: ${why}. Set it to Suspended instead.` });
+      await pool.query("DELETE FROM agent_users WHERE agent_code = $1", [a.code]);
+      await pool.query("DELETE FROM agent_api_keys WHERE agent_code = $1", [a.code]).catch(() => {});
+      await pool.query("DELETE FROM ops_bill_schedules WHERE party_type = 'agent' AND party_key = $1", [a.code]).catch(() => {});
+      /* a booking made in the moment since the check keeps the agent: agent_bookings refers to it */
+      try { await pool.query("DELETE FROM agents WHERE code = $1", [a.code]); }
+      catch (e) { return res.status(409).json({ error: `${a.name} has just been used, so it can't be deleted. Set it to Suspended instead.` }); }
+      console.log("agent deleted:", a.code);
+      res.json({ ok: true, code: a.code, name: a.name });
+    } catch (err) {
+      console.error("agent delete:", err);
+      res.status(500).json({ error: "Could not delete that agent." });
+    }
+  });
+
   app.get("/admin/agents", requireAdmin, async (req, res) => {
     try {
       const { rows } = await pool.query(`
@@ -1807,10 +1858,13 @@ module.exports = function installAgentPortal(ctx) {
       const staff = {};
       (await pool.query("SELECT agent_code, COUNT(*) AS n FROM agent_users WHERE active GROUP BY agent_code")).rows
         .forEach((s) => { staff[s.agent_code] = Number(s.n); });
+      const use = await agentUse();
       res.json({
         agents: rows.map((r) => ({
           code: r.code, name: r.name, email: r.email,
           commissionPct: Number(r.commission_pct), active: r.active, rateCard: !!r.rate_card,
+          /* never used, so it can be deleted outright (18 Nov 2026) */
+          canDelete: !whyKeepAgent(r.code, use), keepReason: whyKeepAgent(r.code, use) || undefined,
           staff: staff[r.code] || 0,
           trips: Number(r.trips),
           gross: Number(r.gross_cents) / 100,

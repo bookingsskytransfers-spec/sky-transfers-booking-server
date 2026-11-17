@@ -39,6 +39,8 @@ const LABELS = {
   "/admin/web-booking/balance-paid": "Marked a balance paid",
   "/admin/web-booking/paid-elsewhere": "Marked a booking paid another way",
   "/admin/agent": "Saved an agent",
+  "/admin/agent/delete": "Deleted an unused agent",
+  "/ops/account/delete": "Deleted an unused account",
   "/admin/settle": "Settled an agent's commission",
   "/admin/agent/staff/add": "Added an agency staff login",
   "/admin/agent/staff/update": "Changed an agency staff login",
@@ -174,7 +176,7 @@ module.exports = function officeStaff({ app, pool, pinMatches, makePinHash, admi
     if (b.vehicleId != null && b.vehicleId !== "") bits.push("vehicle: " + (await nameOf("ops_vehicles", "label", b.vehicleId) || "none"));
     /* a name only where there is no booking reference to go by: a driver, an
        account, an agent - not a passenger */
-    if (!ref) { const n = one(b.name || b.label, 60); if (n) bits.push("name: " + n); }
+    if (!ref) { const n = one(b.name || b.label || (ok && simple(o.name) ? o.name : ""), 60); if (n) bits.push("name: " + n); }
     for (const k of IN_KEYS) {
       const v = b[k];
       if (!safe(v)) continue;
