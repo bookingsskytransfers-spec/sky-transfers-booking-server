@@ -135,6 +135,9 @@ module.exports = function installBilling(ctx) {
       ALTER TABLE ops_accounts ADD COLUMN IF NOT EXISTS phone TEXT;
       ALTER TABLE ops_invoices ADD COLUMN IF NOT EXISTS bill_phone TEXT;
       ALTER TABLE ops_invoice_lines ADD COLUMN IF NOT EXISTS detail TEXT;
+      -- Amending a sent invoice (18 Nov 2026): the number of the void invoice
+      -- this one replaces. The old one is marked by its paid_note.
+      ALTER TABLE ops_invoices ADD COLUMN IF NOT EXISTS replaces TEXT;
     `);
     /* agent-portal.js owns agent_bookings and adds this too; added here as
        well so the invoice query never depends on which module set up first */
@@ -291,7 +294,12 @@ module.exports = function installBilling(ctx) {
     for (const l of inv.lines) { try { l.detail = l.detail ? JSON.parse(l.detail) : null; } catch (e) { l.detail = null; } }
     return inv;
   }
+  /* how an invoice voided by Amend is told from one voided outright */
+  const AMEND_NOTE = "voided to be amended";
   const publicInvoice = (inv) => ({
+    replaces: inv.replaces || null, replacedBy: inv.replaced_by || null,
+    /* voided by Amend and not re-issued yet: it can still be put back */
+    amending: inv.status === "void" && inv.paid_note === AMEND_NOTE && !inv.replaced_by,
     id: inv.id, number: inv.number, partyType: inv.party_type, partyKey: inv.party_key, partyName: inv.party_name,
     billEmail: inv.bill_email, issued: inv.issued, due: inv.due, from: inv.pfrom, to: inv.pto,
     total: inv.total_cents / 100, gst: inv.gst_cents / 100, status: inv.status,
@@ -365,6 +373,7 @@ module.exports = function installBilling(ctx) {
       const detRows = [["Invoice no.", inv.number, true], ["Date of issue", ddmmyyyy(inv.issued)],
         ["Payment terms", paid ? "Paid" : termsText(inv)], ["Due date", ddmmyyyy(inv.due)],
         ["Period", inv.pfrom && inv.pto ? `${ddmmyyyy(inv.pfrom)} to ${ddmmyyyy(inv.pto)}` : ""],
+        ["Replaces", inv.replaces ? `${inv.replaces} (cancelled)` : ""],
         ["Amount due", paid ? dollars(0) : dollars(inv.total_cents), true]].filter((r) => r[1]);
       const boxH = Math.max(billRows.length, detRows.length) * 14 + 34;
       doc.rect(L, y, half, boxH).fill(SOFT);
@@ -617,7 +626,7 @@ module.exports = function installBilling(ctx) {
 
   /* Issues an invoice for the given refs of one party's draft. Throws
      {code, message}. Used by the office route and by autopilot.js. */
-  async function issueInvoice({ partyType, partyKey, from, to, refs, issuedOn }) {
+  async function issueInvoice({ partyType, partyKey, from, to, refs, issuedOn, replaces }) {
     from = isoDate(from); to = isoDate(to);
     if (!from || !to || to < from) throw { code: 400, message: "Choose the period to invoice." };
     const want = new Set((Array.isArray(refs) ? refs : []).map((r) => txt(r, 40)));
@@ -628,6 +637,17 @@ module.exports = function installBilling(ctx) {
     const lines = d.lines.filter((l) => want.has(l.ref));
     if (!lines.length) throw { code: 400, message: "Nothing left to invoice - those jobs may already be on another invoice." };
     const total = lines.reduce((a, l) => a + l.amountCents, 0);
+    /* only a void invoice of this same client can be replaced, and only once */
+    let rep = null;
+    if (replaces) {
+      const o = (await pool.query(`SELECT number, party_type, party_key, status FROM ops_invoices WHERE number = $1`, [txt(replaces, 40)])).rows[0];
+      if (!o || o.status !== "void" || o.party_type !== d.party.type || String(o.party_key) !== String(d.party.key)) {
+        throw { code: 400, message: "An invoice can only replace a void invoice for the same client." };
+      }
+      const already = (await pool.query(`SELECT number FROM ops_invoices WHERE replaces = $1`, [o.number])).rows[0];
+      if (already) throw { code: 409, message: `${o.number} has already been replaced by ${already.number}.` };
+      rep = o.number;
+    }
     const issued = isoDate(issuedOn) || today();
     const due = addDays(issued, d.party.terms != null ? d.party.terms : 14);
     const { rows } = await pool.query(
@@ -638,7 +658,7 @@ module.exports = function installBilling(ctx) {
        d.party.address || null, from, to, issued, due, total, gstOf(total)]);
     const id = rows[0].id;
     const number = "SKY-" + issued.slice(0, 4) + "-" + String(id).padStart(4, "0");
-    await pool.query(`UPDATE ops_invoices SET number = $2, bill_phone = $3 WHERE id = $1`, [id, number, d.party.phone || null]);
+    await pool.query(`UPDATE ops_invoices SET number = $2, bill_phone = $3, replaces = $4 WHERE id = $1`, [id, number, d.party.phone || null, rep]);
     for (const l of lines) {
       await pool.query(`INSERT INTO ops_invoice_lines (invoice_id, ref, service_date, description, amount_cents, detail) VALUES ($1,$2,$3,$4,$5,$6)`,
         [id, l.ref, l.date, l.description, l.amountCents, l.detail ? JSON.stringify(l.detail) : null]);
@@ -650,7 +670,7 @@ module.exports = function installBilling(ctx) {
       `SELECT l.ref FROM ops_invoice_lines l JOIN ops_invoices i ON i.id = l.invoice_id
         WHERE i.status <> 'void' AND i.id <> $1 AND l.ref IN (${inList(rs.length, 2)})`, [id].concat(rs))).rows;
     if (dup.length) {
-      await pool.query(`UPDATE ops_invoices SET status = 'void', paid_note = 'auto-voided: jobs already invoiced' WHERE id = $1`, [id]);
+      await pool.query(`UPDATE ops_invoices SET status = 'void', paid_note = 'auto-voided: jobs already invoiced', replaces = NULL WHERE id = $1`, [id]);
       throw { code: 409, message: "Some of those jobs were invoiced a moment ago from somewhere else - nothing new was issued." };
     }
     let inv = await invoiceWithLines(id);
@@ -663,7 +683,7 @@ module.exports = function installBilling(ctx) {
   app.post("/ops/invoice", requireAdmin, async (req, res) => {
     try {
       const b = req.body || {};
-      const inv = await issueInvoice({ partyType: b.partyType, partyKey: b.partyKey, from: b.from, to: b.to, refs: b.refs, issuedOn: b.issuedOn });
+      const inv = await issueInvoice({ partyType: b.partyType, partyKey: b.partyKey, from: b.from, to: b.to, refs: b.refs, issuedOn: b.issuedOn, replaces: b.replaces });
       res.json({ ok: true, invoice: publicInvoice(inv) });
     } catch (err) {
       if (err && err.code) return res.status(err.code).json({ error: err.message });
@@ -681,7 +701,8 @@ module.exports = function installBilling(ctx) {
            FROM ops_invoices i ${st ? "WHERE i.status = $1" : ""} ORDER BY i.id DESC LIMIT 300`, st ? [st] : []);
       const counts = (await pool.query(`SELECT invoice_id, count(*)::int AS n FROM ops_invoice_lines GROUP BY invoice_id`)).rows;
       const byId = new Map(counts.map((c) => [c.invoice_id, c.n]));
-      res.json({ today: today(), invoices: rows.map((r) => publicInvoice({ ...r, line_count: byId.get(r.id) || 0 })) });
+      const repl = new Map((await pool.query(`SELECT number, replaces FROM ops_invoices WHERE replaces IS NOT NULL`)).rows.map((x) => [x.replaces, x.number]));
+      res.json({ today: today(), invoices: rows.map((r) => publicInvoice({ ...r, line_count: byId.get(r.id) || 0, replaced_by: repl.get(r.number) || null })) });
     } catch (err) {
       console.error("invoices list:", err);
       res.status(500).json({ error: "Could not load invoices." });
@@ -782,11 +803,12 @@ module.exports = function installBilling(ctx) {
     await mailer.sendMail({
       from: `"Sky Transfers Accounts" <${process.env.GMAIL_USER}>`, to, replyTo: BOOKINGS_EMAIL, bcc: BOOKINGS_EMAIL,
       subject: paid ? `Paid tax invoice ${fresh.number} - Sky Transfers`
-                    : `Tax invoice ${fresh.number} from Sky Transfers - ${dollars(fresh.total_cents)} due ${nice(fresh.due)}`,
+                    : `${fresh.replaces ? "Revised tax" : "Tax"} invoice ${fresh.number} from Sky Transfers - ${dollars(fresh.total_cents)} due ${nice(fresh.due)}`,
       text: `Hello${fresh.bill_contact ? " " + fresh.bill_contact.split(" ")[0] : ""},\n\n` +
         (paid ? `Attached is your paid tax invoice ${fresh.number} for ${fresh.party_name}. Thank you.\n`
               : `Attached is tax invoice ${fresh.number} for ${fresh.party_name}: ${fresh.lines.length} transfer${fresh.lines.length === 1 ? "" : "s"}` +
                 (fresh.pfrom ? ` from ${nice(fresh.pfrom)} to ${nice(fresh.pto)}` : "") + `.\n\n` +
+                (fresh.replaces ? `It replaces invoice ${fresh.replaces}, which has been cancelled - please disregard that one.\n\n` : "") +
                 `Amount due: ${dollars(fresh.total_cents)} (GST inclusive), by ${nice(fresh.due)}.\n` +
                 (fresh.pay_link_url ? `\nPay by card: ${fresh.pay_link_url}\n` : "") +
                 (BANK_LINES.length ? `\nDirect bank deposit:\n${BANK_LINES.join("\n")}\nReference: ${fresh.number}\n` : "")) +
@@ -827,6 +849,72 @@ module.exports = function installBilling(ctx) {
     } catch (err) {
       console.error("invoice paid:", err);
       res.status(500).json({ error: "Could not update that invoice." });
+    }
+  });
+
+  /* Amend a sent invoice (18 Nov 2026). An issued invoice holds its own copy
+     of every amount, so it is never edited: Amend voids it and hands back
+     what was on it, the office fixes the jobs and issues a new invoice, and
+     that one says which it replaces. Pressed again on an invoice already
+     voided this way (and not yet replaced) it changes nothing and hands the
+     same details back, so an amendment left half done can be picked up. */
+  app.post("/ops/invoice/amend", requireAdmin, async (req, res) => {
+    try {
+      const inv = await invoiceWithLines(int((req.body || {}).id, 1, 1e9, 0));
+      if (!inv) return res.status(404).json({ error: "No such invoice." });
+      if (inv.status === "paid") return res.status(409).json({ error: "A paid invoice can't be amended - press Re-open first if the payment was a mistake, then Amend." });
+      const resumed = inv.status === "void";
+      if (resumed) {
+        if (inv.paid_note !== AMEND_NOTE) return res.status(409).json({ error: "That invoice is void. Its jobs are free to go on a new invoice." });
+        const by = (await pool.query(`SELECT number FROM ops_invoices WHERE replaces = $1`, [inv.number])).rows[0];
+        if (by) return res.status(409).json({ error: `${inv.number} has already been replaced by ${by.number}. Amend that one instead.` });
+      } else {
+        await pool.query(`UPDATE ops_invoices SET status = 'void', paid_note = $2 WHERE id = $1`, [inv.id, AMEND_NOTE]);
+        await killPayLink(inv);
+        console.log("invoice voided to amend:", inv.number);
+      }
+      res.json({ ok: true, id: inv.id, number: inv.number, resumed, partyType: inv.party_type, partyKey: inv.party_key, partyName: inv.party_name,
+                 from: inv.pfrom, to: inv.pto, refs: inv.lines.map((l) => l.ref), total: inv.total_cents / 100, sentTo: inv.sent_at ? inv.sent_to : null });
+    } catch (err) {
+      console.error("invoice amend:", err);
+      res.status(500).json({ error: "Could not open that invoice to amend." });
+    }
+  });
+
+  /* Changed your mind: put an invoice voided by Amend back exactly as it was.
+     Refused once it has been replaced, or if any of its jobs is now on another
+     invoice or no longer matches what the invoice says - then the invoice
+     would no longer be true, and the amended one should be issued instead. */
+  app.post("/ops/invoice/restore", requireAdmin, async (req, res) => {
+    try {
+      const inv = await invoiceWithLines(int((req.body || {}).id, 1, 1e9, 0));
+      if (!inv) return res.status(404).json({ error: "No such invoice." });
+      if (inv.status !== "void" || inv.paid_note !== AMEND_NOTE) return res.status(409).json({ error: "Only an invoice that was voided with Amend can be put back." });
+      const by = (await pool.query(`SELECT number FROM ops_invoices WHERE replaces = $1`, [inv.number])).rows[0];
+      if (by) return res.status(409).json({ error: `${inv.number} has been replaced by ${by.number}, so it stays void.` });
+      const rs = inv.lines.map((l) => l.ref);
+      if (!rs.length || !inv.pfrom || !inv.pto) return res.status(409).json({ error: "That invoice can't be put back - issue a new one instead." });
+      const dup = (await pool.query(
+        `SELECT l.ref, i.number FROM ops_invoice_lines l JOIN ops_invoices i ON i.id = l.invoice_id
+          WHERE i.status <> 'void' AND i.id <> $1 AND l.ref IN (${inList(rs.length, 2)})`, [inv.id].concat(rs))).rows;
+      if (dup.length) return res.status(409).json({ error: `${dup[0].ref} is now on invoice ${dup[0].number}, so ${inv.number} can't be put back.` });
+      const d = await draftLines(inv.party_type, inv.party_key, inv.pfrom, inv.pto);
+      if (d.error) return res.status(409).json({ error: d.error });
+      const now = new Map(d.lines.map((l) => [l.ref, l.amountCents]));
+      const changed = inv.lines.find((l) => now.get(l.ref) !== l.amount_cents);
+      if (changed) {
+        return res.status(409).json({ error: `${changed.ref} has changed since ${inv.number} was issued (the invoice says ${dollars(changed.amount_cents)}, the job is now ` +
+          `${now.has(changed.ref) ? dollars(now.get(changed.ref)) : "cancelled or no longer billable"}). Issue the amended invoice instead.` });
+      }
+      await pool.query(`UPDATE ops_invoices SET status = 'issued', paid_note = NULL WHERE id = $1`, [inv.id]);
+      /* its own card link back on; a new one only if it never had one */
+      if (stripe && inv.pay_link_id) await stripe.paymentLinks.update(inv.pay_link_id, { active: true }).catch((e) => console.error("invoice link on:", e.message));
+      else await payLinkFor(inv).catch((e) => console.error("invoice pay link:", e.message));
+      console.log("invoice put back:", inv.number);
+      res.json({ ok: true, number: inv.number });
+    } catch (err) {
+      console.error("invoice restore:", err);
+      res.status(500).json({ error: "Could not put that invoice back." });
     }
   });
 
