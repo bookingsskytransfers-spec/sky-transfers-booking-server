@@ -161,6 +161,10 @@ module.exports = function officeStaff({ app, pool, pinMatches, makePinHash, admi
     const bits = [];
     /* done in the agent portal for an agency: say which */
     if (extra && extra.agent) bits.push("agent: " + one(extra.agent, 30));
+    /* what the office did that the agency's own rules would have refused */
+    if (extra && Array.isArray(extra.notes) && extra.notes.length && ok) {
+      bits.push("OFFICE OVERRIDE: " + extra.notes.filter((n, i, a) => a.indexOf(n) === i).map((n) => one(n, 60)).join(", "));
+    }
     if (!ok) bits.push("NOT DONE" + (simple(o.error) ? ": " + one(o.error, 160) : ` (${status})`));
     if (Array.isArray(o.changes) && o.changes.length) bits.push(o.changes.filter(simple).join("; "));
     if (o.priceKept === true) bits.push("price unchanged");

@@ -83,6 +83,26 @@ module.exports = function installAgentPortal(ctx) {
   const closedOf = (a, bk) => (bk && ix.isIx(bk.rate_card) ? ix.CLOSED_TEXT : closedFor(a));
   const lateFeeOf = (a, bk, h) => (bk && ix.isIx(bk.rate_card) ? ix.lateFeePct(h) : onCard(a) ? lateFeePct(h) : null);
 
+  /* The office, working in the portal for an agency (admin "Book for this
+     agent"), is not held to the agency's cut-offs (Aman, 18 Nov 2026): it can
+     book, change and cancel at any time before the pick-up. requireAgent puts
+     the office session here for the length of the request - it is never read
+     from anything the browser sends, so an agency cannot ask for it. Each time
+     a rule is overridden it is noted, and the note goes in the office activity
+     log with the action. */
+  const officeSession = new (require("async_hooks").AsyncLocalStorage)();
+  const officeNow = () => officeSession.getStore() || null;
+  const PASSED = "That pick-up time has already passed.";
+  /* is this pick-up too soon to book? */
+  function tooSoon(d, t) {
+    const o = officeNow();
+    if (!o) return leadTimeShortfall(d, t) !== null;
+    if (!(hoursUntil(d, t) > 0)) return true;
+    if (leadTimeShortfall(d, t) !== null) o.notes.push("booked inside the agent's notice period");
+    return false;
+  }
+  const soonError = () => (officeNow() ? PASSED : LEAD_TIME_ERROR);
+
   /* One idempotent migration at boot. The ALTERs are separate and guarded so
      an instance running the previous version can be rolled forward without a
      migration step or a maintenance window. */
@@ -380,8 +400,9 @@ module.exports = function installAgentPortal(ctx) {
       req.staff = staff;
       req.via = staff.owner ? "Sky Transfers office" : `Sky Transfers office (${staff.name})`;
       req.user = { id: null, name: rows[0].name, email: rows[0].email, role: "owner", office: staff.name };
-      office.track(req, res, { agent: rows[0].code });
-      return next();
+      const extra = { agent: rows[0].code, notes: [] };
+      office.track(req, res, extra);
+      return officeSession.run(extra, () => next());
     }
     /* A staff login is re-checked on every request, so switching someone off
        or resetting their PIN takes effect at once, not when the token expires. */
@@ -594,7 +615,7 @@ module.exports = function installAgentPortal(ctx) {
     if (!ret) return { ret: null };
     if (!/^\d{4}-\d{2}-\d{2}$/.test(ret.date) || !/^\d{1,2}:\d{2}/.test(ret.time)) return { error: "Please give both a date and a time for the return trip." };
     if (ret.date < b.date || (ret.date === b.date && ret.time <= b.time)) return { error: "The return trip has to be after the outbound one." };
-    if (leadTimeShortfall(ret.date, ret.time) !== null) return { error: LEAD_TIME_ERROR };
+    if (tooSoon(ret.date, ret.time)) return { error: soonError() };
     return { ret };
   }
 
@@ -649,7 +670,10 @@ module.exports = function installAgentPortal(ctx) {
     const pax = parseInt(b.pax, 10) || 1;
     if (pax > v.cap) return { error: `The ${v.name} takes up to ${v.cap} passengers - choose a bigger vehicle.` };
     const h = hoursUntil(b.date, b.time);
-    if (h == null || h < ix.CUTOFF_HOURS) return { error: "Interstate trips need at least 24 hours' notice - call +61 481 437 772 for anything sooner." };
+    if (officeNow()) {
+      if (!(h > 0)) return { error: PASSED };
+      if (h < ix.CUTOFF_HOURS) officeNow().notes.push("interstate trip booked inside 24 hours");
+    } else if (h == null || h < ix.CUTOFF_HOURS) return { error: "Interstate trips need at least 24 hours' notice - call +61 481 437 772 for anything sooner." };
     let ret = null;
     if (q.legsCount === 2) {
       const r = returnTripOf(b, null);
@@ -748,7 +772,7 @@ module.exports = function installAgentPortal(ctx) {
     const priced = await agentFare(t, b.vehicle);
     if (priced == null) return { error: t.stops.length ? "We couldn't price the trip with those stops — check each stop was picked from the list, or call us." : "That trip needs a manual quote — please call us." };
     const fare = priced.fare;
-    if (leadTimeShortfall(b.date, b.time) !== null) return { error: LEAD_TIME_ERROR };
+    if (tooSoon(b.date, b.time)) return { error: soonError() };
     const r = returnTripOf(b, t.hours);
     if (r.error) return { error: r.error };
     if (r.ret && !returnDiscount) r.ret = { ...r.ret, noDiscount: true };
@@ -779,7 +803,7 @@ module.exports = function installAgentPortal(ctx) {
     if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return { error: "That passenger email doesn't look right." };
     const v = c.vehicles.find((x) => x.vehicle === b.vehicle);
     if (!v) return { error: "That vehicle isn't on your rate card for this trip - choose another, or call us." };
-    if (leadTimeShortfall(b.date, b.time) !== null) return { error: LEAD_TIME_ERROR };
+    if (tooSoon(b.date, b.time)) return { error: soonError() };
     const r = returnTripOf(b, t.hours);
     if (r.error) return { error: r.error };
     if (c.legsCount === 2 && !r.ret) return { error: svc && svc.kind === "park" ? "Give the date and time to collect them from the park (the return pick-up)." : "Please give both a date and a time for the return trip." };
@@ -980,7 +1004,10 @@ module.exports = function installAgentPortal(ctx) {
       if (bk.card_paid_at) return { error: "This booking has been paid by card, so changes and cancellations go through us - call +61 481 437 772.", code: 409 };
       const iso = bk.pickup_date instanceof Date ? bk.pickup_date.toISOString().slice(0, 10) : String(bk.pickup_date);
       const h = hoursUntil(iso, bk.pickup_time);
-      if (h == null || h < cutoffOf(req.agent, bk)) return { error: closedOf(req.agent, bk), code: 400 };
+      if (officeNow()) {
+        if (!(h > 0)) return { error: "That pick-up time has passed, so it can't be changed here - use the dispatch board.", code: 400 };
+        if (h < cutoffOf(req.agent, bk)) officeNow().notes.push("inside the agent's change cut-off");
+      } else if (h == null || h < cutoffOf(req.agent, bk)) return { error: closedOf(req.agent, bk), code: 400 };
     }
     return { booking: bk };
   }
@@ -996,7 +1023,10 @@ module.exports = function installAgentPortal(ctx) {
         const h0 = hoursUntil(isoOf(bk0.pickup_date), bk0.pickup_time);
         const isI = ix.isIx(bk0.rate_card);
         const fee = lateFeeOf(req.agent, bk0, h0);
-        if (bk0.status === "confirmed" && !bk0.card_paid_at && fee) {
+        /* the office may cancel it without the charge (waiveCharge), or charge it as usual */
+        const waive = !!officeNow() && req.body && req.body.waiveCharge === true;
+        if (waive && bk0.status === "confirmed" && !bk0.card_paid_at && fee) officeNow().notes.push(`late-cancellation charge of ${fee}% waived`);
+        if (bk0.status === "confirmed" && !bk0.card_paid_at && fee && !waive) {
           const feeCents = Math.round(bk0.total_cents * fee / 100);
           if (!req.body || req.body.acceptCharge !== true) {
             return res.status(409).json({ error: `This is inside ${isI ? 24 : fee === 100 ? 6 : 12} hours of pick-up, so cancelling is charged at ${fee}% of the fare: ${money(feeCents)}.`,
@@ -1030,6 +1060,7 @@ module.exports = function installAgentPortal(ctx) {
       notifyOffice(
         `AGENT CANCELLED (${req.agent.code}): ${bk.pickup} -> ${bk.dropoff} [${bk.ref}]`,
         `CANCELLED by ${whoDid(req)}\n\n` +
+        (officeNow() && officeNow().notes.length ? `Office override: ${officeNow().notes.join(", ")}.\n\n` : "") +
         `Reference: ${bk.ref}\nRoute: ${bk.pickup} -> ${bk.dropoff}\n` +
         `Was: ${bk.pickup_date instanceof Date ? bk.pickup_date.toISOString().slice(0,10) : bk.pickup_date} ${bk.pickup_time}\n` +
         `Passenger: ${bk.passenger_name}\nVehicle: ${bk.vehicle}\n` +
@@ -1741,7 +1772,7 @@ module.exports = function installAgentPortal(ctx) {
         bookings: rows.map((r) => {
           const b = bookingRow(r);
           const h = hoursUntil(b.date, b.time);
-          b.changeable = r.status === "confirmed" && !r.card_paid_at && h != null && h >= cutoffOf(req.agent, r);
+          b.changeable = r.status === "confirmed" && !r.card_paid_at && h != null && (req.user.office ? h > 0 : h >= cutoffOf(req.agent, r));
           /* a card agency can still cancel inside 12 hours, at the card's
              charge; an interstate trip inside 24 hours, charged in full */
           const fee = r.status === "confirmed" && !r.card_paid_at ? lateFeeOf(req.agent, r, h) : null;
