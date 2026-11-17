@@ -25,6 +25,13 @@
  * ------------------------------------------------------------------------ */
 const ENDPOINT = "https://routes.googleapis.com/directions/v2:computeRoutes";
 
+/* Every real answer from Google - never a cached one - is passed to one
+   watcher (outage-alarm.js), whichever copy of this module made the call:
+   null when Google answered, otherwise the failure reason. It can only
+   listen; nothing it does changes what distance() returns. (18 Nov 2026) */
+let watcher = null;
+function told(reason) { if (watcher) { try { watcher(reason); } catch (e) { /* never into a quote */ } } }
+
 /* Coordinates are rounded to this many decimals for the cache key. Three is
    about 110 m, far finer than the bands care about, so two spellings of the
    same address share an answer and cost one call rather than two. */
@@ -103,7 +110,7 @@ module.exports = function makeRouteDistance(opts) {
   async function distance(origin, destination) {
     const a = point(origin), b = point(destination);
     if (!a || !b) return { km: null, reason: "bad_coordinates" };
-    if (!key) return { km: null, reason: "no_key" };
+    if (!key) { told("no_key"); return { km: null, reason: "no_key" }; }
 
     const ck = cacheKeyOf(a) + "|" + cacheKeyOf(b);
     const hit = cacheGet(ck);
@@ -139,6 +146,7 @@ module.exports = function makeRouteDistance(opts) {
       clearTimeout(bell);
       const aborted = err && (err.name === "AbortError" || err.code === "ABORT_ERR");
       if (!aborted) console.error("route distance: request failed:", err && err.message);
+      told(aborted ? "timeout" : "network");
       return { km: null, reason: aborted ? "timeout" : "network" };
     }
     clearTimeout(bell);
@@ -150,15 +158,17 @@ module.exports = function makeRouteDistance(opts) {
          rather than leaving a bare status in the log. */
       console.error("route distance: HTTP " + code +
         (code === 403 ? " (key restriction, or the Routes API is not enabled on the project)" : ""));
+      told("http_" + code);
       return { km: null, reason: "http_" + code };
     }
 
     let json;
     try { json = await res.json(); }
-    catch (err) { return { km: null, reason: "bad_response" }; }
+    catch (err) { told("bad_response"); return { km: null, reason: "bad_response" }; }
 
     const route = json && Array.isArray(json.routes) ? json.routes[0] : null;
     const metres = route && Number(route.distanceMeters);
+    told(null);   /* Google answered, whatever it found */
     if (!Number.isFinite(metres) || metres <= 0) return { km: null, reason: "no_route" };
 
     /* duration arrives as a protobuf string like "1534s". It is advisory here
@@ -184,3 +194,4 @@ module.exports = function makeRouteDistance(opts) {
 module.exports.COORD_DP = COORD_DP;
 module.exports.DEFAULTS = DEFAULTS;
 module.exports.ENDPOINT = ENDPOINT;
+module.exports.watch = (fn) => { watcher = typeof fn === "function" ? fn : null; };

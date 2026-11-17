@@ -1494,6 +1494,19 @@ try {
   console.error("Blog feed not mounted (bookings unaffected):", err.message);
 }
 
+/* The outage alarm (outage-alarm.js): emails the office when Google stops
+   answering the distance lookups or the forms' address search, and again
+   when it is over. Wrapped: an alarm must never be the thing that stops a
+   booking. */
+try {
+  require("./outage-alarm")({
+    app, pool: portal && portal.pool, requireAdmin: portal && portal.requireAdmin, mailer, BOOKINGS_EMAIL,
+    from: `"Sky Transfers Website" <${process.env.GMAIL_USER}>`,
+  });
+} catch (err) {
+  console.error("Outage alarm not mounted (bookings unaffected):", err.message);
+}
+
 /* Point-to-point quotes: neither end an airport. Same treatment as the blog
    feed - wrapped, because it is new and nothing on the booking path needs it.
    It is handed the zone tables so it holds no copy of its own, and the admin
