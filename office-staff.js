@@ -102,7 +102,7 @@ const NOT_CHANGES = new Set(["/autopilot/inbox-ai/preview", "/ops/confirm/pdf", 
 /* What is kept from what was sent, and from what came back. */
 const IN_KEYS = ["leg", "status", "code", "id", "driverPay", "amount", "how", "paid", "active", "date", "time",
   "returnDate", "returnTime", "pickup", "dropoff", "vehicle", "account", "partyKey", "from", "to", "cycle", "reset", "action"];
-const OUT_KEYS = ["number", "replaces", "was", "now", "total", "balance", "refunded", "settled", "deleted", "imported", "trips", "created", "emailed"];
+const OUT_KEYS = ["number", "replaces", "was", "now", "total", "balance", "refunded", "settled", "deleted", "imported", "trips", "created", "emailed", "keeper"];
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
 
 const one = (v, n) => String(v == null ? "" : v).replace(/\s+/g, " ").trim().slice(0, n || 120);
@@ -333,4 +333,20 @@ module.exports = function officeStaff({ app, pool, pinMatches, makePinHash, admi
   }
 
   return { OWNER, ready, ownerOf, signIn, userFor, track, record, routes };
+};
+
+/* Which staff login created each of these agents, going by the log (newest
+   entry first): a successful "Saved an agent" that names the code and says
+   "created: true", made by a login that still exists. { CODE: userId }.
+   Used once, to hand agents that predate keepers to whoever set them up. */
+module.exports.agentCreators = function agentCreators(logRows, codes, loginIds) {
+  const out = {};
+  for (const code of codes) {
+    if (!/^[A-Z0-9]{2,16}$/.test(String(code))) continue;
+    const names = new RegExp("(^|; )code: " + code + "(;|$)", "i");
+    const hit = (logRows || []).find((l) => l && l.user_id != null && loginIds.has(Number(l.user_id)) &&
+      names.test(String(l.detail || "")) && /(^|; )created: true(;|$)/.test(String(l.detail || "")));
+    if (hit) out[code] = Number(hit.user_id);
+  }
+  return out;
 };
