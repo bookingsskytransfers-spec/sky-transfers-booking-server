@@ -107,11 +107,16 @@ module.exports = function installDashboard(ctx) {
   }
 
   /* what needs someone today, whatever the period */
-  async function snapshot() {
+  async function snapshot(staff) {
     const t = today(), q = (sql, p) => pool.query(sql, p).then((r) => r.rows).catch(() => []);
     const inv = await q(`SELECT total_cents, to_char(due_on, 'YYYY-MM-DD') AS due FROM ops_invoices WHERE status = 'issued'`);
     const overdue = inv.filter((i) => i.due < t);
-    const comm = (await q(`SELECT COALESCE(SUM(commission_cents), 0) AS c FROM agent_bookings WHERE status = 'confirmed' AND NOT settled`))[0] || { c: 0 };
+    /* a staff login sees the commission of the agents it looks after, no one else's (18 Nov 2026) */
+    const all = !staff || staff.owner;
+    const comm = (all
+      ? await q(`SELECT COALESCE(SUM(commission_cents), 0) AS c FROM agent_bookings WHERE status = 'confirmed' AND NOT settled`)
+      : await q(`SELECT COALESCE(SUM(b.commission_cents), 0) AS c FROM agent_bookings b JOIN agents a ON a.code = b.agent_code
+                  WHERE b.status = 'confirmed' AND NOT b.settled AND a.keeper_uid = $1`, [staff.id]))[0] || { c: 0 };
     const dep = (await q(`SELECT COUNT(*) AS n, COALESCE(SUM(balance_cents), 0) AS c FROM web_bookings WHERE balance_cents > 0 AND status NOT IN ('declined','cancelled')`))[0] || { n: 0, c: 0 };
     const requested = (await q(`SELECT COUNT(*) AS n FROM web_bookings WHERE status = 'requested' AND pickup_date >= $1`, [t]))[0] || { n: 0 };
     const owed = (await q(`SELECT COALESCE(SUM(driver_pay_cents), 0) AS c, COUNT(*) AS n FROM ops_dispatch WHERE status = 'done' AND driver_paid_at IS NULL AND driver_pay_cents > 0`))[0] || { c: 0, n: 0 };
@@ -128,7 +133,7 @@ module.exports = function installDashboard(ctx) {
     return {
       invoicesOpen: { count: inv.length, amount: dollars(inv.reduce((n, i) => n + i.total_cents, 0)) },
       invoicesOverdue: { count: overdue.length, amount: dollars(overdue.reduce((n, i) => n + i.total_cents, 0)) },
-      commissionOwed: dollars(Number(comm.c) || 0),
+      commissionOwed: dollars(Number(comm.c) || 0), commissionYoursOnly: all ? undefined : true,
       balancesOwing: { count: Number(dep.n) || 0, amount: dollars(Number(dep.c) || 0) },
       requestsWaiting: Number(requested.n) || 0,
       driverPayOwed: { count: Number(owed.n) || 0, amount: dollars(Number(owed.c) || 0) },
@@ -144,7 +149,7 @@ module.exports = function installDashboard(ctx) {
       let from = isoDate(req.query.from) || addDays(t, -6), to = isoDate(req.query.to) || t;
       if (to < from) [from, to] = [to, from];
       if (Date.parse(to) - Date.parse(from) > 400 * 864e5) return res.status(400).json({ error: "Choose a period of up to 13 months." });
-      const [period, snap] = await Promise.all([build(from, to), snapshot()]);
+      const [period, snap] = await Promise.all([build(from, to), snapshot(req.staff)]);
       res.json({ ...period, snapshot: snap });
     } catch (err) {
       console.error("dashboard:", err);

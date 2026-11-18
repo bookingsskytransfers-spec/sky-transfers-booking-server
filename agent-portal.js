@@ -189,6 +189,10 @@ module.exports = function installAgentPortal(ctx) {
       -- price a booking was made at, and the charge on a late cancellation
       -- (status 'late_cancel' keeps the charge on the invoice, off the board)
       ALTER TABLE agents ADD COLUMN IF NOT EXISTS rate_card BOOLEAN NOT NULL DEFAULT FALSE;
+      -- who in the office looks after an agent, and so sees its commission
+      -- (18 Nov 2026): a staff login's id, or NULL for the main admin login only
+      ALTER TABLE agents ADD COLUMN IF NOT EXISTS keeper_uid INTEGER;
+      ALTER TABLE agents ADD COLUMN IF NOT EXISTS keeper_checked BOOLEAN NOT NULL DEFAULT FALSE;
       ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS rate_card      TEXT;
       ALTER TABLE agent_bookings ADD COLUMN IF NOT EXISTS cancel_fee_pct INTEGER;
       CREATE INDEX IF NOT EXISTS agent_bookings_by_agent
@@ -379,7 +383,7 @@ module.exports = function installAgentPortal(ctx) {
     const claim = readToken(bearer(req));
     if (!claim || claim.role !== "agent") return res.status(401).json({ error: "Your session has expired — please sign in again." });
     const { rows } = await pool.query(
-      "SELECT code, name, email, commission_pct, active, rate_card FROM agents WHERE code = $1", [claim.code]);
+      "SELECT code, name, email, commission_pct, active, rate_card, keeper_uid FROM agents WHERE code = $1", [claim.code]);
     if (!rows.length || !rows[0].active) return res.status(401).json({ error: "This account is no longer active." });
     req.agent = rows[0];
     /* A booking sent by the agency's own system (booking-api.js) */
@@ -399,7 +403,9 @@ module.exports = function installAgentPortal(ctx) {
       if (!staff) return gone();
       req.staff = staff;
       req.via = staff.owner ? "Sky Transfers office" : `Sky Transfers office (${staff.name})`;
-      req.user = { id: null, name: rows[0].name, email: rows[0].email, role: "owner", office: staff.name };
+      req.user = { id: null, name: rows[0].name, email: rows[0].email, role: "owner", office: staff.name,
+                   /* an office login that does not look after this agent books without the money */
+                   noMoney: !seesMoney(staff, rows[0].keeper_uid) };
       const extra = { agent: rows[0].code, notes: [] };
       office.track(req, res, extra);
       return officeSession.run(extra, () => next());
@@ -419,12 +425,46 @@ module.exports = function installAgentPortal(ctx) {
   }
   /* Bookings-only staff see fares but not the commission, the wallet or the
      agency's invoices; the main login and managers see everything. */
-  const canMoney = (req) => !req.user || req.user.role !== "staff";
+  const canMoney = (req) => !req.user || (req.user.role !== "staff" && !req.user.noMoney);
+  /* Who in the office sees an agent's commission (18 Nov 2026): the main
+     admin login always; a staff login only for an agent it looks after
+     (agents.keeper_uid). Everything else about the agent stays open to every
+     office login - the name, the bookings, the fares, booking for them. */
+  function seesMoney(staff, keeperUid) {
+    if (!staff || staff.owner) return true;
+    return keeperUid != null && staff.id != null && Number(keeperUid) === Number(staff.id);
+  }
+  const MONEY_NOT_YOURS = "Only the main admin login, or the staff member who looks after this agent, can see or pay its commission.";
+  const keeperOf = async (code) => {
+    const r = (await pool.query("SELECT keeper_uid FROM agents WHERE code = $1", [code])).rows[0];
+    return r ? r.keeper_uid : null;
+  };
+  /* Agents that were there before keepers were. Each is looked at once: if
+     the activity log shows a staff login created it ("Saved an agent" with
+     its code and "created: true"), that login keeps it; otherwise it stays
+     with the main admin login until the owner assigns it. Never looked at
+     again, so a later "main admin only" is not undone at the next restart. */
+  async function creditKeepers() {
+    try {
+      if (!pool || !office) return;
+      await office.ready;
+      const todo = (await pool.query("SELECT code FROM agents WHERE keeper_checked = FALSE")).rows;
+      if (!todo.length) return;
+      const log = (await pool.query(
+        "SELECT user_id, detail FROM office_activity WHERE action = 'Saved an agent' AND ok AND user_id IS NOT NULL ORDER BY id DESC")).rows;
+      const logins = new Set((await pool.query("SELECT id FROM office_users")).rows.map((u) => Number(u.id)));
+      const made = require("./office-staff").agentCreators(log, todo.map((a) => a.code), logins);
+      let n = 0;
+      for (const code of Object.keys(made)) { await pool.query("UPDATE agents SET keeper_uid = $2 WHERE code = $1 AND keeper_uid IS NULL", [code, made[code]]); n++; }
+      await pool.query("UPDATE agents SET keeper_checked = TRUE WHERE keeper_checked = FALSE");
+      console.log(`Agent keepers: ${todo.length} existing agent(s) checked, ${n} credited to the staff login that created them`);
+    } catch (e) { console.error("Agent keepers check failed:", e.message); }
+  }
   const canManage = (req) => !!req.user && (req.user.role === "owner" || req.user.role === "manager");
   const ACCOUNTS_ONLY = "Your login is for bookings only — ask whoever manages your agency's account.";
   function requireAgentAccounts(req, res, next) {
     requireAgent(req, res, () => {
-      if (!canMoney(req)) return res.status(403).json({ error: ACCOUNTS_ONLY });
+      if (!canMoney(req)) return res.status(403).json({ error: req.user && req.user.office ? MONEY_NOT_YOURS : ACCOUNTS_ONLY });
       next();
     }).catch((err) => { console.error("agent auth:", err); res.status(500).json({ error: "Could not check your sign-in just now." }); });
   }
@@ -1859,18 +1899,34 @@ module.exports = function installAgentPortal(ctx) {
       (await pool.query("SELECT agent_code, COUNT(*) AS n FROM agent_users WHERE active GROUP BY agent_code")).rows
         .forEach((s) => { staff[s.agent_code] = Number(s.n); });
       const use = await agentUse();
+      /* who looks after each agent, read apart from the grouped query above */
+      const keeper = {}, staffName = {};
+      (await pool.query("SELECT code, keeper_uid FROM agents")).rows.forEach((k) => { keeper[k.code] = k.keeper_uid; });
+      const boss = !req.staff || !!req.staff.owner;
+      let keepers;
+      if (boss) {
+        keepers = (await pool.query("SELECT id, name, active FROM office_users ORDER BY name").catch(() => ({ rows: [] }))).rows
+          .map((u) => ({ id: u.id, name: u.name, active: !!u.active }));
+        keepers.forEach((u) => { staffName[u.id] = u.name; });
+      }
+      const sees = (code) => seesMoney(req.staff, keeper[code]);
       res.json({
+        /* the main admin login is told who keeps each agent, and who could */
+        owner: boss, keepers,
         agents: rows.map((r) => ({
           code: r.code, name: r.name, email: r.email,
-          commissionPct: Number(r.commission_pct), active: r.active, rateCard: !!r.rate_card,
+          commissionPct: sees(r.code) ? Number(r.commission_pct) : null, active: r.active, rateCard: !!r.rate_card,
+          moneyHidden: sees(r.code) ? undefined : true,
+          keeperId: boss ? (keeper[r.code] != null ? Number(keeper[r.code]) : null) : undefined,
+          keeperName: boss && keeper[r.code] != null ? (staffName[keeper[r.code]] || "a deleted login") : undefined,
           /* never used, so it can be deleted outright (18 Nov 2026) */
           canDelete: !whyKeepAgent(r.code, use), keepReason: whyKeepAgent(r.code, use) || undefined,
           staff: staff[r.code] || 0,
           trips: Number(r.trips),
           gross: Number(r.gross_cents) / 100,
-          earned: Number(r.earned_cents) / 100,
-          paid: Number(r.paid_cents) / 100,
-          owing: (Number(r.earned_cents) - Number(r.paid_cents)) / 100,
+          earned: sees(r.code) ? Number(r.earned_cents) / 100 : null,
+          paid: sees(r.code) ? Number(r.paid_cents) / 100 : null,
+          owing: sees(r.code) ? (Number(r.earned_cents) - Number(r.paid_cents)) / 100 : null,
         })),
       });
     } catch (err) {
@@ -3308,7 +3364,12 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
       const code = String(req.query.code || "").trim().toUpperCase();
       const { rows } = await pool.query(
         `SELECT * FROM agent_bookings WHERE agent_code = $1 ORDER BY created_at DESC LIMIT 300`, [code]);
-      res.json({ bookings: rows.map(bookingRow) });
+      const money_ = seesMoney(req.staff, await keeperOf(code));
+      res.json({ moneyHidden: money_ ? undefined : true, bookings: rows.map((r) => {
+        const b = bookingRow(r);
+        if (!money_) { b.commission = null; b.settled = null; }
+        return b;
+      }) });
     } catch (err) {
       console.error("admin bookings:", err);
       res.status(500).json({ error: "Could not load those bookings." });
@@ -3326,10 +3387,26 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
         return res.status(400).json({ error: "Agent code must be 2–16 letters or digits, no spaces." });
       }
       if (!b.name) return res.status(400).json({ error: "Give the agency a name." });
-      const pct = Number(b.commissionPct);
+      const { rows: existing } = await pool.query("SELECT code, commission_pct, keeper_uid FROM agents WHERE code = $1", [code]);
+      /* The commission belongs to whoever looks after the agent: anyone
+         else's save keeps the rate that is there, whatever their page sent. */
+      const mine = !existing.length || seesMoney(req.staff, existing[0].keeper_uid);
+      const pct = mine ? Number(b.commissionPct) : Number(existing[0].commission_pct);
       if (!(pct >= 0 && pct <= 60)) return res.status(400).json({ error: "Commission must be between 0 and 60%." });
-
-      const { rows: existing } = await pool.query("SELECT code FROM agents WHERE code = $1", [code]);
+      /* Only the main admin login chooses who looks after an agent, and only
+         when its page sends the choice. */
+      const boss = !req.staff || !!req.staff.owner;
+      let keeperTo, keeperSaid;
+      if (boss && Object.prototype.hasOwnProperty.call(b, "keeperId")) {
+        const kid = b.keeperId === null || b.keeperId === "" ? null : Number(b.keeperId);
+        if (kid !== null) {
+          const u = Number.isInteger(kid) ? (await pool.query("SELECT id, name FROM office_users WHERE id = $1", [kid])).rows[0] : null;
+          if (!u) return res.status(400).json({ error: "That staff login no longer exists - choose another." });
+          keeperSaid = u.name;
+        } else keeperSaid = "main admin login only";
+        const was = existing.length && existing[0].keeper_uid != null ? Number(existing[0].keeper_uid) : null;
+        if (kid !== was) keeperTo = { id: kid }; else keeperSaid = undefined;
+      }
       let pin = null;
       if (!existing.length || b.resetPin) pin = newPin();
 
@@ -3343,15 +3420,17 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
         );
       } else {
         await pool.query(
-          `INSERT INTO agents (code, name, email, pin_hash, commission_pct, active)
-           VALUES ($1,$2,$3,$4,$5,$6)`,
-          [code, b.name, b.email || null, makePinHash(pin), pct, b.active !== false]
+          /* whoever creates an agent looks after it */
+          `INSERT INTO agents (code, name, email, pin_hash, commission_pct, active, keeper_uid, keeper_checked)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,TRUE)`,
+          [code, b.name, b.email || null, makePinHash(pin), pct, b.active !== false, boss ? null : req.staff.id]
         );
       }
       /* only when the page sends it, so an older admin page can't clear it */
       if (typeof b.rateCard === "boolean") await pool.query("UPDATE agents SET rate_card = $2 WHERE code = $1", [code, b.rateCard]);
+      if (keeperTo) await pool.query("UPDATE agents SET keeper_uid = $2, keeper_checked = TRUE WHERE code = $1", [code, keeperTo.id]);
       LOGIN_FAILS.delete(code);
-      res.json({ ok: true, code, pin, created: !existing.length });
+      res.json({ ok: true, code, pin, created: !existing.length, keeper: keeperSaid });
     } catch (err) {
       console.error("admin agent:", err);
       res.status(500).json({ error: "Could not save that agent." });
@@ -3364,6 +3443,7 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
   app.post("/admin/settle", requireAdmin, async (req, res) => {
     try {
       const code = String(req.body?.code || "").trim().toUpperCase();
+      if (!seesMoney(req.staff, await keeperOf(code))) return res.status(403).json({ error: MONEY_NOT_YOURS });
       const { rows } = await pool.query(
         `UPDATE agent_bookings SET settled = TRUE, settled_at = now()
           WHERE agent_code = $1 AND status = 'confirmed' AND settled = FALSE
@@ -3601,6 +3681,7 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
 
   initAgentSchema()
     .then(seedAgents)
+    .then(creditKeepers)
     .then(async () => {
       try {
         const r = await purgeOldEnquiries({ dryRun: !AUTO_PURGE });

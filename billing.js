@@ -1058,7 +1058,10 @@ module.exports = function installBilling(ctx) {
           await pool.query(`UPDATE agent_bookings SET pay_link_id = NULL, pay_link_url = NULL, pay_link_cents = NULL WHERE ref = $1`, [ref]);
         }
         console.log("agent booking amount:", ref, ag.total_cents, "->", amt);
-        return res.json({ ok: true, ref, was: ag.total_cents / 100, now: amt / 100, commission: comm / 100 });
+        /* the new commission goes back only to a login that looks after that agent (18 Nov 2026) */
+        const kp = (await pool.query(`SELECT keeper_uid FROM agents WHERE code = $1`, [ag.agent_code]).catch(() => ({ rows: [] }))).rows[0];
+        const sees = !req.staff || req.staff.owner || (kp && kp.keeper_uid != null && Number(kp.keeper_uid) === Number(req.staff.id));
+        return res.json({ ok: true, ref, was: ag.total_cents / 100, now: amt / 100, commission: sees ? comm / 100 : undefined });
       }
       const web = (await pool.query(`SELECT 1 FROM web_bookings WHERE ref = $1`, [ref]).catch(() => ({ rows: [] }))).rows[0];
       if (web) return res.status(400).json({ error: "That's a website booking, paid by card - change it with Amend in admin.html, so the guest is charged or refunded correctly." });
