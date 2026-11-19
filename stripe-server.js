@@ -1595,10 +1595,22 @@ try {
    what was asked, without anyone's details. Wrapped like the rest. */
 try {
   if (app.locals.assist) {
-    require("./assist-door")({ app, assist: app.locals.assist, pool: portal && portal.pool, requireAdmin: portal && portal.requireAdmin });
+    app.locals.assistDoor = require("./assist-door")({ app, assist: app.locals.assist, pool: portal && portal.pool, requireAdmin: portal && portal.requireAdmin });
   }
 } catch (err) {
   console.error("Assistant door not mounted (bookings unaffected):", err.message);
+}
+
+/* The MCP connection (assist-mcp.js): the same actions at /mcp, for assistants
+   that connect over the Model Context Protocol (Claude, ChatGPT and others add
+   it as a connected tool). No key and no rules of its own; it shares the
+   door's limits and log. Wrapped like the rest. */
+try {
+  if (app.locals.assist) {
+    require("./assist-mcp")({ app, assist: app.locals.assist, door: app.locals.assistDoor });
+  }
+} catch (err) {
+  console.error("MCP connection not mounted (bookings unaffected):", err.message);
 }
 
 /* Operations - the dispatch board, drivers, vehicles, and the driver job
