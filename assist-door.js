@@ -129,11 +129,11 @@ module.exports = function installAssistDoor(ctx) {
         ref        TEXT
       )`).then(() => { logOn = true; }, (e) => { logOn = /already exists/i.test(e.message); if (!logOn) console.error("assistant door: no log table (" + e.message + ")"); });
   }
-  function record(via, action, out, req, input) {
+  function record(via, action, out, req, input, agent) {
     if (!logOn) return;
     pool.query(`INSERT INTO assist_calls (via, action, ok, reason, caller, agent, assistant, ref) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
       [via, String(action).slice(0, 40), !!(out && out.ok), out && !out.ok ? String(out.reason || "").slice(0, 60) : null, mark(ipOf(req)),
-       String(req.headers["user-agent"] || "").slice(0, 200) || null,
+       String(agent || req.headers["user-agent"] || "").slice(0, 200) || null,
        action === "request_booking" ? String((input && input.assistant) || "").replace(/[^A-Za-z0-9 ._()\-]/g, "").trim().slice(0, 60) || null : null,
        out && out.ok && out.reference ? String(out.reference).slice(0, 30) : null])
       .catch((e) => console.error("assistant door log:", e.message));
@@ -214,5 +214,5 @@ module.exports = function installAssistDoor(ctx) {
   }
 
   console.log("Assistant door open at " + BASE + " (" + TOOLS.length + " actions)");
-  return { on: true, index: INDEX, openapi };
+  return { on: true, index: INDEX, openapi, record, prune, ipOf };
 };
