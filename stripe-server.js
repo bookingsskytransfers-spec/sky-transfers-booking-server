@@ -1589,6 +1589,18 @@ try {
   console.error("Assistant actions not mounted (bookings unaffected):", err.message);
 }
 
+/* The door other companies' AI assistants call those actions through
+   (assist-door.js): /assist/v1, described in the site's llms.txt. No key, no
+   rules of its own - the limits and refusals are the actions' - and a log of
+   what was asked, without anyone's details. Wrapped like the rest. */
+try {
+  if (app.locals.assist) {
+    require("./assist-door")({ app, assist: app.locals.assist, pool: portal && portal.pool, requireAdmin: portal && portal.requireAdmin });
+  }
+} catch (err) {
+  console.error("Assistant door not mounted (bookings unaffected):", err.message);
+}
+
 /* Operations - the dispatch board, drivers, vehicles, and the driver job
    links. Phase 1 of replacing Limo Anywhere. It reads the booking tables the
    portal owns rather than copying them, so it borrows the portal pool and

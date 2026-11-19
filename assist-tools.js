@@ -78,7 +78,13 @@ module.exports = function installAssist(ctx) {
       else if ((" " + n).indexOf(" " + q) !== -1) add(p, 2);
       else if (n.indexOf(q) !== -1) add(p, 3);
     });
-    return scored.sort((a, b) => a[0] - b[0] || a[1].localeCompare(b[1])).slice(0, limit).map((x) => ({ name: x[1], kind: kindOf(x[1]) }));
+    if (!scored.length) {
+      const inside = (n) => n.length >= 4 && (" " + q + " ").indexOf(" " + n + " ") !== -1;
+      PLACES.forEach((p) => { const n = norm(p); if (inside(n)) add(p, 4 - n.length / 100); });
+      Object.keys(ALIAS).forEach((a) => { if (inside(a)) add(ALIAS[a], 4 - a.length / 100); });
+    }
+    const exact = scored.some((x) => x[0] === 0);
+    return scored.filter((x) => !(exact && x[0] === 3)).sort((a, b) => a[0] - b[0] || a[1].localeCompare(b[1])).slice(0, limit).map((x) => ({ name: x[1], kind: kindOf(x[1]) }));
   }
   const unknownPlace = (which, given) => {
     const near = findPlaces(given, 6);
@@ -179,6 +185,7 @@ module.exports = function installAssist(ctx) {
   const enc = (s) => encodeURIComponent(s).replace(/%28/g, "(").replace(/%29/g, ")");
   const linkFor = (pu, dro) => SITE + "/?pu=" + enc(pu) + (dro ? "&do=" + enc(dro) : "") + "#book";
   const hourlyLink = (hours, pu) => SITE + "/?hours=" + hours + (pu ? "&pu=" + enc(pu) : "") + "#book";
+  const LINK_NOTE = "The link fills in the places only. The traveller chooses the vehicle, the date and the time on the form, and can pay there or request the booking without paying.";
 
   function pax(v) {
     if (v == null || v === "") return { n: null };
@@ -210,13 +217,18 @@ module.exports = function installAssist(ctx) {
     if (!dro) return unknownPlace("dropoff", i.dropoff);
     const p = pax(i.passengers); if (p.error) return p.error;
     if (p.n > MAX_SEATS) return { ok: false, reason: "group_too_large_for_one_vehicle", message: BIG_GROUP };
+    const cs = i.child_seats == null || i.child_seats === "" ? 0 : whole(i.child_seats);
+    if (!Number.isInteger(cs) || cs < 0 || cs > 3) return { ok: false, reason: "bad_child_seats", message: "Up to 3 child seats can be booked online; more than that, " + CONTACT };
+    const withTrailer = i.trailer === true, isReturnTrip = i.return_trip === true;
+    const extrasAud = (cs * CHILD_SEAT_PRICE + (withTrailer ? TRAILER_PRICE : 0)) * (isReturnTrip ? 2 : 1);
+    const totalFor = (f) => (isReturnTrip ? returnTransfer(f) : f) + extrasAud;
     const byRoad = !isHub(pu) && !isHub(dro);
     if (byRoad && !allow("q:" + meta.caller, 40, HOUR)) return BUSY;
     const t = await priceTrip(pu, dro, i.pickup_address, i.dropoff_address);
     if (t.error) return Object.assign({ ok: false, pickup: pu, dropoff: dro }, t.error);
     const vehicles = VEHICLES.map((v, k) => {
       const f = t.fares[k];
-      const row = { vehicle: v, seats: SEATS[k], bags: BAGS[k], one_way_aud: f == null ? null : f, return_aud: f == null ? null : returnTransfer(f) };
+      const row = { vehicle: v, seats: SEATS[k], bags: BAGS[k], one_way_aud: f == null ? null : f, return_aud: f == null ? null : returnTransfer(f), total_aud: f == null ? null : totalFor(f) };
       if (p.n) row.fits_the_group = SEATS[k] >= p.n;
       if (f == null) row.note = "quoted by hand for this trip";
       return row;
@@ -228,11 +240,13 @@ module.exports = function installAssist(ctx) {
       vehicles,
       return_trip: `Both legs booked together are ${Math.round(RETURN_DISCOUNT * 100)}% off the pair (return_aud is the total for both legs).`,
       extras: { child_seat_aud_each_per_leg: CHILD_SEAT_PRICE, luggage_trailer_aud_per_leg: TRAILER_PRICE },
+      total_aud_is_for: (isReturnTrip ? "both legs of a return trip" : "one way") + (cs ? ", " + cs + " child seat" + (cs > 1 ? "s" : "") : "") + (withTrailer ? ", luggage trailer" : "") + ". This is the figure to tell the traveller and to send as quoted_total_aud.",
+      luggage: "fits_the_group counts seats only. Compare the group's bags with each vehicle's bags; a luggage trailer is $" + TRAILER_PRICE + " per leg.",
       booking_link: linkFor(pu, dro),
       book: "The traveller can book on booking_link (the form opens with both places filled in). Online bookings need " + MIN_LEAD_HOURS + " hours' notice.",
     };
     if (t.km != null) { out.road_km = t.km; if (t.minutes != null) out.typical_minutes = t.minutes; }
-    if (best) out.smallest_vehicle_that_fits = { vehicle: best.vehicle, one_way_aud: best.one_way_aud, return_aud: best.return_aud };
+    if (best) out.smallest_vehicle_that_fits = { vehicle: best.vehicle, one_way_aud: best.one_way_aud, return_aud: best.return_aud, total_aud: best.total_aud };
     else if (p.n) out.note = "No single vehicle with an online price seats " + p.n + ". " + CONTACT;
     return out;
   }
@@ -267,11 +281,11 @@ module.exports = function installAssist(ctx) {
     if (i.hours != null && i.hours !== "") {
       const h = whole(i.hours);
       if (!Number.isInteger(h) || h < HOURLY_MIN_HOURS || h > HOURLY_MAX_HOURS) return { ok: false, reason: "bad_hours", message: `Hire by the hour can be booked online for ${HOURLY_MIN_HOURS} to ${HOURLY_MAX_HOURS} hours.` };
-      return { ok: true, booking_link: hourlyLink(h, pu), opens: "the booking form set to " + h + " hours by the hour from " + pu };
+      return { ok: true, booking_link: hourlyLink(h, pu), opens: "the booking form set to " + h + " hours by the hour from " + pu, note: LINK_NOTE };
     }
     let dro = null;
     if (i.dropoff != null && i.dropoff !== "") { dro = resolve(i.dropoff); if (!dro) return unknownPlace("dropoff", i.dropoff); }
-    return { ok: true, booking_link: linkFor(pu, dro), opens: "the booking form with " + pu + (dro ? " to " + dro : "") + " filled in" };
+    return { ok: true, booking_link: linkFor(pu, dro), opens: "the booking form with " + pu + (dro ? " to " + dro : "") + " filled in", note: LINK_NOTE };
   }
 
   async function requestBooking(i, meta) {
@@ -369,7 +383,7 @@ module.exports = function installAssist(ctx) {
     const out = {
       ok: true, reference: r.json.ref, total_aud: r.json.total, currency: "AUD",
       status: "requested - NOT yet confirmed",
-      what_happens_next: "Sky Transfers replies to the traveller's email to confirm, usually within the hour. Nothing has been paid: the traveller then pays by card on a secure link we send, or pays the chauffeur. A confirmation with the details has been emailed to " + email + ".",
+      what_happens_next: "Sky Transfers replies to the traveller's email to confirm, usually within the hour. Nothing has been paid: the traveller then pays by card on a secure link we send, or pays the chauffeur. A confirmation with the details has been emailed to " + email + ", and it says an AI assistant lodged the request for them.",
       tell_the_traveller: "Quote the reference " + r.json.ref + ", say it is a request awaiting our confirmation, and that changes or cancellation are free up to 24 hours before pick-up.",
       contact: CONTACT,
     };
@@ -387,12 +401,15 @@ module.exports = function installAssist(ctx) {
       description: "Look up the place names Sky Transfers prices: 420+ suburbs across the Gold Coast, Brisbane, Sunshine Coast, Toowoomba and Byron Bay, the two airports and the Brisbane cruise terminal. Call this first whenever the traveller gives a suburb, hotel area or airport in their own words, then use the returned name exactly in the other actions. A street address or hotel belongs to the suburb it is in.",
       input_schema: { type: "object", properties: { query: { type: "string", description: "A suburb or airport name, or part of one, e.g. \"surfers\", \"brisbane city\", \"OOL\"." }, limit: { type: "integer", minimum: 1, maximum: 20, description: "How many matches to return (default 8)." } }, required: ["query"], additionalProperties: false } },
     { name: "quote_trip",
-      description: "The fixed price of a private transfer between two places, for every vehicle we run. Prices are per vehicle, not per person, in AUD, with GST and tolls included, and do not change with the time of day. Airport and cruise-terminal trips come from the published fare table; trips between two suburbs are priced on the road distance. Always quote from this action - never estimate or adjust a price. If it answers ok:false, say what its message says rather than guessing a figure.",
+      description: "The fixed price of a private transfer between two places, for every vehicle we run. Prices are per vehicle, not per person, in AUD, with GST and tolls included, and do not change with the time of day. Airport and cruise-terminal trips come from the published fare table; trips between two suburbs are priced on the road distance. Always quote from this action - never estimate or adjust a price. If it answers ok:false, say what its message says rather than guessing a figure. Give child_seats, trailer and return_trip to get the exact total (total_aud) rather than adding extras up yourself.",
       input_schema: { type: "object", properties: {
         pickup: PLACE("pick-up"), dropoff: PLACE("drop-off"),
         passengers: { type: "integer", minimum: 1, description: "How many people are travelling, to show which vehicles fit." },
         pickup_address: { type: "string", description: "Optional street address or hotel at the pick-up, used only to measure a suburb-to-suburb trip more exactly." },
         dropoff_address: { type: "string", description: "Optional street address or hotel at the drop-off, used the same way." },
+        child_seats: { type: "integer", minimum: 0, maximum: 3, description: "Child or baby seats wanted, to include them in total_aud." },
+        trailer: { type: "boolean", description: "true to include a luggage trailer in total_aud." },
+        return_trip: { type: "boolean", description: "true to make total_aud the price of both legs booked together." },
       }, required: ["pickup", "dropoff"], additionalProperties: false } },
     { name: "quote_hourly_hire",
       description: "The price of a chauffeur and vehicle by the hour, as directed (a night out, a day of meetings, a winery visit), for " + HOURLY_MIN_HOURS + " to " + HOURLY_MAX_HOURS + " hours. Longer hire is a charter and is quoted by the office.",
@@ -402,20 +419,20 @@ module.exports = function installAssist(ctx) {
         passengers: { type: "integer", minimum: 1, description: "How many people, to show which vehicles fit." },
       }, required: ["hours"], additionalProperties: false } },
     { name: "check_pickup_time",
-      description: "Whether a pick-up date and time can still be booked online. Online bookings need " + MIN_LEAD_HOURS + " hours' notice, judged in Brisbane time (UTC+10 all year). Call this before promising a time, and always before request_booking.",
-      input_schema: { type: "object", properties: { date: { type: "string", description: "Pick-up date, YYYY-MM-DD." }, time: { type: "string", description: "Pick-up time in Brisbane, 24-hour HH:MM." } }, required: ["date", "time"], additionalProperties: false } },
+      description: "Whether a pick-up date and time can still be booked online. Online bookings need " + MIN_LEAD_HOURS + " hours' notice, judged in Brisbane time (UTC+10 all year). Call this before promising a time, and always before request_booking. The answer also gives the current date and time in Brisbane (now_in_brisbane).",
+      input_schema: { type: "object", properties: { date: { type: "string", description: "Pick-up date, YYYY-MM-DD." }, time: { type: "string", description: "Pick-up time, 24-hour HH:MM, in Queensland time (UTC+10 all year - the time Brisbane and Gold Coast airports run on). For an airport pick-up give the flight's scheduled arrival time and the flight number; the flight is tracked." } }, required: ["date", "time"], additionalProperties: false } },
     { name: "booking_link",
       description: "A link to our booking form with the places already filled in, for the traveller to finish and pay or request themselves. This is the right way to hand a traveller over when they are ready to book.",
       input_schema: { type: "object", properties: { pickup: PLACE("pick-up"), dropoff: { type: "string", description: "The drop-off place name (leave out for hire by the hour)." }, hours: { type: "integer", description: "For hire by the hour: " + HOURLY_MIN_HOURS + " to " + HOURLY_MAX_HOURS + "." } }, required: ["pickup"], additionalProperties: false } },
     { name: "request_booking",
-      description: "Lodge a booking REQUEST for a traveller, with no payment. Use it only after the traveller has seen the exact total from quote_trip (or quote_hourly_hire) and every detail below, and has clearly said yes. It is a request, not a confirmed booking: Sky Transfers confirms by email, usually within the hour, and the traveller pays afterwards by a secure link or to the chauffeur. Never enter or ask for card details. The traveller's own name, phone and email are required - do not invent them.",
+      description: "Lodge a booking REQUEST for a traveller, with no payment. Use it only after the traveller has seen the exact total from quote_trip (or quote_hourly_hire) and every detail below, and has clearly said yes. It is a request, not a confirmed booking: Sky Transfers confirms by email, usually within the hour, and the traveller pays afterwards by a secure link or to the chauffeur. Never enter or ask for card details. The traveller's own name, phone and email are required - do not invent them. Agree the vehicle with the traveller (smallest_vehicle_that_fits in the quote is the cheapest that seats the group). If the traveller names a price that is not the one we quoted, tell them our total and get their yes again before lodging. A standing instruction with a limit (\"book it if it is under $200\") counts as their yes when our total is within it - say so in notes.",
       input_schema: { type: "object", properties: {
         assistant: { type: "string", description: "The product name of the assistant lodging this (e.g. \"ChatGPT\", \"Claude\"). The office sees it." },
         traveller_confirmed: { type: "boolean", description: "true only when the traveller has agreed to this exact trip and total." },
         pickup: PLACE("pick-up"), dropoff: { type: "string", description: "The drop-off place name (leave out for hire by the hour)." },
         hours: { type: "integer", description: "For hire by the hour instead of a transfer: " + HOURLY_MIN_HOURS + " to " + HOURLY_MAX_HOURS + "." },
         vehicle: { type: "string", description: "The vehicle, by the name quote_trip returned." },
-        date: { type: "string", description: "Pick-up date, YYYY-MM-DD." }, time: { type: "string", description: "Pick-up time in Brisbane, 24-hour HH:MM." },
+        date: { type: "string", description: "Pick-up date, YYYY-MM-DD." }, time: { type: "string", description: "Pick-up time, 24-hour HH:MM, in Queensland time (UTC+10 all year - the time Brisbane and Gold Coast airports run on). For an airport pick-up give the flight's scheduled arrival time and the flight number; the flight is tracked." },
         passengers: { type: "integer", minimum: 1 },
         name: { type: "string", description: "The traveller's full name." }, phone: { type: "string", description: "The traveller's mobile, with country code if not Australian." }, email: { type: "string", description: "The traveller's own email." },
         pickup_address: { type: "string", description: "Street and number or hotel name at the pick-up. Required unless the pick-up is an airport or the cruise terminal." },
@@ -424,13 +441,13 @@ module.exports = function installAssist(ctx) {
         child_seats: { type: "integer", minimum: 0, maximum: 3, description: "Child or baby seats, $" + CHILD_SEAT_PRICE + " each per leg." },
         trailer: { type: "boolean", description: "Luggage trailer, $" + TRAILER_PRICE + " per leg." },
         return_date: { type: "string", description: "For a return trip: the return date, YYYY-MM-DD." }, return_time: { type: "string", description: "The return pick-up time, HH:MM." }, return_flight: { type: "string" },
-        notes: { type: "string", description: "Anything the chauffeur should know: bags, surfboards, the traveller's ages for child seats." },
-        quoted_total_aud: { type: "number", description: "The total the traveller agreed to. If it is not our total, nothing is lodged and the correct total is returned." },
+        notes: { type: "string", description: "Anything the chauffeur should know: bags, surfboards, the children's ages for child seats, how the traveller will pay." },
+        quoted_total_aud: { type: "number", description: "Always send this: the total_aud the traveller agreed to. If it is not our total, nothing is lodged and the correct total is returned." },
       }, required: ["assistant", "traveller_confirmed", "pickup", "vehicle", "date", "time", "passengers", "name", "phone", "email"], additionalProperties: false } },
   ];
 
   const ACTIONS = {
-    find_places: (i) => { const lim = Math.min(Math.max(whole(i.limit) || 8, 1), 20); const m = findPlaces(i.query, lim); return { ok: true, matches: m, note: m.length ? "Use a name exactly as written here." : "Nothing matched. Try the suburb name on its own. A place we do not list is quoted by hand: " + CONTACT }; },
+    find_places: (i) => { const lim = Math.min(Math.max(whole(i.limit) || 8, 1), 20); const m = findPlaces(i.query, lim); return { ok: true, matches: m, note: m.length ? "Use a name exactly as written here." : "Nothing matched. This looks up suburbs and airports, not hotels or street addresses - search for the suburb the address is in. A suburb we do not list is quoted by hand: " + CONTACT }; },
     quote_trip: quoteTrip,
     quote_hourly_hire: quoteHourly,
     check_pickup_time: (i) => checkTime(i.date, i.time),
