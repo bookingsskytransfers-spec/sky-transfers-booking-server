@@ -1613,6 +1613,18 @@ try {
   console.error("MCP connection not mounted (bookings unaffected):", err.message);
 }
 
+/* The chat on the website (assist-chat.js): Claude answers a visitor's
+   questions, quotes from the same actions and hands over a booking link. It is
+   not given request_booking, so it cannot lodge anything. Off until its own
+   key (ASSIST_CHAT_API_KEY) is on the server. Wrapped like the rest. */
+try {
+  if (app.locals.assist) {
+    app.locals.assistChat = require("./assist-chat")({ app, assist: app.locals.assist, door: app.locals.assistDoor, pool: portal && portal.pool, requireAdmin: portal && portal.requireAdmin });
+  }
+} catch (err) {
+  console.error("Site chat not mounted (bookings unaffected):", err.message);
+}
+
 /* Operations - the dispatch board, drivers, vehicles, and the driver job
    links. Phase 1 of replacing Limo Anywhere. It reads the booking tables the
    portal owns rather than copying them, so it borrows the portal pool and
