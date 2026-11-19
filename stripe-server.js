@@ -695,7 +695,7 @@ function bookingEmailHtml(b, s) {
         <td style="vertical-align:top;font:700 22px Arial,sans-serif;color:#141D30;">${esc(b.name)}</td>
         <td align="right" style="vertical-align:top;"><span style="display:inline-block;padding:6px 14px;border-radius:12px;font:700 10px Arial,sans-serif;letter-spacing:1px;background:${pillBg};color:#FFFFFF;">${c.pill.replace(/  ·  /g, " &middot; ")}</span></td>
       </tr></table>
-      <div style="font:400 14.5px/1.6 Arial,sans-serif;color:#333B4C;padding-top:10px;">Hi ${esc(String(b.name || "").split(" ")[0])}, ${greeting}</div>
+      <div style="font:400 14.5px/1.6 Arial,sans-serif;color:#333B4C;padding-top:10px;">Hi ${esc(String(b.name || "").split(" ")[0])}, ${greeting}${c.state === "request" && assistGuestNote(b) ? " " + esc(assistGuestNote(b)) : ""}</div>
     </td></tr>
 
     ${s.payUrl ? `<!-- Pay button: only a confirmation the office sent with a payment link -->
@@ -919,6 +919,26 @@ function quoteCheck(b, total) {
   return { quoted: Math.round(quoted), total: Math.round(total), note };
 }
 
+/* A request lodged by an AI assistant for a traveller (assist-tools.js) says
+   so on the office copy, on its own line above the booking like a referral
+   does, so the lines the dispatch automation reads are untouched. Only the
+   assistant's name, stripped to plain characters. */
+function assistName(b) {
+  return String((b && b.viaAssistant) || "").replace(/[^A-Za-z0-9 ._()\-]/g, "").trim().slice(0, 60);
+}
+function assistLine(b) {
+  const n = assistName(b);
+  return n ? `LODGED BY AN AI ASSISTANT (${n}) on the traveller's behalf - a pay-later request, nothing has been paid.\n` : "";
+}
+/* The traveller is told as well (Aman, 19 Nov 2026): once other companies'
+   assistants can lodge requests, one could be lodged with somebody else's
+   email address, and that person needs a plain way to say so. On the request
+   email only - by the time we confirm, a person here has dealt with it. */
+function assistGuestNote(b) {
+  const n = assistName(b);
+  return n ? `This request was sent for you by an AI assistant (${n}). If you did not ask for it, reply to this email and we will remove it.` : "";
+}
+
 app.post("/request-booking", async (req, res) => {
   try {
     if (!mailer) return res.status(500).json({ error: "Email is not configured on the server" });
@@ -957,7 +977,7 @@ app.post("/request-booking", async (req, res) => {
       replyTo: b.email,
       subject: `NEW Booking request: ${b.pickup} -> ${b.dropoff} (${b.date} ${b.time}) [${b.ref}]`,
       text: (mismatch ? `!! ${mismatch.note}\n\n` : "") +
-        `NEW BOOKING REQUEST — Sky Transfers website\n\n` + (aff ? affiliates.officeLine(aff) + "\n" : "") + s.text,
+        `NEW BOOKING REQUEST — Sky Transfers website\n\n` + (aff ? affiliates.officeLine(aff) + "\n" : "") + assistLine(b) + s.text,
       html: actions ? dispatchHtml(s, actions) : undefined,
       attachments: pdf ? [{ filename: "SkyTransfers-Booking.pdf", content: pdf }] : [],
     });
@@ -968,7 +988,7 @@ app.post("/request-booking", async (req, res) => {
       replyTo: BOOKINGS_EMAIL,
       subject: `Booking request received — Sky Transfers · ${b.ref}`,
       text:
-        `${hi(b.name)},\n\nThanks for your booking request with Sky Transfers.\n\n${s.text}\n\n` +
+        `${hi(b.name)},\n\nThanks for your booking request with Sky Transfers.\n\n${assistGuestNote(b) ? assistGuestNote(b) + "\n\n" : ""}${s.text}\n\n` +
         `This is a request, not a confirmed booking yet — we'll reply shortly (usually within the hour) to confirm your chauffeur.\n\n` +
         `Need anything in the meantime? Call or text +61 481 437 772.\n\n` +
         `Sky Transfers — Gold Coast & Brisbane airport transfers\nwww.skytransfers.com.au`,
@@ -1424,7 +1444,7 @@ app.post("/stripe-webhook", async (req, res) => {
 });
 
 const port = process.env.PORT || 4242;
-app.listen(port, () => console.log(`Sky Transfers payment server on :${port}`));
+const httpServer = app.listen(port, () => console.log(`Sky Transfers payment server on :${port}`));
 /* ---------------------------------------------------------------------
    The agent portal. It lives in agent-portal.js and is handed the pieces
    this file already owns — the fare table, the lead-time rule, the mailer
@@ -1550,6 +1570,23 @@ try {
 } catch (err) {
   stopsMod = null;
   console.error("stops not mounted (bookings without stops unaffected):", err.message);
+}
+
+/* The AI assistant's actions (assist-tools.js): look up a place, quote a trip
+   or an hourly hire, check the notice period, make a pre-filled booking link,
+   lodge a pay-later booking request. It holds no prices and no rules of its
+   own - it is handed computeFare and calls this server's own quote and
+   booking routes - and it adds no routes: the chat and the door for other
+   assistants are built on top of app.locals.assist. Wrapped like the rest. */
+try {
+  app.locals.assist = require("./assist-tools")({
+    VEHICLES, VEHICLE_ALIASES, HOURLY_RATES, HOURLY_MIN_HOURS, HOURLY_MAX_HOURS,
+    computeFare, leadTimeShortfall, MIN_LEAD_HOURS, returnTransfer, RETURN_DISCOUNT,
+    CHILD_SEAT_PRICE, TRAILER_PRICE, PLACES: AGENT_PLACES, HUBS: [OOL, BNE, CRUISE],
+    base: () => "http://127.0.0.1:" + httpServer.address().port,
+  });
+} catch (err) {
+  console.error("Assistant actions not mounted (bookings unaffected):", err.message);
 }
 
 /* Operations - the dispatch board, drivers, vehicles, and the driver job
