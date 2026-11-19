@@ -112,7 +112,10 @@ module.exports = function installAssistDoor(ctx) {
 
   /* ---- the log ---------------------------------------------------------- */
   const SALT = String(process.env.AGENT_SECRET || "sky");
-  const ipOf = (req) => String(req.headers["x-forwarded-for"] || req.ip || "").split(",")[0].trim() || "?";
+  const ipOf = (req) => {
+    const ip = String(req.headers["cf-connecting-ip"] || "").trim() || String(req.headers["x-forwarded-for"] || req.ip || "").split(",")[0].trim() || "?";
+    return (ip.indexOf(":") !== -1 ? ip.split(":").slice(0, 4).join(":") : ip).slice(0, 45);
+  };
   const mark = (ip) => crypto.createHash("sha256").update(SALT + "|" + ip).digest("hex").slice(0, 12);
   let logOn = false;
   if (pool) {
