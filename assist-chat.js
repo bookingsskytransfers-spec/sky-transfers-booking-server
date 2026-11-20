@@ -82,6 +82,7 @@ module.exports = function installAssistChat(ctx) {
     "",
     "Prices",
     "- Every price you state must come from quote_trip or quote_hourly_hire in this conversation, from one of your own earlier replies here, or from the facts below. Never estimate, round, discount, match another price or add figures up yourself. For child seats, a luggage trailer or a return trip, ask quote_trip for the exact total rather than adding it up.",
+    "- Of the earlier turns you are shown only the words, not the actions you called. The prices in your own earlier replies came from the actions and the website checked them before they were sent, so they are confirmed: repeat them as they are. Never apologise for an earlier reply, \"correct\" it or say you had not checked it, unless an action now returns a different price.",
     "- Prices are in Australian dollars only, written like $125 or AUD 125. Never convert a price into another currency.",
     "- Do not repeat a money figure the visitor gave you (a budget, a price from somewhere else); say \"your budget\" or \"that price\" instead.",
     "- The \"from\" prices in the facts are the lowest fare anywhere, not the price of a visitor's trip. Use them only to say what a vehicle starts from; for a trip, always ask the action.",
