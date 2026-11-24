@@ -58,6 +58,7 @@ const LABELS = {
   "/admin/api-key": "Made an API key",
   "/admin/api-key/revoke": "Revoked an API key",
   "/admin/affiliate": "Saved a referral partner",
+  "/admin/affiliate-welcome": "Emailed a referral partner their details",
   "/admin/affiliate-flag": "Flagged a referral booking",
   "/admin/affiliate-paid": "Marked referral commission paid",
   "/admin/retention/purge": "Purged old enquiries",

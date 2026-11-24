@@ -98,6 +98,7 @@ module.exports = function mountAffiliates(o) {
         created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
         activated_at   TIMESTAMPTZ
       );
+      ALTER TABLE affiliates ADD COLUMN IF NOT EXISTS welcomed_at TIMESTAMPTZ;
       ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS aff_code       TEXT;
       ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS aff_pct        NUMERIC(5,2);
       ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS aff_flag       TEXT;
@@ -151,6 +152,63 @@ module.exports = function mountAffiliates(o) {
     ? `Referral: ${a.code} (${a.business || a.name}), ${Number(a.commission_pct)}% commission` +
       (a.self ? " - FLAGGED: the guest's email or phone is the affiliate's own, check before paying" : "") + "\n"
     : "";
+
+  /* The welcome email (24 Nov 2026): the affiliate's own link, code and rate,
+     and how the programme works in the words of the referral page. It goes
+     out the first time an account is made active, and again when the office
+     asks. The PIN is never in it - the office passes that on itself, as the
+     admin page has always said. A copy goes to the office. */
+  const validEmail = (v) => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(v || "").trim());
+  function welcomeMail(a) {
+    const link = `${site}/?ref=${a.code}`;
+    const hi = firstName(a.name);
+    const bank = a.bsb && a.account_no
+      ? "Payments go out monthly by bank transfer, to the bank details we have on file for you."
+      : "Payments go out monthly by bank transfer. We don't have your bank details yet - when you are ready, send us your account name, BSB and account number.";
+    return {
+      subject: "Your Sky Transfers referral link and details",
+      text:
+        `Hi ${hi === "Guest" ? "there" : hi},\n\n` +
+        `Welcome to the Sky Transfers referral programme. Your account is active and your link is ready to share.\n\n` +
+        `YOUR DETAILS\n` +
+        `Your link: ${link}\n` +
+        `Your code: ${a.code}\n` +
+        `Your commission rate: ${Number(a.commission_pct)}%\n\n` +
+        `HOW IT WORKS\n` +
+        `- Share your link or your code with your guests. They book and pay on our website at the normal published fare.\n` +
+        `- Guests who don't use the link can type your code into "Referral code (optional)" on the booking form.\n` +
+        `- You earn commission on every trip that is booked and paid on our website and then completed. A cancelled or refunded booking earns nothing.\n` +
+        `- Commission is worked out on the fare, excluding GST and extras such as child seats and the luggage trailer.\n` +
+        `- Your link is remembered for 30 days on the guest's device. If they click someone else's link after yours, the last link clicked counts. A code typed into the booking form counts ahead of any link.\n` +
+        `- Bookings you make for yourself don't count.\n` +
+        `- Please don't run paid search advertising on "Sky Transfers" or our brand name, and no spam.\n\n` +
+        `YOUR ACCOUNT\n` +
+        `See the bookings you referred and what you have earned at:\n${site}/affiliate.html\n` +
+        `Sign in with your code and your PIN. For your security the PIN is not sent by email - Aman will give it to you directly.\n\n` +
+        `GETTING PAID\n${bank}\n\n` +
+        `Questions? Reply to this email, or call or WhatsApp +61 481 437 772.\n\n` +
+        `Aman\nSky Transfers\n`,
+    };
+  }
+  /* "sent", or why not: "inactive", "no-email" or "failed". Never throws. */
+  async function sendWelcome(a) {
+    if (!a || !a.active || !(Number(a.commission_pct) > 0)) return "inactive";
+    if (!validEmail(a.email)) return "no-email";
+    if (!mailer) return "failed";
+    try {
+      const m = welcomeMail(a);
+      await mailer.sendMail({
+        from: `"Sky Transfers" <${process.env.GMAIL_USER}>`, to: String(a.email).trim(), bcc: BOOKINGS_EMAIL, replyTo: BOOKINGS_EMAIL,
+        subject: m.subject, text: m.text,
+      });
+      await pool.query("UPDATE affiliates SET welcomed_at = now() WHERE code = $1", [a.code]).catch(() => {});
+      console.log("affiliate welcome: emailed", a.code);
+      return "sent";
+    } catch (e) {
+      console.error("affiliate welcome email:", a.code, e.message);
+      return "failed";
+    }
+  }
 
   /* Every referred booking of one affiliate (or all of them), with its state.
      The dispatch board's own rows say which legs are done. */
@@ -305,7 +363,7 @@ module.exports = function mountAffiliates(o) {
             code: a.code, name: a.name, business: a.business, email: a.email, phone: a.phone,
             website: a.website, promote: a.promote, bsb: a.bsb, accountNo: a.account_no, accountName: a.account_name,
             commissionPct: a.commission_pct != null ? Number(a.commission_pct) : null, active: a.active,
-            source: a.source, notes: a.notes, createdAt: a.created_at, hasPin: !!a.pin_hash,
+            source: a.source, notes: a.notes, createdAt: a.created_at, hasPin: !!a.pin_hash, welcomedAt: a.welcomed_at || null,
             link: `${site}/?ref=${a.code}`, bookings: list.length,
             pending: t.pending / 100, owed: t.earned / 100, paid: t.paid / 100, review: t.flagged / 100,
           };
@@ -369,10 +427,37 @@ module.exports = function mountAffiliates(o) {
           vals.concat(pin ? auth.makePinHash(pin) : null));
       }
       auth.clearFails("aff:" + code);
-      res.json({ ok: true, code, pin, link: `${site}/?ref=${code}`, created: !ex.length });
+      /* The first time an account goes active its welcome email goes out. An
+         account that was already active before is left alone - the office has
+         the button for that. */
+      let welcome = null;
+      if (active && !(ex[0] && ex[0].activated_at)) {
+        const fresh = (await pool.query("SELECT * FROM affiliates WHERE code = $1", [code])).rows[0];
+        welcome = await sendWelcome(fresh);
+      }
+      res.json({ ok: true, code, pin, link: `${site}/?ref=${code}`, created: !ex.length, welcome });
     } catch (err) {
       console.error("admin affiliate:", err);
       res.status(500).json({ error: "Could not save that affiliate." });
+    }
+  });
+
+  /* The welcome email again, when the office asks for it - and the way to send
+     it to an account that was already active before the email existed. */
+  app.post("/admin/affiliate-welcome", requireAdmin, async (req, res) => {
+    try {
+      await ready;
+      const code = normCode(req.body && req.body.code);
+      const a = code ? (await pool.query("SELECT * FROM affiliates WHERE code = $1", [code])).rows[0] : null;
+      if (!a) return res.status(404).json({ error: "No affiliate with that code." });
+      if (!a.active || !(Number(a.commission_pct) > 0)) return res.status(400).json({ error: "Make the account Active, with a commission rate, before emailing their details." });
+      if (!validEmail(a.email)) return res.status(400).json({ error: "Add their email address and save, then send it." });
+      const r = await sendWelcome(a);
+      if (r !== "sent") return res.status(502).json({ error: "The email could not be sent just now - please try again." });
+      res.json({ ok: true, code: a.code, to: String(a.email).trim() });
+    } catch (err) {
+      console.error("admin affiliate welcome:", err);
+      res.status(500).json({ error: "Could not send that email." });
     }
   });
 
