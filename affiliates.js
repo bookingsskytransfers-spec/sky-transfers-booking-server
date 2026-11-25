@@ -348,6 +348,48 @@ module.exports = function mountAffiliates(o) {
   });
 
   /* ---- admin -------------------------------------------------------------- */
+  /* Check a code (25 Nov 2026): would a website booking carrying this code be
+     credited, and to whom? It asks resolve() - the function every booking goes
+     through - so the answer cannot differ from what a real booking gets, and
+     when the answer is no it says which reason applies. A guest's email or
+     phone is optional: with one, it also says whether that booking would be
+     held as a self-referral. It reads only; nothing is written. POST, so a
+     guest's email or phone never sits in a web address. */
+  app.post("/admin/affiliate-check", requireAdmin, async (req, res) => {
+    try {
+      await ready;
+      res.setHeader("Cache-Control", "no-store");
+      const b = req.body || {};
+      const typed = String(b.code || "").trim().slice(0, 60);
+      if (!typed) return res.status(400).json({ error: "Type a referral code to check." });
+      const code = normCode(typed);
+      if (!code) {
+        return res.json({ ok: true, typed, code: null, credited: false, reason: "invalid",
+          message: `No. "${typed}" is not a valid code - a code is 3 to 30 letters, digits or hyphens - so a booking carrying it is taken as a normal booking with no referral.` });
+      }
+      const guest = { email: String(b.email || "").trim().slice(0, 160), phone: String(b.phone || "").trim().slice(0, 40) };
+      const hit = await resolve(code, null, guest);
+      const row = (await pool.query("SELECT code, name, business, commission_pct, active FROM affiliates WHERE code = $1", [code])).rows[0] || null;
+      const who = row ? (row.business || row.name) : null;
+      const base = { ok: true, typed, code, link: `${site}/?ref=${code}`, affiliate: who, active: row ? !!row.active : null,
+        commissionPct: row && row.commission_pct != null ? Number(row.commission_pct) : null };
+      if (hit) {
+        return res.json({ ...base, credited: true, selfReferral: !!hit.self, reason: hit.self ? "self" : "ok",
+          message: `Yes. A website booking with the code ${code} - typed into the form, or from the link ${site}/?ref=${code} - is credited to ${who} at ${Number(hit.commission_pct)}%.` +
+            (hit.self ? " But this guest's email or phone is the affiliate's own, so that booking would be flagged for you to allow or void before any commission counts." : "") });
+      }
+      if (!row) return res.json({ ...base, credited: false, reason: "unknown",
+        message: `No. There is no affiliate with the code ${code}, so a booking carrying it is taken as a normal booking with no referral.` });
+      if (!row.active) return res.json({ ...base, credited: false, reason: "inactive",
+        message: `No. ${who} (${code}) is not Active, so a booking carrying the code earns nothing. Set the account to Active to switch it on.` });
+      return res.json({ ...base, credited: false, reason: "no-rate",
+        message: `No. ${who} (${code}) has no commission rate, so a booking carrying the code earns nothing.` });
+    } catch (err) {
+      console.error("admin affiliate check:", err);
+      res.status(500).json({ error: "Could not check that code." });
+    }
+  });
+
   app.get("/admin/affiliates", requireAdmin, async (req, res) => {
     try {
       await ready;
