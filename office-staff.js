@@ -99,7 +99,7 @@ const LABELS = {
   "/ops/import/la": "Imported jobs",
 };
 /* Posts that change nothing: previews and drafts. */
-const NOT_CHANGES = new Set(["/autopilot/inbox-ai/preview", "/ops/confirm/pdf", "/ops/invoice/draft", "/agent/quote"]);
+const NOT_CHANGES = new Set(["/autopilot/inbox-ai/preview", "/ops/confirm/pdf", "/ops/invoice/draft", "/agent/quote", "/admin/affiliate-check"]);
 /* What is kept from what was sent, and from what came back. */
 const IN_KEYS = ["leg", "status", "code", "id", "driverPay", "amount", "how", "paid", "active", "date", "time",
   "returnDate", "returnTime", "pickup", "dropoff", "vehicle", "account", "partyKey", "from", "to", "cycle", "reset", "action"];
