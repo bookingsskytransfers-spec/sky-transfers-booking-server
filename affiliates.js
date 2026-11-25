@@ -100,6 +100,7 @@ module.exports = function mountAffiliates(o) {
       );
       ALTER TABLE affiliates ADD COLUMN IF NOT EXISTS welcomed_at TIMESTAMPTZ;
       ALTER TABLE affiliates ADD COLUMN IF NOT EXISTS pin_own BOOLEAN DEFAULT FALSE;
+      ALTER TABLE affiliates ADD COLUMN IF NOT EXISTS pin_issued_at TIMESTAMPTZ;
       ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS aff_code       TEXT;
       ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS aff_pct        NUMERIC(5,2);
       ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS aff_flag       TEXT;
@@ -157,10 +158,21 @@ module.exports = function mountAffiliates(o) {
   /* The welcome email (24 Nov 2026): the affiliate's own link, code and rate,
      and how the programme works in the words of the referral page. It goes
      out the first time an account is made active, and again when the office
-     asks. The PIN is never in it - the office passes that on itself, as the
-     admin page has always said. A copy goes to the office. */
+     asks. Since 26 Nov 2026 it carries a temporary PIN (see TEMP_PIN_DAYS),
+     unless the affiliate has already chosen their own. A copy goes to the
+     office. */
   const validEmail = (v) => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(v || "").trim());
-  function welcomeMail(a) {
+  /* A PIN the office issues is temporary (26 Nov 2026, Aman: "we send first
+     temporary PIN via email and when the other person logs in they have to
+     reset their PIN first"). It can travel by email because it only gets the
+     affiliate as far as choosing their own: nothing else on their page opens
+     until they have (requireAffiliate), and it stops working TEMP_PIN_DAYS
+     days after it was issued if it was never used. Six digits, since it
+     travels. An account from before this, with no issue date, never expires. */
+  const TEMP_PIN_DAYS = 7;
+  const tempPin = () => String(require("crypto").randomInt(100000, 1000000));
+  const tempExpired = (a) => !a.pin_own && !!a.pin_issued_at && Date.now() - new Date(a.pin_issued_at).getTime() > TEMP_PIN_DAYS * 864e5;
+  function welcomeMail(a, pin) {
     const link = `${site}/?ref=${a.code}`;
     const hi = firstName(a.name);
     const bank = a.bsb && a.account_no
@@ -185,19 +197,22 @@ module.exports = function mountAffiliates(o) {
         `- Please don't run paid search advertising on "Sky Transfers" or our brand name, and no spam.\n\n` +
         `YOUR ACCOUNT\n` +
         `See the bookings you referred and what you have earned at:\n${site}/affiliate.html\n` +
-        `Sign in with your code and your PIN. For your security the PIN is not sent by email - Aman will give it to you directly. Once you are signed in you can change it to a PIN of your own.\n\n` +
+        (pin
+          ? `Sign in with your code and this temporary PIN: ${pin}\n` +
+            `The first time you sign in you are asked to choose your own PIN straight away, and this one stops working. If it is not used within ${TEMP_PIN_DAYS} days it expires - just ask us for a new one. Please do not forward this email.\n\n`
+          : `Sign in with your code and the PIN you chose. Forgotten it? Call or WhatsApp +61 481 437 772 and we will email you a temporary one.\n\n`) +
         `GETTING PAID\n${bank}\n\n` +
         `Questions? Reply to this email, or call or WhatsApp +61 481 437 772.\n\n` +
         `Aman\nSky Transfers\n`,
     };
   }
   /* "sent", or why not: "inactive", "no-email" or "failed". Never throws. */
-  async function sendWelcome(a) {
+  async function sendWelcome(a, pin) {
     if (!a || !a.active || !(Number(a.commission_pct) > 0)) return "inactive";
     if (!validEmail(a.email)) return "no-email";
     if (!mailer) return "failed";
     try {
-      const m = welcomeMail(a);
+      const m = welcomeMail(a, pin);
       await mailer.sendMail({
         from: `"Sky Transfers" <${process.env.GMAIL_USER}>`, to: String(a.email).trim(), bcc: BOOKINGS_EMAIL, replyTo: BOOKINGS_EMAIL,
         subject: m.subject, text: m.text,
@@ -279,7 +294,7 @@ module.exports = function mountAffiliates(o) {
           `Name: ${a.name}\nBusiness: ${a.business || "-"}\nEmail: ${a.email}\nPhone: ${a.phone}\n` +
           `Website or listing: ${a.website || "-"}\n\nHow they'll promote us:\n${a.promote || "-"}\n\n` +
           `Saved in admin (Affiliates tab) as "${code}", INACTIVE. To approve: set the commission rate, ` +
-          `check the code, tick Active and save - the PIN is shown once, to pass on with their link ${site}/?ref=${code}\n`,
+          `check the code, tick Active and save - they are then emailed their link (${site}/?ref=${code}) and a temporary PIN.\n`,
       }).catch((e) => console.error("affiliate apply email:", e.message));
       res.json({ ok: true });
     } catch (err) {
@@ -297,14 +312,16 @@ module.exports = function mountAffiliates(o) {
       if (!code || !pin) return res.status(400).json({ error: "Enter your referral code and PIN." });
       const key = "aff:" + code;
       if (auth.loginLocked(key)) return res.status(429).json({ error: "Too many attempts. Try again in 15 minutes, or call +61 481 437 772." });
-      const { rows } = await pool.query("SELECT code, name, pin_hash, pin_ver, active FROM affiliates WHERE code = $1", [code]);
+      const { rows } = await pool.query("SELECT code, name, pin_hash, pin_ver, active, pin_own, pin_issued_at FROM affiliates WHERE code = $1", [code]);
       const a = rows[0];
       if (!a || !a.active || !a.pin_hash || !auth.pinMatches(pin, a.pin_hash)) {
         auth.noteLoginFail(key);
         return res.status(401).json({ error: "That code and PIN do not match." });
       }
       auth.clearFails(key);
-      res.json({ token: auth.signToken(a.code, "affiliate", 12 * 3600 * 1000, { pv: Number(a.pin_ver) }), name: a.name, code: a.code });
+      /* the right PIN, but a temporary one nobody used in time */
+      if (tempExpired(a)) return res.status(401).json({ error: "That temporary PIN has expired. Call or WhatsApp +61 481 437 772 and we will send you a new one." });
+      res.json({ token: auth.signToken(a.code, "affiliate", 12 * 3600 * 1000, { pv: Number(a.pin_ver) }), name: a.name, code: a.code, mustChangePin: !a.pin_own });
     } catch (err) {
       console.error("affiliate login:", err);
       res.status(500).json({ error: "Could not sign you in just now." });
@@ -317,6 +334,8 @@ module.exports = function mountAffiliates(o) {
       const { rows } = await pool.query("SELECT * FROM affiliates WHERE code = $1", [claim.code]);
       const a = rows[0];
       if (!a || !a.active || Number(a.pin_ver) !== Number(claim.pv)) return res.status(401).json({ error: "This account is no longer active, or its PIN changed - please sign in again." });
+      /* on a PIN the office issued, the one thing they may do is choose their own */
+      if (!a.pin_own && req.path !== "/affiliate/pin") return res.status(403).json({ error: "Choose your own PIN to continue.", mustChangePin: true });
       req.affiliate = a;
       next();
     } catch (err) {
@@ -449,6 +468,7 @@ module.exports = function mountAffiliates(o) {
             website: a.website, promote: a.promote, bsb: a.bsb, accountNo: a.account_no, accountName: a.account_name,
             commissionPct: a.commission_pct != null ? Number(a.commission_pct) : null, active: a.active,
             source: a.source, notes: a.notes, createdAt: a.created_at, hasPin: !!a.pin_hash, welcomedAt: a.welcomed_at || null,
+            pinOwn: !!a.pin_own, pinExpired: tempExpired(a),
             link: `${site}/?ref=${a.code}`, bookings: list.length,
             pending: t.pending / 100, owed: t.earned / 100, paid: t.paid / 100, review: t.flagged / 100,
           };
@@ -494,7 +514,7 @@ module.exports = function mountAffiliates(o) {
         }
       }
       let pin = null;
-      if ((active && !(ex[0] && ex[0].pin_hash)) || b.resetPin) pin = auth.newPin();
+      if ((active && !(ex[0] && ex[0].pin_hash)) || b.resetPin) pin = tempPin();
       const vals = [code, String(b.name).trim().slice(0, 120), clip(b.business, 160), clip(b.email, 160), clip(b.phone, 40),
         clip(b.website, 300), bsb, acct, clip(b.accountName, 120), pct, active, clip(b.notes, 1000)];
       if (ex.length) {
@@ -511,14 +531,17 @@ module.exports = function mountAffiliates(o) {
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13, CASE WHEN $11 THEN now() END, 'admin')`,
           vals.concat(pin ? auth.makePinHash(pin) : null));
       }
+      /* a PIN issued here is temporary: dated, and not the affiliate's own */
+      if (pin) await pool.query("UPDATE affiliates SET pin_issued_at = now(), pin_own = FALSE WHERE code = $1", [code]);
       auth.clearFails("aff:" + code);
-      /* The first time an account goes active its welcome email goes out. An
+      /* The first time an account goes active its welcome email goes out, with
+         the temporary PIN that was just made. An
          account that was already active before is left alone - the office has
          the button for that. */
       let welcome = null;
       if (active && !(ex[0] && ex[0].activated_at)) {
         const fresh = (await pool.query("SELECT * FROM affiliates WHERE code = $1", [code])).rows[0];
-        welcome = await sendWelcome(fresh);
+        welcome = await sendWelcome(fresh, pin);
       }
       res.json({ ok: true, code, pin, link: `${site}/?ref=${code}`, created: !ex.length, welcome });
     } catch (err) {
@@ -537,9 +560,17 @@ module.exports = function mountAffiliates(o) {
       if (!a) return res.status(404).json({ error: "No affiliate with that code." });
       if (!a.active || !(Number(a.commission_pct) > 0)) return res.status(400).json({ error: "Make the account Active, with a commission rate, before emailing their details." });
       if (!validEmail(a.email)) return res.status(400).json({ error: "Add their email address and save, then send it." });
-      const r = await sendWelcome(a);
-      if (r !== "sent") return res.status(502).json({ error: "The email could not be sent just now - please try again." });
-      res.json({ ok: true, code: a.code, to: String(a.email).trim() });
+      /* Someone who has chosen their own PIN is sent their details without one.
+         Anyone else gets a fresh temporary PIN in the email, and the one they
+         had stops working - so it is stored only once the email has gone. */
+      const pin = a.pin_own ? null : tempPin();
+      const r = await sendWelcome(a, pin);
+      if (r !== "sent") return res.status(502).json({ error: "The email could not be sent just now - please try again. Nothing has changed." });
+      if (pin) {
+        await pool.query("UPDATE affiliates SET pin_hash = $2, pin_ver = pin_ver + 1, pin_own = FALSE, pin_issued_at = now() WHERE code = $1", [a.code, auth.makePinHash(pin)]);
+        auth.clearFails("aff:" + a.code);
+      }
+      res.json({ ok: true, code: a.code, to: String(a.email).trim(), tempPin: !!pin });
     } catch (err) {
       console.error("admin affiliate welcome:", err);
       res.status(500).json({ error: "Could not send that email." });
