@@ -1528,6 +1528,16 @@ try {
   console.error("Outage alarm not mounted (bookings unaffected):", err.message);
 }
 
+/* Why a price could not be given (quote-misses.js): counts quotes priced and
+   refused and keeps the reason and the two suburbs of each refusal. It has to
+   be mounted before the two quote endpoints below so that it sees their
+   replies. Wrapped: a record must never be the thing that stops a quote. */
+try {
+  require("./quote-misses")({ app, pool: portal && portal.pool, requireAdmin: portal && portal.requireAdmin });
+} catch (err) {
+  console.error("Quote record not mounted (quotes unaffected):", err.message);
+}
+
 /* Point-to-point quotes: neither end an airport. Same treatment as the blog
    feed - wrapped, because it is new and nothing on the booking path needs it.
    It is handed the zone tables so it holds no copy of its own, and the admin

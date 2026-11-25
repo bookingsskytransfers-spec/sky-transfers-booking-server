@@ -107,7 +107,7 @@ module.exports = function installP2P(ctx) {
         const all = VEHICLES.map((v) => (QUOTE_ONLY.has(v) ? null : priced(v).fare));
         if (all.every((f) => f == null)) {
           const why = priced(priceable[0]).reason;
-          return res.status(422).json({ error: SPOKEN[why] || FALLBACK, reason: why });
+          return res.status(422).json({ error: SPOKEN[why] || FALLBACK, reason: why, km: road.km });
         }
         return res.json({
           km: road.km, minutes: road.minutes, pickup: from.suburb, dropoff: to.suburb,
@@ -119,7 +119,7 @@ module.exports = function installP2P(ctx) {
 
       const q = priced(vehicle);
       if (q.fare == null) {
-        return res.status(422).json({ error: SPOKEN[q.reason] || FALLBACK, reason: q.reason });
+        return res.status(422).json({ error: SPOKEN[q.reason] || FALLBACK, reason: q.reason, km: road.km });
       }
 
       res.json({
