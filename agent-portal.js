@@ -2464,6 +2464,7 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
           subject: `Booking confirmed — Sky Transfers · ${r.ref}`,
           text: `Hi ${r.passenger_name},\n\nGood news — your transfer is confirmed. Your chauffeur is booked.\n\n` +
                 `${rowLines(r)}\n\nTo secure it, pay here:\n${payUrl}\n\n` +
+                bankDetails.text(Math.round((r.total_cents || 0) / 100), r.ref) +
                 `We track your flight and your chauffeur meets you with a name board. Free changes up to 24 hours ` +
                 `before pick-up — reply to this email or call +61 481 437 772.\n\n` +
                 `Sky Transfers — Gold Coast & Brisbane airport transfers\nwww.skytransfers.com.au`,
@@ -2471,6 +2472,7 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
 <h1 style="font:400 26px/1.3 Georgia,serif;color:#141D30;margin:0 0 14px">Your transfer is confirmed</h1>
 <p style="margin:0 0 20px">Hi ${esc(r.passenger_name)}, your chauffeur is booked. Pay below to secure it.</p>
 <p style="margin:0 0 24px"><a href="${esc(payUrl)}" style="display:inline-block;background:#C9A227;color:#141D30;font-weight:700;text-decoration:none;padding:15px 28px;border-radius:9px">Pay ${esc(rowMoney(r))} now</a></p>
+${bankDetails.htmlRow(Math.round((r.total_cents || 0) / 100), r.ref) ? `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 20px">${bankDetails.htmlRow(Math.round((r.total_cents || 0) / 100), r.ref).replace("padding:14px 28px 2px;", "padding:0;")}</table>` : ""}
 <pre style="font:14px/1.6 ui-monospace,Menlo,Consolas,monospace;background:#F7F4ED;border:1px solid #E5E0D2;border-radius:10px;padding:16px;white-space:pre-wrap;margin:0">${esc(rowLines(r))}</pre>
 <p style="margin:18px 0 0;font-size:14px;color:#68707F">Free changes up to 24 hours before pick-up &mdash; reply to this email or call +61 481 437 772.</p></div>`,
         });
@@ -2555,8 +2557,12 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
     return addDeposit(s, r, b.paid);
   }
 
+  /* Bank details beside a payment link (26 Nov 2026) - see bank-details.js for
+     when they are offered and where they come from. */
+  const bankDetails = require("./bank-details");
   async function emailGuestConfirmation(b, s, payUrl) {
     const pdf = await bookingPdf(b, s).catch((e) => { console.error("PDF failed:", e.message); return null; });
+    const bankText = payUrl ? bankDetails.text(bankDetails.amountFor(s, b.paid), b.ref) : "";
     /* a deposit booking: deposit due, deposit paid, or its balance link */
     const dep = s.deposit && !s.refund ? (s.depositDue && !b.paid ? "due" : b.paid && s.balance ? (payUrl ? "balance" : "paid") : null) : null;
     const paidSoFar = s.balance ? s.total - s.balance : 0;
@@ -2605,7 +2611,7 @@ button{font:600 16px/1 inherit;padding:16px 26px;border:0;border-radius:9px;curs
     await mailer.sendMail({
       from: `"Sky Transfers" <${process.env.GMAIL_USER}>`,
       to: b.email, replyTo: BOOKINGS_EMAIL, subject,
-      text: `Hi ${b.name},\n\n${opening}\n\n${s.text}\n\n` +
+      text: `Hi ${b.name},\n\n${opening}\n\n${bankText}${s.text}\n\n` +
             (hoursOf(b) ? "Your chauffeur will be at the pick-up at the time above. Free changes to 24 hours "
                         : `We track your flight and your chauffeur meets you with a name board. Free changes to 24 hours `) +
             `before pick-up: reply to this email or call +61 481 437 772.\n\n` +
