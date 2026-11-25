@@ -703,7 +703,7 @@ function bookingEmailHtml(b, s) {
       <a href="${esc(s.payUrl)}" style="display:inline-block;background:#C9A227;color:#141D30;font:700 15px Arial,sans-serif;padding:14px 30px;border-radius:9px;text-decoration:none;">${s.balance ? `Pay the $${s.balance} balance now` : s.depositDue ? `Pay the $${s.depositDue} deposit now` : `Pay $${s.total} now to secure your booking`}</a>
       <div style="font:400 12.5px Arial,sans-serif;color:#68707F;padding-top:8px;">Secure card payment by Stripe &mdash; card details never touch our website.</div>
     </td></tr>
-    ${require("./bank-details").htmlRow(require("./bank-details").amountFor(s, paid), b.ref)}` : ""}
+    ${require("./bank-details").htmlRowFor(s, paid, b.ref)}` : ""}
     ${section("Booking details", c.booking)}
     ${section("Passenger details", c.passenger)}
     ${section(c.tripTitle, c.trip)}
