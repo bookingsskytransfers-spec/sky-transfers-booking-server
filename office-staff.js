@@ -37,6 +37,7 @@ const LABELS = {
   "/admin/web-booking/deposit": "Confirmed a booking with a deposit",
   "/admin/web-booking/balance-link": "Sent a balance link",
   "/admin/web-booking/balance-paid": "Marked a balance paid",
+  "/admin/web-booking/deposit-paid": "Marked a deposit paid another way",
   "/admin/web-booking/paid-elsewhere": "Marked a booking paid another way",
   "/admin/agent": "Saved an agent",
   "/admin/agent/delete": "Deleted an unused agent",
