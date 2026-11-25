@@ -138,6 +138,22 @@ module.exports = function installBilling(ctx) {
       -- Amending a sent invoice (18 Nov 2026): the number of the void invoice
       -- this one replaces. The old one is marked by its paid_note.
       ALTER TABLE ops_invoices ADD COLUMN IF NOT EXISTS replaces TEXT;
+      -- Part payments (26 Nov 2026): money received against an open invoice,
+      -- one row each, so the invoice shows what has come in and what is left.
+      -- pay_ref is a Stripe PaymentIntent, kept so a replayed webhook is not
+      -- counted twice. reminded_* is the last balance reminder that went out.
+      CREATE TABLE IF NOT EXISTS ops_invoice_payments (
+        id            SERIAL PRIMARY KEY,
+        invoice_id    INTEGER NOT NULL REFERENCES ops_invoices(id),
+        amount_cents  INTEGER NOT NULL,
+        how           TEXT,
+        received_on   DATE NOT NULL,
+        pay_ref       TEXT,
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS ops_invoice_payments_inv ON ops_invoice_payments (invoice_id);
+      ALTER TABLE ops_invoices ADD COLUMN IF NOT EXISTS reminded_at TIMESTAMPTZ;
+      ALTER TABLE ops_invoices ADD COLUMN IF NOT EXISTS reminded_count INTEGER DEFAULT 0;
     `);
     /* agent-portal.js owns agent_bookings and adds this too; added here as
        well so the invoice query never depends on which module set up first */
@@ -260,18 +276,24 @@ module.exports = function installBilling(ctx) {
   /* ---- Stripe payment link for an invoice ---------------------------------
      The webhook sees invoice_for and marks the invoice paid - see
      paidByStripe below. Optional: an invoice without one is still valid. */
-  async function payLinkFor(inv) {
-    if (!stripe || inv.total_cents <= 0) return null;
+  /* After a part payment the link asks for what is left, not the total
+     (26 Nov 2026). `again` is set when an earlier link has been switched off
+     and this one replaces it, so Stripe does not hand the dead one back. */
+  async function payLinkFor(inv, again) {
+    const got = inv.received_cents != null ? inv.received_cents : await receivedCents(inv.id);
+    const due = inv.total_cents - got;
+    if (!stripe || due <= 0) return null;
+    const seq = again ? "-" + Date.now().toString(36) : "";
     const price = await stripe.prices.create({
-      currency: "aud", unit_amount: inv.total_cents,
-      product_data: { name: `Sky Transfers tax invoice ${inv.number} - ${inv.party_name}` },
-    }, { idempotencyKey: "invprice-" + inv.number });
+      currency: "aud", unit_amount: due,
+      product_data: { name: `Sky Transfers tax invoice ${inv.number} - ${inv.party_name}${got > 0 ? " (balance)" : ""}` },
+    }, { idempotencyKey: "invprice-" + inv.number + seq });
     const link = await stripe.paymentLinks.create({
       line_items: [{ price: price.id, quantity: 1 }],
       metadata: { invoice_for: inv.number, ref: inv.number },
       after_completion: { type: "hosted_confirmation", hosted_confirmation: { custom_message: `Thank you - invoice ${inv.number} is paid. A receipt is on its way.` } },
       inactive_message: `Invoice ${inv.number} has been paid or replaced. Questions: ${SELLER.phone}.`,
-    }, { idempotencyKey: "invlink-" + inv.number });
+    }, { idempotencyKey: "invlink-" + inv.number + seq });
     await pool.query(`UPDATE ops_invoices SET pay_link_id = $2, pay_link_url = $3 WHERE id = $1`, [inv.id, link.id, link.url]);
     return link.url;
   }
@@ -292,8 +314,23 @@ module.exports = function installBilling(ctx) {
       `SELECT ref, to_char(service_date, 'YYYY-MM-DD') AS date, description, amount_cents, detail
          FROM ops_invoice_lines WHERE invoice_id = $1 ORDER BY service_date, id`, [id])).rows;
     for (const l of inv.lines) { try { l.detail = l.detail ? JSON.parse(l.detail) : null; } catch (e) { l.detail = null; } }
+    inv.payments = (await paymentsByInvoice([id])).get(id) || [];
+    inv.received_cents = inv.payments.reduce((a, p) => a + p.amount_cents, 0);
     return inv;
   }
+  /* Part payments, oldest first, for one invoice or for all of them. */
+  async function paymentsByInvoice(ids) {
+    const { rows } = await pool.query(
+      `SELECT id, invoice_id, amount_cents, how, to_char(received_on, 'YYYY-MM-DD') AS received
+         FROM ops_invoice_payments ${ids ? `WHERE invoice_id IN (${inList(ids.length)})` : ""} ORDER BY received_on, id`, ids || []);
+    const m = new Map();
+    for (const p of rows) { if (!m.has(p.invoice_id)) m.set(p.invoice_id, []); m.get(p.invoice_id).push(p); }
+    return m;
+  }
+  const receivedOf = (list) => (list || []).reduce((a, p) => a + p.amount_cents, 0);
+  async function receivedCents(id) { return receivedOf((await paymentsByInvoice([id])).get(id)); }
+  /* "Bank transfer" reads "bank transfer" mid-sentence; "PayID" is left alone */
+  const lowerHow = (h) => (/[A-Z].*[A-Z]/.test(String(h || "")) ? String(h) : String(h || "").toLowerCase());
   /* how an invoice voided by Amend is told from one voided outright */
   const AMEND_NOTE = "voided to be amended";
   const publicInvoice = (inv) => ({
@@ -306,6 +343,11 @@ module.exports = function installBilling(ctx) {
     overdue: inv.status === "issued" && inv.due < today(),
     daysOverdue: inv.status === "issued" && inv.due < today() ? Math.round((Date.parse(today()) - Date.parse(inv.due)) / 864e5) : 0,
     paidAt: inv.paid_at, paidNote: inv.paid_note, sentAt: inv.sent_at, sentTo: inv.sent_to, payUrl: inv.pay_link_url,
+    /* part payments: what has come in, and what is left on an open invoice */
+    received: receivedOf(inv.payments) / 100,
+    balance: inv.status === "issued" ? Math.max(0, inv.total_cents - receivedOf(inv.payments)) / 100 : 0,
+    payments: (inv.payments || []).map((p) => ({ id: p.id, amount: p.amount_cents / 100, how: p.how || "", received: p.received })),
+    remindedAt: inv.reminded_at || null, reminders: inv.reminded_count || 0,
     lineCount: inv.line_count != null ? +inv.line_count : (inv.lines ? inv.lines.length : null),
   });
 
@@ -374,7 +416,7 @@ module.exports = function installBilling(ctx) {
         ["Payment terms", paid ? "Paid" : termsText(inv)], ["Due date", ddmmyyyy(inv.due)],
         ["Period", inv.pfrom && inv.pto ? `${ddmmyyyy(inv.pfrom)} to ${ddmmyyyy(inv.pto)}` : ""],
         ["Replaces", inv.replaces ? `${inv.replaces} (cancelled)` : ""],
-        ["Amount due", paid ? dollars(0) : dollars(inv.total_cents), true]].filter((r) => r[1]);
+        [!paid && receivedOf(inv.payments) > 0 ? "Balance due" : "Amount due", paid ? dollars(0) : dollars(Math.max(0, inv.total_cents - receivedOf(inv.payments))), true]].filter((r) => r[1]);
       const boxH = Math.max(billRows.length, detRows.length) * 14 + 34;
       doc.rect(L, y, half, boxH).fill(SOFT);
       doc.rect(L + half + 14, y, half, boxH).fill(SOFT);
@@ -476,7 +518,7 @@ module.exports = function installBilling(ctx) {
       }
       const leftW = W - 300;
       const payH = 18 + payLines.reduce((h, [t]) => { doc.font("Helvetica").fontSize(8.8); return h + (t ? doc.heightOfString(t, { width: leftW }) + 2 : 6); }, 0);
-      if (y + Math.max(payH, 110) > PH - 60) { doc.addPage(); y = 40; }
+      if (y + Math.max(payH, 110 + 17 * (paid ? 0 : (inv.payments || []).length)) > PH - 60) { doc.addPage(); y = 40; }
       const top = y;
       doc.font("Helvetica-Bold").fontSize(10).fillColor(INK).text(paid ? "PAYMENT RECEIVED" : "PAYMENT METHODS", L, y);
       let py = y + 16;
@@ -505,6 +547,15 @@ module.exports = function installBilling(ctx) {
         ty += 17;
         doc.font("Helvetica-Bold").fontSize(11).fillColor(INK).text("Balance due", TX + 10, ty, { width: 150 })
           .text(dollars(0), TX + 160, ty, { width: TW - 170, align: "right" });
+      } else if (receivedOf(inv.payments) > 0) {
+        /* part paid: each amount received, then what is left */
+        inv.payments.forEach((p) => {
+          doc.font("Helvetica").fontSize(9.5).fillColor(MUTED).text(`Less: received ${ddmmyyyy(p.received)}`, TX + 10, ty, { width: 150 });
+          doc.fillColor(INK).text("-" + dollars(p.amount_cents), TX + 160, ty, { width: TW - 170, align: "right" });
+          ty += 17;
+        });
+        doc.font("Helvetica-Bold").fontSize(11).fillColor(INK).text("Balance due", TX + 10, ty, { width: 150 })
+          .text(dollars(Math.max(0, inv.total_cents - receivedOf(inv.payments))), TX + 160, ty, { width: TW - 170, align: "right" });
       } else {
         doc.font("Helvetica-Bold").fontSize(11).fillColor(INK).text("Amount due", TX + 10, ty, { width: 150 })
           .text(dollars(inv.total_cents), TX + 160, ty, { width: TW - 170, align: "right" });
@@ -571,7 +622,10 @@ module.exports = function installBilling(ctx) {
       const ajobs = (await pool.query(
         `SELECT ref, agent_code, total_cents FROM agent_bookings WHERE status <> 'cancelled' AND pickup_date <= $1`, [t])).rows;
       const invs = (await pool.query(
-        `SELECT party_type, party_key, total_cents, status, to_char(due_on, 'YYYY-MM-DD') AS due FROM ops_invoices WHERE status = 'issued'`)).rows;
+        `SELECT id, party_type, party_key, total_cents, status, to_char(due_on, 'YYYY-MM-DD') AS due FROM ops_invoices WHERE status = 'issued'`)).rows;
+      /* what is still owing on each: the total less any part payments */
+      const partPaid = await paymentsByInvoice();
+      for (const i of invs) i.total_cents = Math.max(0, i.total_cents - receivedOf(partPaid.get(i.id)));
       const billed = await billedRefs();
       const unbilled = (list, keyOf, centsOf) => {
         const m = new Map();
@@ -740,7 +794,8 @@ module.exports = function installBilling(ctx) {
       const counts = (await pool.query(`SELECT invoice_id, count(*)::int AS n FROM ops_invoice_lines GROUP BY invoice_id`)).rows;
       const byId = new Map(counts.map((c) => [c.invoice_id, c.n]));
       const repl = new Map((await pool.query(`SELECT number, replaces FROM ops_invoices WHERE replaces IS NOT NULL`)).rows.map((x) => [x.replaces, x.number]));
-      res.json({ today: today(), invoices: rows.map((r) => publicInvoice({ ...r, line_count: byId.get(r.id) || 0, replaced_by: repl.get(r.number) || null })) });
+      const pays = await paymentsByInvoice();
+      res.json({ today: today(), invoices: rows.map((r) => publicInvoice({ ...r, line_count: byId.get(r.id) || 0, replaced_by: repl.get(r.number) || null, payments: pays.get(r.id) || [] })) });
     } catch (err) {
       console.error("invoices list:", err);
       res.status(500).json({ error: "Could not load invoices." });
@@ -767,9 +822,11 @@ module.exports = function installBilling(ctx) {
         const counts = ids.length
           ? (await pool.query(`SELECT invoice_id, count(*)::int AS n FROM ops_invoice_lines WHERE invoice_id IN (${inList(ids.length)}) GROUP BY invoice_id`, ids)).rows : [];
         const byId = new Map(counts.map((c) => [c.invoice_id, c.n]));
+        const pays = ids.length ? await paymentsByInvoice(ids) : new Map();
         const invoices = rows.map((r) => {
-          const p = publicInvoice({ ...r, line_count: byId.get(r.id) || 0 });
+          const p = publicInvoice({ ...r, line_count: byId.get(r.id) || 0, payments: pays.get(r.id) || [] });
           return { id: p.id, number: p.number, issued: p.issued, due: p.due, from: p.from, to: p.to, total: p.total, gst: p.gst,
+                   received: p.received, balance: p.balance,
                    status: p.status, overdue: p.overdue, daysOverdue: p.daysOverdue, paidAt: p.paidAt, trips: p.lineCount,
                    payUrl: p.status === "issued" ? p.payUrl || null : null };
         });
@@ -783,8 +840,8 @@ module.exports = function installBilling(ctx) {
         res.json({
           today: t, invoices,
           statement: {
-            owing: sum(open, (i) => i.total), owingCount: open.length,
-            overdue: sum(late, (i) => i.total), overdueCount: late.length,
+            owing: sum(open, (i) => i.balance), owingCount: open.length,
+            overdue: sum(late, (i) => i.balance), overdueCount: late.length,
             uninvoiced: sum(unbilled, (r) => r.total_cents / 100), uninvoicedCount: unbilled.length,
           },
         });
@@ -838,16 +895,19 @@ module.exports = function installBilling(ctx) {
     const fresh = await invoiceWithLines(inv.id);
     const pdf = await invoicePdf(fresh);
     const paid = fresh.status === "paid";
+    /* part paid: the email asks for what is left */
+    const got = fresh.received_cents || 0, owing = Math.max(0, fresh.total_cents - got);
     await mailer.sendMail({
       from: `"Sky Transfers Accounts" <${process.env.GMAIL_USER}>`, to, replyTo: BOOKINGS_EMAIL, bcc: BOOKINGS_EMAIL,
       subject: paid ? `Paid tax invoice ${fresh.number} - Sky Transfers`
-                    : `${fresh.replaces ? "Revised tax" : "Tax"} invoice ${fresh.number} from Sky Transfers - ${dollars(fresh.total_cents)} due ${nice(fresh.due)}`,
+                    : `${fresh.replaces ? "Revised tax" : "Tax"} invoice ${fresh.number} from Sky Transfers - ${dollars(owing)} due ${nice(fresh.due)}`,
       text: `Hello${fresh.bill_contact ? " " + fresh.bill_contact.split(" ")[0] : ""},\n\n` +
         (paid ? `Attached is your paid tax invoice ${fresh.number} for ${fresh.party_name}. Thank you.\n`
               : `Attached is tax invoice ${fresh.number} for ${fresh.party_name}: ${fresh.lines.length} transfer${fresh.lines.length === 1 ? "" : "s"}` +
                 (fresh.pfrom ? ` from ${nice(fresh.pfrom)} to ${nice(fresh.pto)}` : "") + `.\n\n` +
                 (fresh.replaces ? `It replaces invoice ${fresh.replaces}, which has been cancelled - please disregard that one.\n\n` : "") +
-                `Amount due: ${dollars(fresh.total_cents)} (GST inclusive), by ${nice(fresh.due)}.\n` +
+                `Amount due: ${dollars(owing)} (GST inclusive), by ${nice(fresh.due)}.\n` +
+                (got > 0 ? `That is the ${dollars(fresh.total_cents)} total less ${dollars(got)} already received - thank you.\n` : "") +
                 (fresh.pay_link_url ? `\nPay by card: ${fresh.pay_link_url}\n` : "") +
                 (BANK_LINES.length ? `\nDirect bank deposit:\n${BANK_LINES.join("\n")}\nReference: ${fresh.number}\n` : "")) +
         `\nAny questions, reply to this email or call ${SELLER.phone}.\n\nKind regards,\n${SELLER.contact}\nSky Transfers\n` +
@@ -887,6 +947,117 @@ module.exports = function installBilling(ctx) {
     } catch (err) {
       console.error("invoice paid:", err);
       res.status(500).json({ error: "Could not update that invoice." });
+    }
+  });
+
+  /* ---- part payments and the balance reminder (26 Nov 2026) ---------------
+     Aman: "Kangaroo Voyage paid some amount towards an invoice by bank
+     transfer - how do I edit the amount and send a reminder for the remaining
+     balance". The invoice itself is never edited: each amount received is its
+     own row, the invoice shows received and balance, its card link is
+     replaced by one for what is left, and the last payment that clears it
+     marks it paid. A reminder is an email with the invoice attached that
+     says what has been received and what is still to pay. */
+  async function relinkBalance(inv) {
+    await killPayLink(inv);
+    await pool.query(`UPDATE ops_invoices SET pay_link_id = NULL, pay_link_url = NULL WHERE id = $1`, [inv.id]);
+    const fresh = await invoiceWithLines(inv.id);
+    if (fresh.status === "issued") await payLinkFor(fresh, true).catch((e) => console.error("invoice balance link:", e.message));
+    return invoiceWithLines(inv.id);
+  }
+
+  app.post("/ops/invoice/payment", requireAdmin, async (req, res) => {
+    try {
+      const b = req.body || {};
+      const inv = await invoiceWithLines(int(b.id, 1, 1e9, 0));
+      if (!inv) return res.status(404).json({ error: "No such invoice." });
+      if (inv.status === "void") return res.status(409).json({ error: "That invoice is void." });
+      if (inv.status === "paid") return res.status(409).json({ error: "That invoice is already paid in full. Press Re-open first if that was a mistake." });
+      const cents = Math.round(Number(b.amount) * 100);
+      if (!Number.isFinite(cents) || cents <= 0) return res.status(400).json({ error: "Type the amount received, in dollars." });
+      const left = inv.total_cents - inv.received_cents;
+      if (cents > left) return res.status(400).json({ error: `Only ${dollars(left)} is owing on ${inv.number} - the payment can't be more than that.` });
+      const on = /^\d{4}-\d{2}-\d{2}$/.test(String(b.received || "")) && String(b.received) <= today() ? String(b.received) : today();
+      const how = txt(b.how, 60) || "Bank transfer";
+      await pool.query(`INSERT INTO ops_invoice_payments (invoice_id, amount_cents, how, received_on) VALUES ($1, $2, $3, $4)`, [inv.id, cents, how, on]);
+      const full = cents === left;
+      if (full) {
+        await pool.query(`UPDATE ops_invoices SET status = 'paid', paid_at = COALESCE(paid_at, now()), paid_note = $2 WHERE id = $1`,
+          [inv.id, inv.received_cents > 0 ? "paid in parts, the last by " + lowerHow(how) : lowerHow(how)]);
+        await killPayLink(inv);
+      }
+      const fresh = full ? await invoiceWithLines(inv.id) : await relinkBalance(inv);
+      console.log("invoice payment recorded:", inv.number, dollars(cents), how, full ? "- paid in full" : "- " + dollars(left - cents) + " still owing");
+      res.json({ ok: true, number: inv.number, amount: cents / 100, received: fresh.received_cents / 100,
+                 balance: Math.max(0, fresh.total_cents - fresh.received_cents) / 100, paid: full, payUrl: full ? null : fresh.pay_link_url || null });
+    } catch (err) {
+      console.error("invoice payment:", err);
+      res.status(500).json({ error: "Could not record that payment." });
+    }
+  });
+
+  /* A payment typed in by mistake. Only while the invoice is open: one that
+     was cleared by its last payment is re-opened first. */
+  app.post("/ops/invoice/payment/remove", requireAdmin, async (req, res) => {
+    try {
+      const b = req.body || {};
+      const inv = await invoiceWithLines(int(b.id, 1, 1e9, 0));
+      if (!inv) return res.status(404).json({ error: "No such invoice." });
+      if (inv.status === "void") return res.status(409).json({ error: "That invoice is void." });
+      if (inv.status !== "issued") return res.status(409).json({ error: "That invoice is marked paid. Press Re-open first, then remove the payment." });
+      const pid = int(b.paymentId, 1, 1e9, 0);
+      const p = inv.payments.find((x) => x.id === pid);
+      if (!p) return res.status(404).json({ error: "That payment is not on this invoice." });
+      await pool.query(`DELETE FROM ops_invoice_payments WHERE id = $1 AND invoice_id = $2`, [pid, inv.id]);
+      const fresh = await relinkBalance(inv);
+      console.log("invoice payment removed:", inv.number, dollars(p.amount_cents));
+      res.json({ ok: true, number: inv.number, removed: p.amount_cents / 100, received: fresh.received_cents / 100,
+                 balance: Math.max(0, fresh.total_cents - fresh.received_cents) / 100 });
+    } catch (err) {
+      console.error("invoice payment remove:", err);
+      res.status(500).json({ error: "Could not remove that payment." });
+    }
+  });
+
+  app.post("/ops/invoice/remind", requireAdmin, async (req, res) => {
+    try {
+      if (!mailer) return res.status(500).json({ error: "Email is not configured on the server." });
+      const b = req.body || {};
+      const inv = await invoiceWithLines(int(b.id, 1, 1e9, 0));
+      if (!inv) return res.status(404).json({ error: "No such invoice." });
+      if (inv.status === "void") return res.status(409).json({ error: "That invoice is void." });
+      if (inv.status === "paid") return res.status(409).json({ error: "That invoice is paid - there is nothing to remind them about." });
+      const owing = inv.total_cents - inv.received_cents;
+      if (owing <= 0) return res.status(409).json({ error: "Nothing is owing on that invoice - press Mark paid." });
+      const to = txt(b.to, 200) || inv.bill_email;
+      if (!to || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) return res.status(400).json({ error: "Give an email address to send it to." });
+      if (!inv.pay_link_url) await payLinkFor(inv, inv.received_cents > 0).catch(() => null);
+      const fresh = await invoiceWithLines(inv.id);
+      const pdf = await invoicePdf(fresh);
+      const late = fresh.due < today();
+      const days = late ? Math.round((Date.parse(today()) - Date.parse(fresh.due)) / 864e5) : 0;
+      await mailer.sendMail({
+        from: `"Sky Transfers Accounts" <${process.env.GMAIL_USER}>`, to, replyTo: BOOKINGS_EMAIL, bcc: BOOKINGS_EMAIL,
+        subject: `Reminder: ${dollars(owing)} ${late ? "overdue" : "due " + nice(fresh.due)} on tax invoice ${fresh.number} - Sky Transfers`,
+        text: `Hello${fresh.bill_contact ? " " + fresh.bill_contact.split(" ")[0] : ""},\n\n` +
+          `A friendly reminder about tax invoice ${fresh.number} for ${fresh.party_name}, attached again for your records.\n\n` +
+          `Invoice total: ${dollars(fresh.total_cents)} (GST inclusive)\n` +
+          fresh.payments.map((p) => `Received ${nice(p.received)}: ${dollars(p.amount_cents)}${p.how ? " (" + lowerHow(p.how) + ")" : ""} - thank you\n`).join("") +
+          `${fresh.payments.length ? "Balance" : "Amount"} due: ${dollars(owing)}\n` +
+          (late ? `It was due on ${nice(fresh.due)} and is now ${days} day${days === 1 ? "" : "s"} overdue.\n` : `It is due by ${nice(fresh.due)}.\n`) +
+          (fresh.pay_link_url ? `\nPay by card: ${fresh.pay_link_url}\n` : "") +
+          (BANK_LINES.length ? `\nDirect bank deposit:\n${BANK_LINES.join("\n")}\nReference: ${fresh.number}\n` : "") +
+          `\nIf you have already paid, thank you - please reply with the remittance so we can match it.\n` +
+          `\nAny questions, reply to this email or call ${SELLER.phone}.\n\nKind regards,\n${SELLER.contact}\nSky Transfers\n` +
+          `${SELLER.short}\nABN ${SELLER.abn}\n${SELLER.phone}  |  ${SELLER.email}  |  ${SELLER.web}`,
+        attachments: [{ filename: fresh.number + ".pdf", content: pdf, contentType: "application/pdf" }],
+      });
+      await pool.query(`UPDATE ops_invoices SET reminded_at = now(), reminded_count = COALESCE(reminded_count, 0) + 1 WHERE id = $1`, [fresh.id]);
+      console.log("invoice reminder sent:", fresh.number, "->", to, dollars(owing), late ? days + " days overdue" : "not yet due");
+      res.json({ ok: true, to, number: fresh.number, balance: owing / 100, overdue: late, daysOverdue: days });
+    } catch (err) {
+      console.error("invoice remind:", err);
+      res.status(500).json({ error: "Could not send that reminder." });
     }
   });
 
@@ -977,7 +1148,19 @@ module.exports = function installBilling(ctx) {
     const { rows } = await pool.query(`SELECT id, number, status, total_cents, party_name, pay_link_id FROM ops_invoices WHERE number = $1`, [number]);
     const inv = rows[0];
     if (!inv) { console.error("invoice payment for unknown invoice:", number); return null; }
-    const full = amountCents >= inv.total_cents;
+    /* against what was still owing, not the total: a card payment for the
+       balance after a part payment clears the invoice. It joins the part
+       payments when there are any, or when it is itself only part - never
+       twice for a replayed webhook. A single card payment in full is recorded
+       exactly as it always was. */
+    const before = await receivedCents(inv.id);
+    const seen = paymentIntent ? (await pool.query(`SELECT 1 FROM ops_invoice_payments WHERE invoice_id = $1 AND pay_ref = $2`, [inv.id, paymentIntent])).rows.length > 0 : false;
+    const full = amountCents >= inv.total_cents - (seen ? before - amountCents : before);
+    if (!seen && inv.status === "issued" && (before > 0 || !full)) {
+      await pool.query(`INSERT INTO ops_invoice_payments (invoice_id, amount_cents, how, received_on, pay_ref) VALUES ($1, $2, $3, $4, $5)`,
+        [inv.id, Math.min(amountCents, Math.max(0, inv.total_cents - before)), "Card", today(), paymentIntent || null]);
+      if (!full) await relinkBalance(inv).catch((e) => console.error("invoice balance link:", e.message));
+    }
     await pool.query(
       `UPDATE ops_invoices SET status = CASE WHEN $2 THEN 'paid' ELSE status END,
          paid_at = CASE WHEN $2 THEN COALESCE(paid_at, now()) ELSE paid_at END, paid_note = $3 WHERE id = $1`,
@@ -988,7 +1171,8 @@ module.exports = function installBilling(ctx) {
       from: `"Sky Transfers Accounts" <${process.env.GMAIL_USER}>`, to: BOOKINGS_EMAIL,
       subject: `INVOICE PAID${full ? "" : " (PART)"}: ${number} - ${inv.party_name} - ${dollars(amountCents)}`,
       text: `${inv.party_name} paid ${dollars(amountCents)} by card against ${number} (total ${dollars(inv.total_cents)}).` +
-            (full ? "\nThe invoice is marked paid on the dispatch page." : "\nThis is LESS than the total - the invoice is still open."),
+            (full ? "\nThe invoice is marked paid on the dispatch page."
+                  : `\nThis is LESS than what was owing - the invoice is still open with ${dollars(Math.max(0, inv.total_cents - before - amountCents))} to pay.`),
     }).catch((e) => console.error("invoice paid alert:", e.message));
     return { full };
   }
