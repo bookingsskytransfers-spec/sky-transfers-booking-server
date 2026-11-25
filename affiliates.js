@@ -99,6 +99,7 @@ module.exports = function mountAffiliates(o) {
         activated_at   TIMESTAMPTZ
       );
       ALTER TABLE affiliates ADD COLUMN IF NOT EXISTS welcomed_at TIMESTAMPTZ;
+      ALTER TABLE affiliates ADD COLUMN IF NOT EXISTS pin_own BOOLEAN DEFAULT FALSE;
       ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS aff_code       TEXT;
       ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS aff_pct        NUMERIC(5,2);
       ALTER TABLE web_bookings ADD COLUMN IF NOT EXISTS aff_flag       TEXT;
@@ -184,7 +185,7 @@ module.exports = function mountAffiliates(o) {
         `- Please don't run paid search advertising on "Sky Transfers" or our brand name, and no spam.\n\n` +
         `YOUR ACCOUNT\n` +
         `See the bookings you referred and what you have earned at:\n${site}/affiliate.html\n` +
-        `Sign in with your code and your PIN. For your security the PIN is not sent by email - Aman will give it to you directly.\n\n` +
+        `Sign in with your code and your PIN. For your security the PIN is not sent by email - Aman will give it to you directly. Once you are signed in you can change it to a PIN of your own.\n\n` +
         `GETTING PAID\n${bank}\n\n` +
         `Questions? Reply to this email, or call or WhatsApp +61 481 437 772.\n\n` +
         `Aman\nSky Transfers\n`,
@@ -330,7 +331,7 @@ module.exports = function mountAffiliates(o) {
       const t = totals(list);
       res.json({
         name: a.name, business: a.business, code: a.code, link: `${site}/?ref=${a.code}`,
-        commissionPct: Number(a.commission_pct),
+        commissionPct: Number(a.commission_pct), pinOwn: !!a.pin_own,
         totals: { pending: t.pending / 100, earned: t.earned / 100, paid: t.paid / 100, review: t.flagged / 100 },
         /* first name, date, route and fare only - never a phone or an email */
         bookings: list.map((r) => ({
@@ -344,6 +345,48 @@ module.exports = function mountAffiliates(o) {
     } catch (err) {
       console.error("affiliate me:", err);
       res.status(500).json({ error: "Could not load your account just now." });
+    }
+  });
+
+  /* Change your own PIN (26 Nov 2026). The first PIN comes from the office;
+     this lets the affiliate replace it with one only they know. The current
+     PIN is asked for again, and wrong tries count toward the same
+     fifteen-minute lock as sign-in. The new one is 4 to 8 digits and not an
+     obvious one. Changing it signs out every other session of theirs; this
+     one is handed a fresh token. They are told by email that it changed -
+     never what to. A wrong current PIN answers 400, not 401, so their page
+     does not take it for an expired session and sign them out. */
+  const weakPin = (p) => /^(\d)\1+$/.test(p) || "01234567890123456789".indexOf(p) !== -1 || "98765432109876543210".indexOf(p) !== -1;
+  app.post("/affiliate/pin", requireAffiliate, async (req, res) => {
+    try {
+      const a = req.affiliate, key = "aff:" + a.code;
+      const cur = String((req.body && req.body.current) || "").trim(), next = String((req.body && req.body.next) || "").trim();
+      if (auth.loginLocked(key)) return res.status(429).json({ error: "Too many attempts. Try again in 15 minutes, or call +61 481 437 772." });
+      if (!cur || !auth.pinMatches(cur, a.pin_hash)) { auth.noteLoginFail(key); return res.status(400).json({ error: "That is not your current PIN." }); }
+      if (!/^\d{4,8}$/.test(next)) return res.status(400).json({ error: "A PIN is 4 to 8 digits, numbers only." });
+      if (weakPin(next)) return res.status(400).json({ error: "That PIN is too easy to guess. Avoid one repeated digit and runs like 1234." });
+      if (auth.pinMatches(next, a.pin_hash)) return res.status(400).json({ error: "That is the PIN you already have. Choose a different one." });
+      const r = await pool.query(
+        "UPDATE affiliates SET pin_hash = $2, pin_ver = pin_ver + 1, pin_own = TRUE WHERE code = $1 AND pin_ver = $3 RETURNING pin_ver",
+        [a.code, auth.makePinHash(next), a.pin_ver]);
+      if (!r.rows[0]) return res.status(409).json({ error: "Your PIN was changed a moment ago - please sign in again." });
+      auth.clearFails(key);
+      console.log("affiliate pin: changed by the affiliate,", a.code);
+      if (mailer && validEmail(a.email)) {
+        const hi = firstName(a.name);
+        mailer.sendMail({
+          from: `"Sky Transfers" <${process.env.GMAIL_USER}>`, to: String(a.email).trim(), replyTo: BOOKINGS_EMAIL,
+          subject: "Your Sky Transfers referral PIN was changed",
+          text: `Hi ${hi === "Guest" ? "there" : hi},\n\n` +
+            `The PIN for your Sky Transfers referral account (${a.code}) was changed just now from your account page.\n\n` +
+            `If that was you, there is nothing to do. If it was not you, call or WhatsApp +61 481 437 772 straight away and we will reset it.\n\n` +
+            `Aman\nSky Transfers\n`,
+        }).catch((e) => console.error("affiliate pin email:", a.code, e.message));
+      }
+      res.json({ ok: true, token: auth.signToken(a.code, "affiliate", 12 * 3600 * 1000, { pv: Number(r.rows[0].pin_ver) }) });
+    } catch (err) {
+      console.error("affiliate pin:", err);
+      res.status(500).json({ error: "Could not change your PIN just now." });
     }
   });
 
@@ -459,7 +502,7 @@ module.exports = function mountAffiliates(o) {
           `UPDATE affiliates SET code=$1, name=$2, business=$3, email=$4, phone=$5, website=$6, bsb=$7, account_no=$8,
                   account_name=$9, commission_pct=$10, active=$11, notes=$12,
                   activated_at = CASE WHEN $11 THEN COALESCE(activated_at, now()) ELSE activated_at END
-                  ${pin ? ", pin_hash=$14, pin_ver = pin_ver + 1" : ""}
+                  ${pin ? ", pin_hash=$14, pin_ver = pin_ver + 1, pin_own = FALSE" : ""}
             WHERE code=$13`, pin ? vals.concat(target, auth.makePinHash(pin)) : vals.concat(target));
       } else {
         await pool.query(
