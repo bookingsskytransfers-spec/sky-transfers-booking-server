@@ -150,10 +150,11 @@ const VEHICLES = [
 ];
 /* The 18-seater has airport and cruise TRANSFER fares - the eighth column of
    every rate table, the Sprinter 14 fare x 1.20 rounded up to the next $5
-   (Aman, 3 Nov 2026) - but no hourly or point-to-point price. QUOTE_ONLY now
-   means only that: p2p-fare.js and p2p-routes.js refuse it, and HOURLY_RATES
-   carries a null for it. computeFare, the road-distance fallback and stops
-   price it like any other vehicle. */
+   (Aman, 3 Nov 2026) - and, since 27 Nov 2026, an hourly rate like the other
+   Sprinters (Aman: "18 seater $165/hour"). It still has no point-to-point
+   price. QUOTE_ONLY now means only that: p2p-fare.js and p2p-routes.js
+   refuse it. computeFare, the road-distance fallback and stops price it like
+   any other vehicle. */
 const QUOTE_ONLY = new Set(["Mercedes Sprinter 18-Seater"]);
 /* Names that were live before 20 Sept 2026. A booking made seconds before the
    rename still has to price, so these stay here permanently. The fare comes
@@ -165,12 +166,16 @@ const VEHICLE_ALIASES = {
 };
 /* Hourly hire - a chauffeur and vehicle at the guest's disposal, booked from
    the homepage form like a transfer. Per hour by vehicle class, index-for-index
-   with VEHICLES; the 18-seater stays quote-only. Three hours is the floor -
+   with VEHICLES. Rates set by Aman on 27-28 Nov 2026: People Mover 100
+   (was 115), Luxury Sedan 110 (was 125), Luxury Minivan 125
+   (was 135), Sprinter 10-seater 135
+   (was 160), 14-seater 150 (was 185), 18-seater 165 (was quoted by hand).
+   Three hours is the floor -
    below that two one-ways are the better product - and past six hours it is
    charter work with its own half-day and full-day rates. No evening loading:
    the product exists for nights out, so the same rate applies at any hour.
    MUST match HOURLY_RATES / HOURLY_HOURS in index.html. */
-const HOURLY_RATES = [90, 100, 115, 125, 135, 160, 185, null];
+const HOURLY_RATES = [90, 100, 100, 110, 125, 135, 150, 165];
 const HOURLY_MIN_HOURS = 3, HOURLY_MAX_HOURS = 6;
 /* A booking can be held for 1 to 16 hours, but only 3 to 6 has an online
    price (baseFareForBooking). Longer - or shorter - is charter work the office
