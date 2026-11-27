@@ -170,7 +170,12 @@ const SP = { lat: -27.9990, lng: 153.4290, suburb: "Surfers Paradise" };
     [{ pickup: GC, dropoff: SP, vehicle: "Hovercraft" }, "a vehicle that does not exist"],
     [{ pickup: { ...GC, suburb: "Noosa Heads" }, dropoff: SP, vehicle: "Sedan" }, "a long-haul region"],
     [{ pickup: { ...GC, suburb: "Nowhereville" }, dropoff: SP, vehicle: "Sedan" }, "an unknown suburb"],
-    [{ pickup: GC, dropoff: { ...SP, suburb: "Broadbeach" }, vehicle: "Sedan" }, "the same suburb both ends"],
+    [{ pickup: GC, dropoff: { ...GC }, vehicle: "Sedan" }, "the same place at both ends"],
+    [{ pickup: { suburb: "Broadbeach" }, dropoff: { suburb: "Broadbeach" }, vehicle: "Sedan" }, "the same suburb picked twice with no address"],
+    [{ pickup: { suburb: "Broadbeach", address: "1 Surf Pde, Broadbeach QLD" }, dropoff: { suburb: "Broadbeach", address: "Broadbeach, QLD, Australia" }, vehicle: "Sedan" }, "the same suburb with only one street address"],
+    [{ pickup: { suburb: "Broadbeach", address: "1 Surf Pde, Broadbeach QLD" }, dropoff: { suburb: "Broadbeach", address: "1 surf pde,  broadbeach qld" }, vehicle: "Sedan" }, "the same street address typed twice"],
+    [{ pickup: { ...GC, suburb: "Noosa Heads" }, dropoff: { ...SP, suburb: "Noosa Heads" }, vehicle: "Sedan" }, "two addresses in one long-haul suburb"],
+    [{ pickup: { ...GC, suburb: OOL }, dropoff: { ...SP, suburb: OOL }, vehicle: "Sedan" }, "the same airport both ends"],
   ]) {
     const roads = stubRoads({ km: 4.2, minutes: 8 });
     const { app } = mount(roads, true);
@@ -180,6 +185,27 @@ const SP = { lat: -27.9990, lng: 153.4290, suburb: "Surfers Paradise" };
     ok(typeof r.body.error === "string" && r.body.error.length > 10, why + " gets a sentence a customer can read");
     ok(!/computeFare|null|undefined|_/.test(r.body.error.replace(/[.,]/g, "")) || /airport/.test(r.body.error),
       why + " does not leak an internal reason string into the customer message");
+  }
+
+  section("two addresses in one suburb are a trip, not the same place (26 Nov 2026)");
+  {
+    const roads = stubRoads({ km: 0.9, minutes: 4 });
+    const { app, api } = mount(roads, true);
+    const two = { pickup: GC, dropoff: { ...SP, suburb: "Broadbeach" } };
+    let r = await call(app, "POST /p2p-quote", two);
+    eq(r.code, 200, "two different points in Broadbeach are priced");
+    eq(r.body.fares[0], 80, "at the lowest Gold Coast band for the Sedan");
+    eq(r.body.fares[1], 95, "with the usual class adder for the SUV");
+    eq(roads.calls, 1, "after one distance lookup");
+    eq(await api.fareFor({ vehicle: "Sedan", p2p: two }), 80, "checkout recomputes the same $80");
+    r = await call(app, "POST /p2p-quote", { pickup: { suburb: "Fortitude Valley", address: "1 Ann St, Fortitude Valley QLD" }, dropoff: { suburb: "Fortitude Valley", address: "200 Brunswick St, Fortitude Valley QLD" }, vehicle: "Sedan" });
+    eq(r.code, 200, "two street addresses in one Brisbane suburb are priced with no coordinates");
+    eq(r.body.fare, 85, "at the lowest Brisbane band");
+    eq(await api.fareFor({ vehicle: "Sedan", p2p: { pickup: GC, dropoff: { ...GC } } }), null, "the same point twice is still not a fare at checkout");
+    const none = stubRoads({ km: 0 });
+    r = await call(mount(none, true).app, "POST /p2p-quote", two);
+    eq(r.code, 422, "two addresses the road measure puts 0 km apart are the same place after all");
+    eq(r.body.reason, "same_place", "and say so");
   }
 
   section("missing addresses never reach Google either");

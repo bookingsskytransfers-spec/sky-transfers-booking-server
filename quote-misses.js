@@ -31,7 +31,7 @@ module.exports = function installQuoteMisses({ app, pool, requireAdmin }) {
   const LABEL = {
     outside_banded_area: "Outside the area priced online (Sunshine Coast, Toowoomba, Byron and northern NSW, or a suburb not on the list)",
     over_max_km: "Longer than the online limit",
-    same_place: "Both ends in the same suburb",
+    same_place: "The same place at both ends",
     airport_leg_use_computeFare: "An airport or the cruise terminal at one end, sent as a non-airport trip",
     vehicle_quoted_by_hand: "The 18-seater, which is quoted by hand",
     unknown_vehicle: "A vehicle the server does not know",
