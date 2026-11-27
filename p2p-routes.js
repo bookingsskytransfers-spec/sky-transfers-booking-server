@@ -63,6 +63,23 @@ module.exports = function installP2P(ctx) {
     address: String((p && p.address) || "").trim().slice(0, 200),
   });
 
+  /* Two ends in the same suburb (26 Nov 2026). A hotel to a restaurant in
+     one suburb is the commonest night-out trip, and it used to be turned away
+     as "the same place" because both ends carry the same suburb name. It is a
+     real trip when the two ends are really apart: two sets of coordinates
+     more than a few tens of metres from each other, or - with no coordinates
+     - two different street addresses, neither of them just the suburb. */
+  const flatAddr = (v) => String(v == null ? "" : v).trim().replace(/\s+/g, " ").toLowerCase();
+  const coord = (v) => (v === "" || v == null || !Number.isFinite(+v) ? null : +v);
+  function apart(from, to) {
+    const a = [coord(from.lat), coord(from.lng)], b = [coord(to.lat), coord(to.lng)];
+    if (a[0] != null && a[1] != null && b[0] != null && b[1] != null) {
+      return Math.abs(a[0] - b[0]) > 0.0003 || Math.abs(a[1] - b[1]) > 0.0003;
+    }
+    const bare = (p) => !p.address || flatAddr(p.address) === flatAddr(p.suburb) || flatAddr(p.address) === flatAddr(p.suburb + ", QLD, Australia");
+    return !bare(from) && !bare(to) && flatAddr(from.address) !== flatAddr(to.address);
+  }
+
   /* The vehicles the fare engine can price, in VEHICLES order. The quote-only
      18-seater stays in the list as null so the page's grid lines up. */
   const priceable = VEHICLES.filter((v) => !QUOTE_ONLY.has(v));
@@ -88,19 +105,25 @@ module.exports = function installP2P(ctx) {
          here for nothing. The distance is only worth buying once the trip is
          one we could actually price. With no vehicle named, the Sedan stands
          in: every refusal that is about the route, not the vehicle, shows on it. */
-      const dry = fares.quote({ pickupSuburb: from.suburb, dropoffSuburb: to.suburb, km: 1, vehicle: vehicle || "Sedan" });
+      /* same suburb, but two addresses that are really apart: an ordinary trip */
+      const same = from.suburb === to.suburb && apart(from, to);
+      const dry = fares.quote({ pickupSuburb: from.suburb, dropoffSuburb: to.suburb, km: 1, vehicle: vehicle || "Sedan", sameSuburb: same });
       if (dry.fare == null && dry.reason !== "no_distance") {
         return res.status(422).json({ error: SPOKEN[dry.reason] || FALLBACK, reason: dry.reason });
       }
 
       const road = await roadFor(from, to);
+      /* two addresses the road measure puts on top of each other are the same place after all */
+      if (same && (road.km === 0 || (road.km == null && road.reason === "no_route"))) {
+        return res.status(422).json({ error: SPOKEN.same_place, reason: "same_place" });
+      }
       if (road.km == null) {
         console.error("p2p quote: no distance (" + road.reason + ") for " +
           from.suburb + " -> " + to.suburb);
         return res.status(503).json({ error: NO_DISTANCE, reason: road.reason });
       }
 
-      const priced = (v) => fares.quote({ pickupSuburb: from.suburb, dropoffSuburb: to.suburb, km: road.km, vehicle: v });
+      const priced = (v) => fares.quote({ pickupSuburb: from.suburb, dropoffSuburb: to.suburb, km: road.km, vehicle: v, sameSuburb: same });
 
       /* No vehicle: the whole ladder at once, for the page's vehicle grid. */
       if (!vehicle) {
@@ -150,14 +173,15 @@ module.exports = function installP2P(ctx) {
     if (!p || typeof p !== "object") return null;
     const from = place(p.pickup), to = place(p.dropoff);
     if (!from.suburb || !to.suburb) return null;
-    const dry = fares.quote({ pickupSuburb: from.suburb, dropoffSuburb: to.suburb, km: 1, vehicle: b.vehicle });
+    const same = from.suburb === to.suburb && apart(from, to);
+    const dry = fares.quote({ pickupSuburb: from.suburb, dropoffSuburb: to.suburb, km: 1, vehicle: b.vehicle, sameSuburb: same });
     if (dry.fare == null && dry.reason !== "no_distance") return null;
     const road = await roadFor(from, to);
     if (road.km == null) {
       console.error("p2p fare: no distance (" + road.reason + ") for " + from.suburb + " -> " + to.suburb);
       return null;
     }
-    return fares.quote({ pickupSuburb: from.suburb, dropoffSuburb: to.suburb, km: road.km, vehicle: b.vehicle }).fare;
+    return fares.quote({ pickupSuburb: from.suburb, dropoffSuburb: to.suburb, km: road.km, vehicle: b.vehicle, sameSuburb: same }).fare;
   }
 
   /* ---- self-test ---------------------------------------------------------

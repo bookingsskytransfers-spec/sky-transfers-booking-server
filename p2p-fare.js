@@ -145,7 +145,7 @@ module.exports = function makeP2PFare(tables) {
      there is no fixed price and the job has to be quoted by hand. reason is
      always set when fare is null, so the caller can say something useful
      rather than fail blankly. */
-  function quote({ pickupSuburb, dropoffSuburb, km, vehicle }) {
+  function quote({ pickupSuburb, dropoffSuburb, km, vehicle, sameSuburb }) {
     const name = (VEHICLE_ALIASES && VEHICLE_ALIASES[vehicle]) || vehicle;
     if (QUOTE_ONLY.has(name)) return { fare: null, reason: "vehicle_quoted_by_hand" };
     const vi = VEHICLES.indexOf(name);
@@ -156,7 +156,11 @@ module.exports = function makeP2PFare(tables) {
     const a = String(pickupSuburb == null ? "" : pickupSuburb).trim();
     const b = String(dropoffSuburb == null ? "" : dropoffSuburb).trim();
     if (!a || !b) return { fare: null, reason: "missing_endpoint" };
-    if (a === b) return { fare: null, reason: "same_place" };
+    /* The same suburb at both ends is the same place - unless the caller has
+       established that the two street addresses differ (26 Nov 2026, Aman:
+       "do 1"). Then it is an ordinary short trip, a hotel to a restaurant,
+       and prices on its measured distance like any other: the lowest band. */
+    if (a === b && !sameSuburb) return { fare: null, reason: "same_place" };
 
     /* An airport or the cruise terminal at either end makes this an airport
        transfer, and it must price from the published table, never from here.
